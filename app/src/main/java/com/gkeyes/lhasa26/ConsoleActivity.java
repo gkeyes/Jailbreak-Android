@@ -81,7 +81,7 @@ public final class ConsoleActivity extends Activity
         console = new FoldConsoleView(this);
         console.setId(0x4c415353);
         console.setBrandName(getString(R.string.app_name));
-        console.listener = this;
+        console.attachListener(this);
         setContentView(console);
 
         Shizuku.addBinderReceivedListenerSticky(this::refreshAuthorization);
@@ -124,7 +124,6 @@ public final class ConsoleActivity extends Activity
             authorization = !alive ? "Shizuku 未运行" : (granted ? "Shizuku 已授权" : "需要授权");
             authEnabled = true;
             if (!running) {
-                privilege = granted ? "Shizuku 可用" : privilege;
                 mainEnabled = alive && granted;
                 diagEnabled = alive && granted;
             }
@@ -136,18 +135,12 @@ public final class ConsoleActivity extends Activity
         if (console == null) {
             return;
         }
-        String version = "";
-        try {
-            version = getPackageManager().getPackageInfo(getPackageName(), 0).versionName;
-        } catch (Exception ignored) {
-            version = "";
-        }
         FoldUiState state = new FoldUiState(
                 status, privilege, authorization, actionLabel, stepText, elapsed,
                 device, build, kernel, compatibility,
                 sessionLog.toString(), latest,
                 mainEnabled, authEnabled, diagEnabled, running, running && !stepText.isEmpty(),
-                keepScreenOn, 0f, version);
+                keepScreenOn, 0f, versionName());
         console.render(state);
     }
 
@@ -169,12 +162,14 @@ public final class ConsoleActivity extends Activity
                     Intent launch = getPackageManager().getLaunchIntentForPackage("moe.shizuku.privileged.api");
                     if (launch != null) {
                         startActivity(launch);
+                    } else {
+                        toast("未安装 Shizuku");
                     }
                 } else {
                     try {
                         Shizuku.requestPermission(REQUEST_SHIZUKU);
                     } catch (Throwable ignored) {
-                        // Shizuku refuses when it is already granted.
+                        // Already granted or binder unavailable.
                     }
                 }
                 break;
@@ -191,7 +186,7 @@ public final class ConsoleActivity extends Activity
                         + "do [ -e \"$f\" ] && rm -f \"$f\"; done; true", "临时文件已清理");
                 break;
             case SOFT_REBOOT:
-                confirm("软重启", "将重启系统框架（KernelSU su 生效）。未保存的内容可能丢失。", () ->
+                confirm("软重启", "将重启系统框架，未保存的内容可能丢失。", () ->
                         maintenance("kill -9 $(pidof system_server)", "软重启指令已发送"));
                 break;
             case REBOOT:
@@ -225,7 +220,7 @@ public final class ConsoleActivity extends Activity
     }
 
     private void maintenance(String command, String done) {
-        if (authorization.startsWith("Shizuku") && !authorization.equals("Shizuku 已授权")) {
+        if (!"Shizuku 已授权".equals(authorization)) {
             toast("请先授权 Shizuku");
             return;
         }

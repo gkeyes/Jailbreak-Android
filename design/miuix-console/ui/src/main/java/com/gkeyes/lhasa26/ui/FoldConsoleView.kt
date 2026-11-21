@@ -39,6 +39,12 @@ class FoldConsoleView @JvmOverloads constructor(
         hardwareEffects = enabled
     }
 
+    /** Java-friendly sink: the generated property setter is not visible to the app module. */
+    @MainThread
+    fun attachListener(sink: Listener?) {
+        listener = sink
+    }
+
     @Composable
     override fun Content() {
         FoldConsole(state = snapshot, onEvent = { listener?.onEvent(it) }, brandName = displayName,
