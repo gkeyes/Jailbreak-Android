@@ -27,6 +27,7 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
     private static final Pattern RUNNING_PAYLOAD = Pattern.compile("uaf_plant_replay");
     private static final String RUN_MARKER = "/data/local/tmp/.lhasa_run";
     private static final String FAILED_MARKER = "/data/local/tmp/.lhasa_failed_boot";
+    private static final String ROOTD_SOCKET = "/data/local/tmp/pc98260-root.sock";
     private static final String EXPLOIT_BINARIES = "uaf_plant_replay perf_slide slide_probe reach_probe";
     private final CommandExecutor executor;
     private final AssetDeployer deployer;
@@ -440,7 +441,7 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
         }
         String site = KernelSupport.extractSite(probe.output);
         if (site != null) {
-            append("site = " + site + "（trace 扫描）");
+            append("site = " + site + "（site 探测）");
             return "--site " + site;
         }
         throw new IllegalStateException("未能读取 KASLR 偏移，请确认 perf / tracefs 可用。");
@@ -496,14 +497,23 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
         run("pkill -f uaf_plant_replay 2>/dev/null; killall uaf_plant_replay 2>/dev/null; true", true);
     }
 
+    /**
+     * /proc is mounted with hidepid=invisible here, so ps cannot see other processes; the leftover
+     * rootd socket is the only reliable sign that an earlier payload is still alive.
+     */
     private int payloadProcessCount() throws Exception {
         String output = run("ps -A 2>/dev/null | grep -c '[u]af_plant_replay'", true).output.trim();
+        int count;
         try {
-            return Integer.parseInt(output);
+            count = Integer.parseInt(output);
         } catch (NumberFormatException ignored) {
-            Matcher matcher = RUNNING_PAYLOAD.matcher(output);
-            return matcher.find() ? 1 : 0;
+            count = RUNNING_PAYLOAD.matcher(output).find() ? 1 : 0;
         }
+        if (count > 0) {
+            return count;
+        }
+        String socket = run("test -S " + ROOTD_SOCKET + " && echo 1 || echo 0", true).output.trim();
+        return "1".equals(socket) ? 1 : 0;
     }
 
     /**
@@ -526,11 +536,30 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
         }
     }
 
-    /** Runs a maintenance command through the same busy gate as the exploit workflow. */
+    /**
+     * Runs a maintenance command through the same busy gate as the exploit workflow.
+     * /proc is hidepid=invisible, so "pidof system_server" returns nothing and the old soft-reboot
+     * command silently did nothing; it is replaced by an init restart of zygote, which needs su.
+     */
     public boolean runMaintenance(String command) {
         return start("maint", () -> {
-            CommandResult result = run(command, true);
-            append(result.isSuccess() ? "维护命令完成" : "维护命令失败：" + result.output);
+            boolean canElevate = "yes".equals(run("test -x /system/bin/su && echo yes || echo no", true).output.trim());
+            String target = command;
+            if (command.contains("pidof system_server")) {
+                if (!canElevate) {
+                    append("[维护] 软重启需要 /system/bin/su（KernelSU 已加载后可用），当前不可用");
+                    callbacks.onState(state, "软重启不可用 · 需要 KernelSU su");
+                    return;
+                }
+                target = "/system/bin/su -c 'setprop ctl.restart zygote'";
+                append("[维护] 软重启：改为由 init 重启 zygote（pidof 在 hidepid=invisible 下取不到 system_server）");
+            } else if (command.startsWith("reboot") && canElevate) {
+                target = "/system/bin/su -c 'reboot'";
+            }
+            CommandResult result = run(target, true);
+            append(result.isSuccess()
+                    ? "维护命令完成"
+                    : "维护命令失败（退出码 " + result.exitCode + "）：" + result.output);
         }, false);
     }
 
@@ -641,7 +670,7 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
             enforceBeforeRun = run("getenforce 2>/dev/null", true).output.trim();
             String patch = run("getprop ro.build.version.security_patch", true).output.trim();
             String suProbe = run("/system/bin/su -c id 2>/dev/null", true).output;
-            String socket = run("ls -l /data/local/tmp/pc98260-root.sock 2>/dev/null", true).output.trim();
+            String socket = run("ls -l " + ROOTD_SOCKET + " 2>/dev/null", true).output.trim();
             append("[基线] id=" + id + " · SELinux=" + enforceBeforeRun);
             append("[基线] security_patch=" + patch + (patch.compareTo("2026-10-06") < 0
                     ? "（早于上游修复 2026-10-06，处于未修补窗口）"
