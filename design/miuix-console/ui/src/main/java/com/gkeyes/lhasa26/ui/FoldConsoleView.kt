@@ -20,6 +20,7 @@ class FoldConsoleView @JvmOverloads constructor(
 
     private var snapshot by mutableStateOf(FoldUiState())
     private var displayName by mutableStateOf("18fold越狱")
+    private var hardwareEffects by mutableStateOf(true)
     var listener: Listener? = null
 
     @MainThread
@@ -32,8 +33,15 @@ class FoldConsoleView @JvmOverloads constructor(
         displayName = name
     }
 
+    /** Disable before composing content intended for a software Canvas, e.g. a bitmap export. */
+    @MainThread
+    fun setHardwareEffectsEnabled(enabled: Boolean) {
+        hardwareEffects = enabled
+    }
+
     @Composable
     override fun Content() {
-        FoldConsole(state = snapshot, onEvent = { listener?.onEvent(it) }, brandName = displayName)
+        FoldConsole(state = snapshot, onEvent = { listener?.onEvent(it) }, brandName = displayName,
+            hardwareEffectsEnabled = hardwareEffects)
     }
 }

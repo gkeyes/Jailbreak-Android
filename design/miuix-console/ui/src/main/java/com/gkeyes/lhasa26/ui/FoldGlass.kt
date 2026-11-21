@@ -23,6 +23,7 @@ import androidx.compose.ui.graphics.rememberGraphicsLayer
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.positionInRoot
 import androidx.compose.ui.platform.LocalView
+import top.yukonga.miuix.kmp.squircle.LocalSquircleEnabled
 
 private class GlassSource(val layer: GraphicsLayer) {
     var origin by mutableStateOf<Offset?>(null)
@@ -31,12 +32,17 @@ private val LocalGlassSource = staticCompositionLocalOf<GlassSource?> { null }
 
 /** Scope the recorded content to one window; no bitmaps or pixel copies cross the GPU boundary. */
 @Composable
-fun FoldGlassHost(content: @Composable () -> Unit) {
-    val source = if (LocalView.current.isHardwareAccelerated) {
+fun FoldGlassHost(hardwareEffectsEnabled: Boolean = true, content: @Composable () -> Unit) {
+    val enabled = hardwareEffectsEnabled && LocalSquircleEnabled.current && LocalView.current.isHardwareAccelerated
+    val source = if (enabled) {
         val layer = rememberGraphicsLayer()
         remember(layer) { GlassSource(layer) }
     } else null
-    CompositionLocalProvider(LocalGlassSource provides source, content = content)
+    CompositionLocalProvider(
+        LocalSquircleEnabled provides enabled,
+        LocalGlassSource provides source,
+        content = content,
+    )
 }
 
 /** Apply to the page viewport only. The overlay that samples this layer must be a sibling. */

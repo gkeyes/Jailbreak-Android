@@ -40,6 +40,7 @@ fun FoldConsole(
     modifier: Modifier = Modifier,
     dark: Boolean = isSystemInDarkTheme(),
     brandName: String = "18fold越狱",
+    hardwareEffectsEnabled: Boolean = true,
 ) {
     var page by rememberSaveable { mutableIntStateOf(0) }
     var dialog by rememberSaveable { mutableStateOf<FoldEvent?>(null) }
@@ -68,9 +69,9 @@ fun FoldConsole(
             surfaceContainer = Color(0xffedf4f0), dividerLine = Color(0xffd8dfdb),
         )
     }
-    MiuixTheme(colors = colors) {
-        Scaffold(modifier = modifier.fillMaxSize(), containerColor = colors.surface) { safe ->
-            FoldGlassHost {
+    FoldGlassHost(hardwareEffectsEnabled) {
+        MiuixTheme(colors = colors) {
+            Scaffold(modifier = modifier.fillMaxSize(), containerColor = colors.surface) { safe ->
                 BoxWithConstraints(Modifier.fillMaxSize().padding(safe)) {
                     val rail = maxWidth >= 700.dp
                     val margin = if (rail) 28.dp else 22.dp
@@ -98,8 +99,8 @@ fun FoldConsole(
                         else Modifier.align(Alignment.BottomCenter).padding(start = 16.dp, end = 16.dp, bottom = 10.dp)
                     FoldNavigation(page, { page = it }, rail, dark, placement)
                 }
+                FoldDialog(dialog, state, onDismiss = { dialog = null }, onEvent = onEvent)
             }
-            FoldDialog(dialog, state, onDismiss = { dialog = null }, onEvent = onEvent)
         }
     }
 }
