@@ -1,0 +1,22 @@
+# Lhasa 内核常量表（唯一数据源）
+#
+# 格式：release=<uname -r> timer=.. cred=.. selinux=.. userns=.. rootuser=..
+#       groups=.. ucounts=.. task_site=.. task_bytes=.. stext=.. etext=..
+# 说明：地址都是链接期地址，运行时 = 链接期 + KASLR 位移。
+#       timer     = alloc_posix_timer + 0x30
+#       cred      = prepare_creds + 0x2c
+#       task_site = copy_process + 0x138
+# 解析器（uaf_plant_replay）只认 release= 开头的行。
+# 生成：XiaoAi\tools\gen_profile.py（扫 boot\*.img，解 kallsyms）
+#
+# 已分析并匹配的系统版本 / 机型（2026-11 用 boot 镜像逐个验证）：
+#   g1d099fcb35e0  <- 18 Fold 4.0.5 / 4.0.6 / 4.0.11 / 4.0.15
+#                    15S Pro (dijun) 4.0.0.5 / 4.0.0.7
+#                    Pad 7 Ultra (jinghu) / Pad 7S Pro (violin)
+#   g284297031c53  <- 18 Fold 4.0.18 / 4.0.21
+#   g805aa6adea19  <- 18 Fold 4.0.26（含 kernel_18fold_full.img）
+#   注意：kernel_18fold.img 是截断镜像，kallsyms 解不出来，别用它。
+#
+release=6.18.21-android17-5-g1d099fcb35e0-abogki538445360-4k timer=0xffffffc08042baec cred=0xffffffc08026ed58 selinux=0xffffffc082958630 userns=0xffffffc0826d10d8 rootuser=0xffffffc0826d1388 groups=0xffffffc0826d2a48 ucounts=0xffffffc0826d2f08 task_site=0xffffffc0801ef5cc task_bytes=0x1680 stext=0xffffffc080010000 etext=0xffffffc081360000
+release=6.18.21-android17-5-g284297031c53-abogki553682993-4k timer=0xffffffc08042aa68 cred=0xffffffc08026c02c selinux=0xffffffc082959630 userns=0xffffffc0826d10d8 rootuser=0xffffffc0826d1388 groups=0xffffffc0826d2a48 ucounts=0xffffffc0826d2f08 task_site=0xffffffc0801f2ec8 task_bytes=0x1680 stext=0xffffffc080010000 etext=0xffffffc081360000
+release=6.18.21-android17-5-g805aa6adea19-abogki565292102-4k timer=0xffffffc0803a726c cred=0xffffffc08026d1b4 selinux=0xffffffc082959630 userns=0xffffffc0826d10d8 rootuser=0xffffffc0826d1388 groups=0xffffffc0826d2a48 ucounts=0xffffffc0826d2f08 task_site=0xffffffc0801f006c task_bytes=0x1680 stext=0xffffffc080010000 etext=0xffffffc081360000
