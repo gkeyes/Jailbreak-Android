@@ -39,6 +39,7 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
     private volatile boolean busy;
     private volatile boolean rootBeforeRun;
     private volatile String enforceBeforeRun = "";
+    private volatile long lastDeviceRefresh;
 
     public WorkflowEngine(AssetManager assets, CommandExecutor executor, WorkflowCallbacks callbacks) {
         this.executor = executor;
@@ -71,10 +72,17 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
                 return;
             }
             try {
+                long now = System.currentTimeMillis();
+                if (now - lastDeviceRefresh < 5000L) {
+                    return;
+                }
+                lastDeviceRefresh = now;
+                String[] fields = run("getprop ro.product.device; getprop ro.build.version.incremental; uname -r", true)
+                        .output.trim().split("\\n");
                 DeviceSnapshot snapshot = new DeviceSnapshot(
-                        run("getprop ro.product.device", true).output,
-                        run("getprop ro.build.version.incremental", true).output,
-                        run("uname -r", true).output);
+                        fields.length > 0 ? fields[0] : "",
+                        fields.length > 1 ? fields[1] : "",
+                        fields.length > 2 ? fields[2] : "");
                 callbacks.onDevice(snapshot);
             } catch (Exception ignored) {
                 // Device information is supplemental and should never block the main action.
@@ -84,6 +92,7 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
 
     public void stop() {
         worker.shutdownNow();
+        executor.kill();
     }
 
     public String getSessionLog() {
@@ -235,7 +244,7 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
         run("rm -f " + FAILED_MARKER, true);
         clearRunMarker();
         state = State.ROOTED;
-        callbacks.onState(State.ROOTED, "已获得临时 ROOT");
+        callbacks.onStatus("已获得临时 ROOT · 正在加载 KernelSU");
         append("临时 ROOT 已就绪。");
         append("[归因] " + (rootBeforeRun
                 ? "运行前已具备 uid=0（root 非本次取得），本次只确认根通道可用"
@@ -440,6 +449,14 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
             Matcher matcher = RUNNING_PAYLOAD.matcher(output);
             return matcher.find() ? 1 : 0;
         }
+    }
+
+    /** Runs a maintenance command through the same busy gate as the exploit workflow. */
+    public boolean runMaintenance(String command) {
+        return start("maint", () -> {
+            CommandResult result = run(command, true);
+            append(result.isSuccess() ? "维护命令完成" : "维护命令失败：" + result.output);
+        }, false);
     }
 
     private CommandResult run(String command, boolean quiet) throws Exception {

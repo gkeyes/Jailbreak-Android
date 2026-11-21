@@ -35,7 +35,29 @@ public final class ShizukuExecutor implements CommandExecutor {
         if (process == null) {
             throw new IllegalStateException("Shizuku 拒绝启动 shell 进程");
         }
+        active = process;
         return process;
+    }
+
+    private volatile Process active;
+
+    @Override
+    public void kill() {
+        Process current = active;
+        active = null;
+        if (current == null) {
+            return;
+        }
+        try {
+            current.destroy();
+        } catch (Throwable ignored) {
+            // The remote process may already be gone.
+        }
+        try {
+            current.destroyForcibly();
+        } catch (Throwable ignored) {
+            // Nothing else to do.
+        }
     }
 
     /**
@@ -68,7 +90,13 @@ public final class ShizukuExecutor implements CommandExecutor {
         ByteArrayOutputStream stderr = new ByteArrayOutputStream();
         Thread outThread = drainAsync(process.getInputStream(), stdout);
         Thread errThread = drainAsync(process.getErrorStream(), stderr);
-        int exitCode = process.waitFor();
+        if (!process.waitFor(120L, java.util.concurrent.TimeUnit.SECONDS)) {
+            kill();
+            outThread.join(2000L);
+            errThread.join(2000L);
+            return new CommandResult(-1, "命令超时（120 秒）：" + command);
+        }
+        int exitCode = process.exitValue();
         outThread.join(8000L);
         errThread.join(8000L);
         String out = stdout.toString(StandardCharsets.UTF_8.name());
@@ -77,6 +105,7 @@ public final class ShizukuExecutor implements CommandExecutor {
         if (!quiet && exitCode != 0 && combined.trim().isEmpty()) {
             combined = "命令退出码 " + exitCode;
         }
+        active = null;
         return new CommandResult(exitCode, combined);
     }
 
