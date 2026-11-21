@@ -5,6 +5,7 @@ on:
     branches: [ main ]
     paths:
       - 'app/**'
+      - 'design/**'
       - 'build.gradle.kts'
       - 'settings.gradle.kts'
       - 'gradle/**'
@@ -14,6 +15,7 @@ on:
 
 permissions:
   contents: write
+  issues: write
 
 env:
   LHASA_STORE_PASSWORD: lhasa26pass
@@ -23,7 +25,7 @@ env:
   KSU_APK_SHA256: b4a059ace71de2fa65cc7f12b1c58d55fc23ab25e057ee4230ce779742abe450
 
 jobs:
-  build:
+  app:
     if: "!contains(github.event.head_commit.message, 'ci: signed apk ok') && !contains(github.event.head_commit.message, 'ci: build failed')"
     runs-on: ubuntu-latest
     steps:
@@ -35,7 +37,6 @@ jobs:
           echo "A: checkout $(date -u +%H:%M:%S)" > ci.log
           for ref in $(git ls-remote --heads origin 'refs/heads/ci/verify-*' | awk '{print $2}'); do
             branch=${ref#refs/heads/}
-            echo "A: deleting stale branch $branch" | tee -a ci.log
             git push origin --delete "$branch"
           done
 
@@ -43,10 +44,9 @@ jobs:
         run: |
           actual=$(sha256sum app/src/main/assets/ksud | awk '{print $1}')
           if [ "$actual" = "$KSUSD_SHA256" ]; then
-            echo "B: ksud ok ($actual)" >> ci.log
+            echo "B: ksud ok" >> ci.log
             exit 0
           fi
-          echo "B: ksud mismatch actual=$actual, restoring from KernelSU v3.3.1" >> ci.log
           curl -fsSL -o /tmp/ksu-manager.apk \
             https://github.com/tiann/KernelSU/releases/download/v3.3.1/KernelSU_v3.3.1_32680-release.apk
           echo "$KSU_APK_SHA256  /tmp/ksu-manager.apk" | sha256sum -c - >> ci.log
@@ -64,12 +64,9 @@ jobs:
           set -e
           if [ ! -f keystore/lhasa26.jks ]; then
             mkdir -p keystore
-            keytool -genkeypair -v \
-              -keystore keystore/lhasa26.jks \
-              -alias "$LHASA_KEY_ALIAS" \
+            keytool -genkeypair -v -keystore keystore/lhasa26.jks -alias "$LHASA_KEY_ALIAS" \
               -keyalg RSA -keysize 2048 -validity 10000 \
-              -storepass "$LHASA_STORE_PASSWORD" \
-              -keypass "$LHASA_KEY_PASSWORD" \
+              -storepass "$LHASA_STORE_PASSWORD" -keypass "$LHASA_KEY_PASSWORD" \
               -dname "CN=Lhasa26-Android, OU=local, O=local, C=CN" >> ci.log 2>&1
             git config user.name "lhasa-ci"
             git config user.email "lhasa-ci@users.noreply.github.com"
@@ -77,7 +74,6 @@ jobs:
             git commit -m "ci: add fixed release signing key"
             git push
           fi
-          echo "C: keystore ready" >> ci.log
 
       - uses: actions/setup-java@v4
         with:
@@ -87,11 +83,12 @@ jobs:
       - name: Prepare SDK
         run: |
           set +e
-          echo "D: java $(java -version 2>&1 | head -1)" >> ci.log
           for root in "${ANDROID_SDK_ROOT:-}" /usr/local/lib/android/sdk /opt/android-sdk; do
             if [ -n "$root" ] && [ -d "$root/platforms" ]; then
-              echo "D: sdk=$root" >> ci.log
               echo "ANDROID_SDK_ROOT=$root" >> "$GITHUB_ENV"
+              if [ -x "$root/cmdline-tools/latest/bin/sdkmanager" ]; then
+                yes | "$root/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null 2>&1
+              fi
               break
             fi
           done
@@ -106,7 +103,6 @@ jobs:
         run: |
           apk=$(ls app/build/outputs/apk/release/*.apk | head -1)
           unzip -p "$apk" assets/ksud > /tmp/apk-ksud
-          echo "E: apk=$(basename "$apk") ksud=$(sha256sum /tmp/apk-ksud | awk '{print $1}')" >> ci.log
           echo "$KSUSD_SHA256  /tmp/apk-ksud" | sha256sum -c - >> ci.log
 
       - name: Upload APK
@@ -127,35 +123,25 @@ jobs:
           apk=$(ls app/build/outputs/apk/release/*.apk | head -1)
           sha=$(sha256sum "$apk" | awk '{print $1}')
           tag="v${ver}"
-          notes=$(printf '## 18fold越狱 %s\n\n- APK: `%s`\n- sha256: `%s`\n- KernelSU ksud: `%s`\n- 固定签名：与之前版本可覆盖安装\n\n> 本包为 main 分支 `%s` 构建；`design/miuix-console` 新控制台尚未并入 app 模块。\n' \
-            "$ver" "$(basename "$apk")" "$sha" "$KSUSD_SHA256" "${GITHUB_SHA:0:8}")
+          asset="/tmp/lhasa26-${ver}.apk"
+          cp "$apk" "$asset"
+          notes=$(printf '## 18fold越狱 %s\n\n- sha256: `%s`\n- ksud: `%s`\n- main `%s`\n' "$ver" "$sha" "$KSUSD_SHA256" "${GITHUB_SHA:0:8}")
           if gh release view "$tag" >/dev/null 2>&1; then
-            echo "release $tag already exists, uploading another asset"
-            gh release upload "$tag" "$apk#lhasa26-${ver}-$(echo "$sha" | cut -c1-8).apk" --clobber
+            gh release upload "$tag" "$asset" --clobber
           else
-            gh release create "$tag" "$apk#lhasa26-${ver}.apk" \
-              --title "18fold越狱 ${ver}" \
-              --notes "$notes" \
-              --target "$GITHUB_SHA"
+            gh release create "$tag" "$asset" --title "18fold越狱 ${ver}" --notes "$notes" --target "$GITHUB_SHA"
           fi
-          echo "F: release $tag published" >> ci.log
 
-      - name: Record build
-        if: success()
-        run: |
-          {
-            echo "Build and upload succeeded."
-            echo
-            echo '```text'
-            sha256sum app/build/outputs/apk/release/*.apk
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Record failure
+      - name: Report failure as an issue
         if: failure()
-        run: echo "See the first failed step in this job for the error." >> "$GITHUB_STEP_SUMMARY"
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tail -c 20000 ci.log > /tmp/fail.log 2>/dev/null || true
+          { echo "Commit: \`${GITHUB_SHA:0:8}\`"; echo; echo '```text'; cat /tmp/fail.log; echo '```'; } > /tmp/fail.md
+          gh issue create --title "build failed ${GITHUB_SHA:0:8}" --body-file /tmp/fail.md
 
-      - name: Publish result tag
+      - name: Tag result
         if: always()
         env:
           RESULT: ${{ job.status }}
@@ -169,9 +155,68 @@ jobs:
             sha=$(sha256sum "$apk" | awk '{print $1}')
             tag="apk-${ver}-$(echo "$sha" | cut -c1-12)"
           else
-            hint=$(grep -i -E 'error:|FAILURE:' ci.log 2>/dev/null | tail -1 | tr -c 'A-Za-z0-9._' '-' | cut -c1-60)
-            tag="fail-${ver}-${hint:-unknown}"
+            tag="fail-${ver}-${GITHUB_RUN_NUMBER}"
           fi
           git tag -f "$tag"
           git push origin "refs/tags/$tag" --force
-          echo "tagged $tag" >> "$GITHUB_STEP_SUMMARY"
+
+  design:
+    if: "!contains(github.event.head_commit.message, 'ci: signed apk ok') && !contains(github.event.head_commit.message, 'ci: build failed')"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Prepare SDK
+        run: |
+          set +e
+          for root in "${ANDROID_SDK_ROOT:-}" /usr/local/lib/android/sdk /opt/android-sdk; do
+            if [ -n "$root" ] && [ -d "$root" ]; then
+              echo "ANDROID_SDK_ROOT=$root" >> "$GITHUB_ENV"
+              if [ -x "$root/cmdline-tools/latest/bin/sdkmanager" ]; then
+                yes | "$root/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null 2>&1
+                "$root/cmdline-tools/latest/bin/sdkmanager" --list 2>/dev/null | grep -c 'platforms;android-37' | sed 's/^/android-37 entries: /'
+              fi
+              break
+            fi
+          done
+
+      - name: Build the console library
+        run: |
+          set -o pipefail
+          cd design/miuix-console
+          chmod +x gradlew
+          ./gradlew --no-daemon :ui:assembleRelease 2>&1 | tee design.log
+
+      - name: Upload AAR
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: design-aar
+          path: |
+            design/miuix-console/ui/build/outputs/aar/*.aar
+            design/miuix-console/design.log
+          if-no-files-found: warn
+
+      - name: Tag console success
+        if: success()
+        run: |
+          set +e
+          git config user.name "lhasa-ci"
+          git config user.email "lhasa-ci@users.noreply.github.com"
+          tag="design-ok-${GITHUB_SHA:0:8}"
+          git tag -f "$tag"
+          git push origin "refs/tags/$tag" --force
+
+      - name: Report console failure as an issue
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tail -c 20000 design/miuix-console/design.log > /tmp/dfail.log 2>/dev/null || true
+          { echo "Console library build, commit \`${GITHUB_SHA:0:8}\`"; echo; echo '```text'; cat /tmp/dfail.log; echo '```'; } > /tmp/dfail.md
+          gh issue create --title "design-build failed ${GITHUB_SHA:0:8}" --body-file /tmp/dfail.md
