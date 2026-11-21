@@ -37,6 +37,8 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
     private volatile long startedAt;
     private volatile int currentStep = -1;
     private volatile boolean busy;
+    private volatile boolean rootBeforeRun;
+    private volatile String enforceBeforeRun = "";
 
     public WorkflowEngine(AssetManager assets, CommandExecutor executor, WorkflowCallbacks callbacks) {
         this.executor = executor;
@@ -186,6 +188,7 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
                 append("（提示）本次开机已为 Permissive，将直接重试 cred 阶段。");
             }
         }
+        captureBaseline();
         cleanMemory();
 
         step(1);
@@ -234,6 +237,11 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
         state = State.ROOTED;
         callbacks.onState(State.ROOTED, "已获得临时 ROOT");
         append("临时 ROOT 已就绪。");
+        append("[归因] " + (rootBeforeRun
+                ? "运行前已具备 uid=0（root 非本次取得），本次只确认根通道可用"
+                : "运行前无 uid=0，运行后 uid=0 → 本次提权链路生效")
+                + " · SELinux " + (enforceBeforeRun.isEmpty() ? "?" : enforceBeforeRun)
+                + " → " + enforceNow());
 
         runKernelSuStep();
     }
@@ -248,9 +256,13 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
         }
         append(report);
         run("echo '!enable_event:kmem:kmem_cache_alloc' > /sys/kernel/tracing/events/kmem/rss_stat/trigger 2>/dev/null; echo 0 > /sys/kernel/tracing/tracing_on 2>/dev/null", true);
+        String patch = run("getprop ro.build.version.security_patch", true).output.trim();
+        append("[诊断] security_patch=" + patch + (patch.compareTo("2026-10-06") < 0
+                ? " · 未修补窗口"
+                : " · 可能已回补"));
         if (report.contains("必需项全部通过")) {
             status("诊断通过 · 环境可用");
-            append("[诊断] 通过 · 环境可用");
+            append("[诊断] 通过 · 环境可用（仅代表探针达标，不代表固件已修补或未修补）");
         } else {
             status("诊断未通过 · 详见日志");
             append(report.contains("必需接口不可用") ? "[诊断] 失败 · 有必需项未通过" : "[诊断] 未完成 · 详见日志");
@@ -271,7 +283,13 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
                 log = load.output;
             }
             append(log);
-            if (isRoot(log)) {
+            // The takeover verdict must come from its own probe, never from scanning a merged log:
+            // loader output, exit codes and the identity query all land in the same file.
+            CommandResult suProbe = run("/system/bin/su -c id 2>/dev/null", true);
+            CommandResult ksudProbe = run("/system/bin/su -c '/data/local/tmp/ksud -V' 2>/dev/null", true);
+            append("[KSU] su -c id → " + oneLine(suProbe.output));
+            append("[KSU] ksud -V → " + oneLine(ksudProbe.output));
+            if (suProbe.output.contains("uid=0")) {
                 state = State.COMPLETE;
                 callbacks.onState(State.COMPLETE, "全部完成 · KernelSU 已接管");
             } else {
@@ -479,11 +497,62 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
     /** Frees memory before the exploit runs; the payload needs large contiguous allocations. */
     private void cleanMemory() {
         try {
-            run("am force-stop com.tencent.mm 2>/dev/null; am force-stop com.tencent.mobileqq 2>/dev/null; true", true);
-            append("清理系统内存：完成");
+            long before = memFreeKb();
+            CommandResult stop = run("am force-stop com.tencent.mm 2>/dev/null; am force-stop com.tencent.mobileqq 2>/dev/null; true", true);
+            long after = memFreeKb();
+            append("清理系统内存：MemFree " + before + " kB → " + after + " kB"
+                    + (stop.exitCode == 0 ? "" : "（命令退出码 " + stop.exitCode + "）"));
         } catch (Exception ignored) {
             append("清理系统内存：跳过");
         }
+    }
+
+    private long memFreeKb() {
+        try {
+            String out = run("awk '/MemFree/{print $2}' /proc/meminfo 2>/dev/null", true).output.trim();
+            return Long.parseLong(out);
+        } catch (Exception ignored) {
+            return -1L;
+        }
+    }
+
+    /**
+     * Records what the device already looked like before any exploit step, so a later "uid=0" can be
+     * attributed: pre-existing root, patch level of the running firmware, and a live rootd socket.
+     */
+    private void captureBaseline() {
+        try {
+            String id = oneLine(run("id 2>/dev/null", true).output);
+            enforceBeforeRun = run("getenforce 2>/dev/null", true).output.trim();
+            String patch = run("getprop ro.build.version.security_patch", true).output.trim();
+            String suProbe = run("/system/bin/su -c id 2>/dev/null", true).output;
+            String socket = run("ls -l /data/local/tmp/pc98260-root.sock 2>/dev/null", true).output.trim();
+            append("[基线] id=" + id + " · SELinux=" + enforceBeforeRun);
+            append("[基线] security_patch=" + patch + (patch.compareTo("2026-10-06") < 0
+                    ? "（早于上游修复 2026-10-06，处于未修补窗口）"
+                    : "（不早于上游修复 2026-10-06，固件可能已回补，失败需先怀疑此处）"));
+            append("[基线] /system/bin/su=" + (suProbe.trim().isEmpty() ? "无" : oneLine(suProbe)));
+            append("[基线] rootd socket=" + (socket.isEmpty() ? "无" : "已存在（本次开机可能已 root 过）"));
+            rootBeforeRun = suProbe.contains("uid=0") || id.contains("uid=0");
+        } catch (Exception ignored) {
+            // A missing baseline only weakens attribution, it must not stop the run.
+        }
+    }
+
+    private String enforceNow() {
+        try {
+            return run("getenforce 2>/dev/null", true).output.trim();
+        } catch (Exception ignored) {
+            return "?";
+        }
+    }
+
+    private static String oneLine(String value) {
+        if (value == null) {
+            return "";
+        }
+        String trimmed = value.trim();
+        return trimmed.isEmpty() ? "无" : trimmed.replace('\n', ' ');
     }
 
     private boolean shizukuGone() {
