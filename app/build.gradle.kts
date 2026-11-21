@@ -10,8 +10,8 @@ android {
         applicationId = "com.gkeyes.lhasa26"
         minSdk = 26
         targetSdk = 35
-        versionCode = 101
-        versionName = "0.1.1"
+        versionCode = 102
+        versionName = "0.1.2"
     }
 
     // Fixed release key so later builds keep the same signature and can overwrite-install.
