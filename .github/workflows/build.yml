@@ -31,20 +31,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Drop stale ci branches
-        run: |
-          set +e
-          echo "A: checkout $(date -u +%H:%M:%S)" > ci.log
-          for ref in $(git ls-remote --heads origin 'refs/heads/ci/verify-*' | awk '{print $2}'); do
-            branch=${ref#refs/heads/}
-            git push origin --delete "$branch"
-          done
-
       - name: Verify or repair the ksud asset
         run: |
           actual=$(sha256sum app/src/main/assets/ksud | awk '{print $1}')
           if [ "$actual" = "$KSUSD_SHA256" ]; then
-            echo "B: ksud ok" >> ci.log
+            echo "ksud ok" > ci.log
             exit 0
           fi
           curl -fsSL -o /tmp/ksu-manager.apk \
@@ -74,6 +65,8 @@ jobs:
             git commit -m "ci: add fixed release signing key"
             git push
           fi
+          keytool -list -v -keystore keystore/lhasa26.jks -alias "$LHASA_KEY_ALIAS" \
+            -storepass "$LHASA_STORE_PASSWORD" 2>/dev/null | grep -m1 'SHA256:' >> ci.log || true
 
       - uses: actions/setup-java@v4
         with:
@@ -99,11 +92,21 @@ jobs:
           set -o pipefail
           ./gradlew --no-daemon :app:assembleRelease 2>&1 | tee -a ci.log
 
-      - name: Verify APK contents
+      - name: Verify APK
         run: |
           apk=$(ls app/build/outputs/apk/release/*.apk | head -1)
           unzip -p "$apk" assets/ksud > /tmp/apk-ksud
           echo "$KSUSD_SHA256  /tmp/apk-ksud" | sha256sum -c - >> ci.log
+          size=$(stat -c%s "$apk")
+          echo "size=$size" >> ci.log
+          apksigner=$(ls "$ANDROID_SDK_ROOT"/build-tools/*/apksigner 2>/dev/null | tail -1)
+          if [ -n "$apksigner" ]; then
+            "$apksigner" verify --print-certs "$apk" > /tmp/certs.txt 2>&1 || true
+            cat /tmp/certs.txt >> ci.log
+            cert=$(grep -m1 'SHA-256 digest' /tmp/certs.txt | awk '{print $NF}' | cut -c1-16)
+            echo "cert=$cert" >> ci.log
+          fi
+          echo "APK $size bytes, cert ${cert:-unknown}"
 
       - name: Upload APK
         if: success()
@@ -122,10 +125,13 @@ jobs:
           ver=$(sed -n 's/.*versionName = "\(.*\)".*/\1/p' app/build.gradle.kts | head -1)
           apk=$(ls app/build/outputs/apk/release/*.apk | head -1)
           sha=$(sha256sum "$apk" | awk '{print $1}')
+          size=$(stat -c%s "$apk")
+          cert=$(grep -m1 'SHA-256 digest' /tmp/certs.txt 2>/dev/null | awk '{print $NF}' | cut -c1-16)
           tag="v${ver}"
           asset="/tmp/lhasa26-${ver}.apk"
           cp "$apk" "$asset"
-          notes=$(printf '## 18fold越狱 %s\n\n- sha256: `%s`\n- ksud: `%s`\n- main `%s`\n' "$ver" "$sha" "$KSUSD_SHA256" "${GITHUB_SHA:0:8}")
+          notes=$(printf '## 18fold越狱 %s\n\n- size: %s bytes\n- sha256: `%s`\n- signer: `%s`\n- ksud: `%s`\n- main `%s`\n' \
+            "$ver" "$size" "$sha" "${cert:-unknown}" "$KSUSD_SHA256" "${GITHUB_SHA:0:8}")
           if gh release view "$tag" >/dev/null 2>&1; then
             gh release upload "$tag" "$asset" --clobber
           else
@@ -151,9 +157,11 @@ jobs:
           git config user.email "lhasa-ci@users.noreply.github.com"
           ver=$(sed -n 's/.*versionName = "\(.*\)".*/\1/p' app/build.gradle.kts | head -1)
           apk=$(ls app/build/outputs/apk/release/*.apk 2>/dev/null | head -1)
+          size=$(stat -c%s "$apk" 2>/dev/null || echo 0)
+          cert=$(grep -m1 'SHA-256 digest' /tmp/certs.txt 2>/dev/null | awk '{print $NF}' | cut -c1-12)
           if [ "$RESULT" = "success" ] && [ -n "$apk" ]; then
             sha=$(sha256sum "$apk" | awk '{print $1}')
-            tag="apk-${ver}-$(echo "$sha" | cut -c1-12)"
+            tag="apk-${ver}-$(echo "$sha" | cut -c1-12)-s${size}-c${cert:-none}"
           else
             tag="fail-${ver}-${GITHUB_RUN_NUMBER}"
           fi
@@ -179,7 +187,6 @@ jobs:
               echo "ANDROID_SDK_ROOT=$root" >> "$GITHUB_ENV"
               if [ -x "$root/cmdline-tools/latest/bin/sdkmanager" ]; then
                 yes | "$root/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null 2>&1
-                "$root/cmdline-tools/latest/bin/sdkmanager" --list 2>/dev/null | grep -c 'platforms;android-37' | sed 's/^/android-37 entries: /'
               fi
               break
             fi
@@ -191,16 +198,6 @@ jobs:
           cd design/miuix-console
           chmod +x gradlew
           ./gradlew --no-daemon :ui:assembleRelease 2>&1 | tee design.log
-
-      - name: Upload AAR
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: design-aar
-          path: |
-            design/miuix-console/ui/build/outputs/aar/*.aar
-            design/miuix-console/design.log
-          if-no-files-found: warn
 
       - name: Tag console success
         if: success()
