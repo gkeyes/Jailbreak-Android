@@ -235,19 +235,16 @@ public final class MainActivity extends Activity implements WorkflowCallbacks {
         metrics.addView(statusMetric("临时 ROOT", privilegeState), flatParams(1, 6));
         hero.addView(metrics);
 
-        authorization = new Button(this, null, android.R.attr.borderlessButtonStyle);
-        authorization.setAllCaps(false);
-        authorization.setText("请求 Shizuku 授权");
-        authorization.setTextColor(accent);
-        authorization.setTextSize(13);
-        authorization.setTypeface(Typeface.DEFAULT_BOLD);
-        authorization.setMinimumHeight(dp(44));
+        authorization = button("Shizuku 授权", false);
         authorization.setGravity(Gravity.START | Gravity.CENTER_VERTICAL);
-        authorization.setPadding(0, 0, 0, 0);
+        authorization.setPaddingRelative(dp(14), dp(7), dp(14), dp(7));
         authorization.setOnClickListener(view -> {
             if (ensureShizuku()) toast("Shizuku 已授权");
         });
-        hero.addView(authorization, new LinearLayout.LayoutParams(-2, -2));
+        LinearLayout.LayoutParams authorizationParams = new LinearLayout.LayoutParams(-1, -2);
+        authorizationParams.topMargin = dp(10);
+        authorizationParams.bottomMargin = dp(10);
+        hero.addView(authorization, authorizationParams);
 
         LinearLayout buttons = horizontalRow();
         action = button("一键临时 ROOT", true);
@@ -694,9 +691,12 @@ public final class MainActivity extends Activity implements WorkflowCallbacks {
     private void updateShizukuStatus() {
         boolean connected = Shizuku.pingBinder();
         boolean authorized = connected && Shizuku.checkSelfPermission() == 0;
-        shizukuState.setText(!connected ? "未连接" : authorized ? "已授权" : "待授权");
-        authorization.setText(!connected ? "打开 Shizuku" : authorized ? "Shizuku 已授权" : "请求 Shizuku 授权");
+        String label = !connected ? "未连接" : authorized ? "已授权" : "待授权";
+        shizukuState.setText(label);
         authorization.setEnabled(!authorized);
+        if (Build.VERSION.SDK_INT >= 30) {
+            authorization.setStateDescription(label);
+        }
     }
 
     private LinearLayout card(GlassMaterial.Layer layer, int radius, int verticalPadding) {
