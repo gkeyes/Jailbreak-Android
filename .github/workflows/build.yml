@@ -22,11 +22,15 @@ env:
 
 jobs:
   build:
-    # Skip the bookkeeping commits this workflow pushes on completion.
     if: "!contains(github.event.head_commit.message, 'ci: signed apk ok') && !contains(github.event.head_commit.message, 'ci: build failed')"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Marker A (checkout)
+        run: |
+          echo "A: checkout ok $(date -u +%H:%M:%S)" > ci.log
+          ls -1 | head -20 >> ci.log
 
       - name: Ensure fixed signing key
         run: |
@@ -39,27 +43,38 @@ jobs:
               -keyalg RSA -keysize 2048 -validity 10000 \
               -storepass "$LHASA_STORE_PASSWORD" \
               -keypass "$LHASA_KEY_PASSWORD" \
-              -dname "CN=Lhasa26-Android, OU=local, O=local, C=CN"
+              -dname "CN=Lhasa26-Android, OU=local, O=local, C=CN" >> ci.log 2>&1
             git config user.name "lhasa-ci"
             git config user.email "lhasa-ci@users.noreply.github.com"
-            # .gitignore excludes *.jks, so force-add the one fixed key.
             git add -f keystore/lhasa26.jks
             git commit -m "ci: add fixed release signing key"
             git push
           fi
+          echo "B: keystore ready" >> ci.log
 
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
 
-      - uses: android-actions/setup-android@v3
+      - name: Marker C (java + sdk)
+        run: |
+          set +e
+          { echo "C: java $(java -version 2>&1 | head -1)"; } >> ci.log
+          for root in "${ANDROID_SDK_ROOT:-}" /usr/local/lib/android/sdk /opt/android-sdk; do
+            if [ -n "$root" ] && [ -d "$root/platforms" ]; then
+              echo "C: sdk=$root platforms=$(ls "$root/platforms" | tr '\n' ' ')" >> ci.log
+              echo "ANDROID_SDK_ROOT=$root" >> "$GITHUB_ENV"
+              break
+            fi
+          done
+          echo "C: done" >> ci.log
 
       - name: Gradle build
         run: |
           chmod +x gradlew
           set -o pipefail
-          ./gradlew --no-daemon :app:assembleRelease 2>&1 | tee gradle-build.log
+          ./gradlew --no-daemon :app:assembleRelease 2>&1 | tee -a ci.log
 
       - name: Upload APK
         if: success()
@@ -84,6 +99,6 @@ jobs:
         run: |
           git config user.name "lhasa-ci"
           git config user.email "lhasa-ci@users.noreply.github.com"
-          excerpt=$(tail -c 400 gradle-build.log 2>/dev/null | tr '\n' ' ' | tr -s ' ' | cut -c1-300)
+          excerpt=$(tail -c 600 ci.log 2>/dev/null | tr '\n' ' ' | tr -s ' ' | cut -c1-400)
           git commit --allow-empty -m "ci: build failed :: ${excerpt:-no-log}"
           git push
