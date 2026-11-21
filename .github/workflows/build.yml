@@ -31,6 +31,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Remove retired version tags
+        run: |
+          set +e
+          for tag in v0.3.2 v0.3.3 v0.3.4 v0.3.5; do
+            if git ls-remote --tags origin "refs/tags/$tag" | grep -q .; then
+              git push origin ":refs/tags/$tag"
+              echo "removed tag $tag"
+            fi
+          done
+
       - name: Verify or repair the ksud asset
         run: |
           actual=$(sha256sum app/src/main/assets/ksud | awk '{print $1}')
@@ -98,7 +108,6 @@ jobs:
           unzip -p "$apk" assets/ksud > /tmp/apk-ksud
           echo "$KSUSD_SHA256  /tmp/apk-ksud" | sha256sum -c - >> ci.log
           size=$(stat -c%s "$apk")
-          echo "size=$size" >> ci.log
           apksigner=$(ls "$ANDROID_SDK_ROOT"/build-tools/*/apksigner 2>/dev/null | tail -1)
           if [ -n "$apksigner" ]; then
             "$apksigner" verify --print-certs "$apk" > /tmp/certs.txt 2>&1 || true
@@ -114,8 +123,9 @@ jobs:
           path: app/build/outputs/apk/release/*.apk
           if-no-files-found: error
 
-      - name: Publish release and prune older ones
-        if: success()
+      # Releases are published only on explicit request: the commit message must contain [release].
+      - name: Publish release (explicit only)
+        if: success() && contains(github.event.head_commit.message, '[release]')
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -135,15 +145,6 @@ jobs:
           else
             gh release create "$tag" "$asset" --title "18fold越狱 ${ver}" --notes "$notes" --target "$GITHUB_SHA"
           fi
-
-          # Only the newest release is kept; the older ones were build experiments.
-          set +e
-          for old in $(gh release list --limit 100 --json tagName --jq '.[].tagName'); do
-            if [ "$old" != "$tag" ]; then
-              echo "deleting release $old"
-              gh release delete "$old" --yes
-            fi
-          done
 
       - name: Report failure as an issue
         if: failure()
@@ -174,53 +175,3 @@ jobs:
           fi
           git tag -f "$tag"
           git push origin "refs/tags/$tag" --force
-
-  design:
-    if: "!contains(github.event.head_commit.message, 'ci: signed apk ok') && !contains(github.event.head_commit.message, 'ci: build failed')"
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: '17'
-
-      - name: Prepare SDK
-        run: |
-          set +e
-          for root in "${ANDROID_SDK_ROOT:-}" /usr/local/lib/android/sdk /opt/android-sdk; do
-            if [ -n "$root" ] && [ -d "$root" ]; then
-              echo "ANDROID_SDK_ROOT=$root" >> "$GITHUB_ENV"
-              if [ -x "$root/cmdline-tools/latest/bin/sdkmanager" ]; then
-                yes | "$root/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null 2>&1
-              fi
-              break
-            fi
-          done
-
-      - name: Build the console library
-        run: |
-          set -o pipefail
-          cd design/miuix-console
-          chmod +x gradlew
-          ./gradlew --no-daemon :ui:assembleRelease 2>&1 | tee design.log
-
-      - name: Tag console success
-        if: success()
-        run: |
-          set +e
-          git config user.name "lhasa-ci"
-          git config user.email "lhasa-ci@users.noreply.github.com"
-          tag="design-ok-${GITHUB_SHA:0:8}"
-          git tag -f "$tag"
-          git push origin "refs/tags/$tag" --force
-
-      - name: Report console failure as an issue
-        if: failure()
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          tail -c 20000 design/miuix-console/design.log > /tmp/dfail.log 2>/dev/null || true
-          { echo "Console library build, commit \`${GITHUB_SHA:0:8}\`"; echo; echo '```text'; cat /tmp/dfail.log; echo '```'; } > /tmp/dfail.md
-          gh issue create --title "design-build failed ${GITHUB_SHA:0:8}" --body-file /tmp/dfail.md
