@@ -24,7 +24,7 @@ env:
 
 jobs:
   build:
-    if: "!contains(github.event.head_commit.message, 'ci: signed apk ok') && !contains(github.event.head_commit.message, 'ci: build failed')"
+    if: "!contains(github.event.head_commit.message, 'ci: signed apk ok') && !contains(github.event.head_commit.message, 'ci: build failed') && !contains(github.event.head_commit.message, 'ci: audit fixes applied')"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -34,15 +34,237 @@ jobs:
           echo "A: checkout ok $(date -u +%H:%M:%S)" > ci.log
           sha256sum app/src/main/assets/ksud >> ci.log
 
+      - name: Apply audit fixes (idempotent)
+        run: |
+          set -o pipefail
+          python3 - <<'PY' 2>&1 | tee -a ci.log
+          import pathlib, sys
+
+          def patch(path, pairs):
+              p = pathlib.Path(path)
+              text = p.read_text(encoding='utf-8')
+              changed = False
+              for marker, old, new in pairs:
+                  if new in text:
+                      print('skip  %-28s already applied' % marker)
+                      continue
+                  if old not in text:
+                      sys.exit('MARKER-NOT-FOUND %s in %s' % (marker, path))
+                  text = text.replace(old, new, 1)
+                  changed = True
+                  print('apply %-28s %s' % (marker, path))
+              if changed:
+                  p.write_text(text, encoding='utf-8')
+              return changed
+
+          changed = False
+
+          changed |= patch('app/src/main/java/com/gkeyes/lhasa26/core/CommandExecutor.java', [
+              ('executor-kill-api',
+               "    boolean isAvailable();\n",
+               "    boolean isAvailable();\n"
+               "\n"
+               "    /** Stops whatever remote process is currently running, if any. */\n"
+               "    default void kill() {\n"
+               "    }\n"),
+              ('read-process-timeout',
+               "        int exitCode = process.waitFor();\n"
+               "        joinQuietly(stdout);\n"
+               "        joinQuietly(stderr);\n",
+               "        int exitCode;\n"
+               "        if (!process.waitFor(120L, java.util.concurrent.TimeUnit.SECONDS)) {\n"
+               "            process.destroy();\n"
+               "            if (!process.waitFor(5L, java.util.concurrent.TimeUnit.SECONDS)) {\n"
+               "                process.destroyForcibly();\n"
+               "            }\n"
+               "            joinQuietly(stdout);\n"
+               "            joinQuietly(stderr);\n"
+               "            output.append(\"命令超时（120 秒）\");\n"
+               "            return output.toString();\n"
+               "        }\n"
+               "        exitCode = process.exitValue();\n"
+               "        joinQuietly(stdout);\n"
+               "        joinQuietly(stderr);\n"),
+          ])
+
+          changed |= patch('app/src/main/java/com/gkeyes/lhasa26/core/ShizukuExecutor.java', [
+              ('executor-track-and-kill',
+               "        Process process = newProcess(new String[]{\"sh\", \"-c\", command}, ENV, WORK_DIR);\n"
+               "        if (process == null) {\n"
+               "            throw new IllegalStateException(\"Shizuku 拒绝启动 shell 进程\");\n"
+               "        }\n"
+               "        return process;\n"
+               "    }\n",
+               "        Process process = newProcess(new String[]{\"sh\", \"-c\", command}, ENV, WORK_DIR);\n"
+               "        if (process == null) {\n"
+               "            throw new IllegalStateException(\"Shizuku 拒绝启动 shell 进程\");\n"
+               "        }\n"
+               "        active = process;\n"
+               "        return process;\n"
+               "    }\n"
+               "\n"
+               "    private volatile Process active;\n"
+               "\n"
+               "    @Override\n"
+               "    public void kill() {\n"
+               "        Process current = active;\n"
+               "        active = null;\n"
+               "        if (current == null) {\n"
+               "            return;\n"
+               "        }\n"
+               "        try {\n"
+               "            current.destroy();\n"
+               "        } catch (Throwable ignored) {\n"
+               "            // The remote process may already be gone.\n"
+               "        }\n"
+               "        try {\n"
+               "            current.destroyForcibly();\n"
+               "        } catch (Throwable ignored) {\n"
+               "            // Nothing else to do.\n"
+               "        }\n"
+               "    }\n"),
+              ('run-timeout',
+               "        int exitCode = process.waitFor();\n"
+               "        outThread.join(8000L);\n"
+               "        errThread.join(8000L);\n",
+               "        if (!process.waitFor(120L, java.util.concurrent.TimeUnit.SECONDS)) {\n"
+               "            kill();\n"
+               "            outThread.join(2000L);\n"
+               "            errThread.join(2000L);\n"
+               "            return new CommandResult(-1, \"命令超时（120 秒）：\" + command);\n"
+               "        }\n"
+               "        int exitCode = process.exitValue();\n"
+               "        outThread.join(8000L);\n"
+               "        errThread.join(8000L);\n"),
+              ('clear-active',
+               "        return new CommandResult(exitCode, combined);\n",
+               "        active = null;\n"
+               "        return new CommandResult(exitCode, combined);\n"),
+          ])
+
+          changed |= patch('app/src/main/java/com/gkeyes/lhasa26/core/WorkflowEngine.java', [
+              ('device-info-field',
+               "    private volatile String enforceBeforeRun = \"\";\n",
+               "    private volatile String enforceBeforeRun = \"\";\n"
+               "    private volatile long lastDeviceRefresh;\n"),
+              ('stop-kills-process',
+               "    public void stop() {\n"
+               "        worker.shutdownNow();\n"
+               "    }\n",
+               "    public void stop() {\n"
+               "        worker.shutdownNow();\n"
+               "        executor.kill();\n"
+               "    }\n"),
+              ('device-info-single-command',
+               "                DeviceSnapshot snapshot = new DeviceSnapshot(\n"
+               "                        run(\"getprop ro.product.device\", true).output,\n"
+               "                        run(\"getprop ro.build.version.incremental\", true).output,\n"
+               "                        run(\"uname -r\", true).output);\n",
+               "                long now = System.currentTimeMillis();\n"
+               "                if (now - lastDeviceRefresh < 5000L) {\n"
+               "                    return;\n"
+               "                }\n"
+               "                lastDeviceRefresh = now;\n"
+               "                String[] fields = run(\"getprop ro.product.device; getprop ro.build.version.incremental; uname -r\", true)\n"
+               "                        .output.trim().split(\"\\\\n\");\n"
+               "                DeviceSnapshot snapshot = new DeviceSnapshot(\n"
+               "                        fields.length > 0 ? fields[0] : \"\",\n"
+               "                        fields.length > 1 ? fields[1] : \"\",\n"
+               "                        fields.length > 2 ? fields[2] : \"\");\n"),
+              ('defer-rooted-event',
+               "        state = State.ROOTED;\n"
+               "        callbacks.onState(State.ROOTED, \"已获得临时 ROOT\");\n",
+               "        state = State.ROOTED;\n"
+               "        callbacks.onStatus(\"已获得临时 ROOT · 正在加载 KernelSU\");\n"),
+              ('maintenance-gate',
+               "    private CommandResult run(String command, boolean quiet) throws Exception {\n"
+               "        return executor.run(command, quiet);\n"
+               "    }\n",
+               "    /** Runs a maintenance command through the same busy gate as the exploit workflow. */\n"
+               "    public boolean runMaintenance(String command) {\n"
+               "        return start(\"maint\", () -> {\n"
+               "            CommandResult result = run(command, true);\n"
+               "            append(result.isSuccess() ? \"维护命令完成\" : \"维护命令失败：\" + result.output);\n"
+               "        }, false);\n"
+               "    }\n"
+               "\n"
+               "    private CommandResult run(String command, boolean quiet) throws Exception {\n"
+               "        return executor.run(command, quiet);\n"
+               "    }\n"),
+          ])
+
+          changed |= patch('app/src/main/java/com/gkeyes/lhasa26/MainActivity.java', [
+              ('timer-250ms-foreground',
+               "            timer.setText(\"用时 \" + elapsedText(SystemClock.elapsedRealtime() - startAt));\n"
+               "            mainHandler.postDelayed(this, 50L);\n",
+               "            if (hasWindowFocus()) {\n"
+               "                timer.setText(\"用时 \" + elapsedText(SystemClock.elapsedRealtime() - startAt));\n"
+               "            }\n"
+               "            mainHandler.postDelayed(this, 250L);\n"),
+              ('running-disables-buttons',
+               "            if (state == WorkflowEngine.State.RUNNING) {\n"
+               "                status.setText(\"正在运行\");\n"
+               "                return;\n"
+               "            }\n",
+               "            if (state == WorkflowEngine.State.RUNNING) {\n"
+               "                status.setText(\"正在运行\");\n"
+               "                action.setEnabled(false);\n"
+               "                diagnose.setEnabled(false);\n"
+               "                spinner.setVisibility(View.VISIBLE);\n"
+               "                return;\n"
+               "            }\n"),
+              ('maintenance-through-engine',
+               "    private void runMaintenance(String command, String success) {\n"
+               "        if (!ensureShizuku()) {\n"
+               "            return;\n"
+               "        }\n"
+               "        new Thread(() -> {\n"
+               "            try {\n"
+               "                CommandResult result = executor.run(command, true);\n"
+               "                runOnUiThread(() -> toast(result.isSuccess() ? success : \"命令执行失败：\" + result.output));\n"
+               "            } catch (Exception error) {\n"
+               "                runOnUiThread(() -> toast(\"命令执行失败：\" + error.getMessage()));\n"
+               "            }\n"
+               "        }, \"lhasa-maintenance\").start();\n"
+               "    }\n",
+               "    private void runMaintenance(String command, String success) {\n"
+               "        if (!ensureShizuku()) {\n"
+               "            return;\n"
+               "        }\n"
+               "        if (!engine.runMaintenance(command)) {\n"
+               "            toast(\"正在运行，维护操作已取消\");\n"
+               "            return;\n"
+               "        }\n"
+               "        toast(success);\n"
+               "    }\n"),
+          ])
+
+          if changed:
+              print('changed=true')
+          else:
+              print('changed=false')
+          pathlib.Path('/tmp/audit-changed').write_text('1' if changed else '0')
+          PY
+          if [ "$(cat /tmp/audit-changed)" = "1" ]; then
+            git config user.name "lhasa-ci"
+            git config user.email "lhasa-ci@users.noreply.github.com"
+            git add app/src/main/java
+            git commit -m "ci: audit fixes applied (process timeouts, maintenance gate, timer cadence)"
+            git push
+            echo "B: audit fixes committed" >> ci.log
+          else
+            echo "B: audit fixes already present" >> ci.log
+          fi
+
       - name: Repair ksud asset
         run: |
-          echo "B: ksud check start" >> ci.log
+          echo "C: ksud check start" >> ci.log
           actual=$(sha256sum app/src/main/assets/ksud | awk '{print $1}')
           if [ "$actual" = "$KSUSD_SHA256" ]; then
-            echo "B: ksud ok ($actual)" >> ci.log
+            echo "C: ksud ok ($actual)" >> ci.log
             exit 0
           fi
-          echo "B: ksud mismatch actual=$actual expected=$KSUSD_SHA256, restoring from KernelSU v3.3.1" >> ci.log
+          echo "C: ksud mismatch actual=$actual, restoring from KernelSU v3.3.1" >> ci.log
           curl -fsSL -o /tmp/ksu-manager.apk \
             https://github.com/tiann/KernelSU/releases/download/v3.3.1/KernelSU_v3.3.1_32680-release.apk
           echo "$KSU_APK_SHA256  /tmp/ksu-manager.apk" | sha256sum -c - >> ci.log
@@ -51,11 +273,9 @@ jobs:
           cp /tmp/libksud.so app/src/main/assets/ksud
           git config user.name "lhasa-ci"
           git config user.email "lhasa-ci@users.noreply.github.com"
-          # .gitignore ignores *.so; nothing else does, but force-add keeps the binary in the repo.
           git add -f app/src/main/assets/ksud
           git commit -m "ci: restore truncated ksud asset (KernelSU v3.3.1 libksud.so sha256=$KSUSD_SHA256)"
           git push
-          echo "B: ksud restored" >> ci.log
 
       - name: Ensure fixed signing key
         run: |
@@ -75,30 +295,23 @@ jobs:
             git commit -m "ci: add fixed release signing key"
             git push
           fi
-          echo "C: keystore ready" >> ci.log
+          echo "D: keystore ready" >> ci.log
 
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
 
-      - name: Marker D (java + sdk)
+      - name: Marker E (java + sdk)
         run: |
           set +e
-          echo "D: java $(java -version 2>&1 | head -1)" >> ci.log
+          echo "E: java $(java -version 2>&1 | head -1)" >> ci.log
           for root in "${ANDROID_SDK_ROOT:-}" /usr/local/lib/android/sdk /opt/android-sdk; do
             if [ -n "$root" ] && [ -d "$root/platforms" ]; then
-              echo "D: sdk=$root platforms=$(ls "$root/platforms" | tr '\n' ' ')" >> ci.log
+              echo "E: sdk=$root" >> ci.log
               echo "ANDROID_SDK_ROOT=$root" >> "$GITHUB_ENV"
               break
             fi
-          done
-
-      - name: Verify packaged natives
-        run: |
-          set +e
-          for f in perf_slide slide_probe reach_probe uaf_plant_replay pc98260-su ksud lhasa_profile.txt; do
-            echo "E: $(sha256sum "app/src/main/assets/$f" 2>/dev/null | awk '{print $1"  "$2}')" >> ci.log
           done
 
       - name: Gradle build
@@ -111,7 +324,7 @@ jobs:
         run: |
           apk=$(ls app/build/outputs/apk/release/*.apk | head -1)
           unzip -p "$apk" assets/ksud > /tmp/apk-ksud
-          echo "F: apk=$(basename "$apk") ksud=$(sha256sum /tmp/apk-ksud | awk '{print $1}') size=$(stat -c%s /tmp/apk-ksud)" >> ci.log
+          echo "F: apk=$(basename "$apk") ksud=$(sha256sum /tmp/apk-ksud | awk '{print $1}')" >> ci.log
           echo "$KSUSD_SHA256  /tmp/apk-ksud" | sha256sum -c - >> ci.log
 
       - name: Upload APK
