@@ -23,3 +23,4 @@ dependencyResolutionManagement {
 
 rootProject.name = "Lhasa26-Android"
 include(":app")
+include(":design:miuix-console:ui")

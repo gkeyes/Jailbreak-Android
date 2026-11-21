@@ -10,8 +10,8 @@ android {
         applicationId = "com.gkeyes.lhasa26"
         minSdk = 37
         targetSdk = 37
-        versionCode = 300
-        versionName = "0.3.0"
+        versionCode = 301
+        versionName = "0.3.1"
     }
 
     // Fixed release key so later builds keep the same signature and can overwrite-install.
@@ -57,4 +57,5 @@ android {
 dependencies {
     implementation("dev.rikka.shizuku:api:13.1.5")
     implementation("dev.rikka.shizuku:provider:13.1.5")
+    implementation(project(":design:miuix-console:ui"))
 }
