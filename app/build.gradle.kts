@@ -10,13 +10,11 @@ android {
         applicationId = "com.gkeyes.lhasa26"
         minSdk = 37
         targetSdk = 37
-        versionCode = 305
-        versionName = "0.3.5"
+        versionCode = 306
+        versionName = "0.3.6"
         resourceConfigurations += listOf("zh", "en")
     }
 
-    // Fixed release key so later builds keep the same signature and can overwrite-install.
-    // The keystore is created once by CI (see .github/workflows/build.yml) and then reused.
     signingConfigs {
         create("release") {
             val keystoreFile = rootProject.file(System.getenv("LHASA_KEYSTORE") ?: "keystore/lhasa26.jks")
@@ -31,7 +29,6 @@ android {
 
     buildTypes {
         release {
-            // Shrinking matters here: the Compose/Miuix runtime is far larger than this app's code.
             isMinifyEnabled = true
             isShrinkResources = true
             signingConfigs.findByName("release")?.let { signing ->
@@ -59,7 +56,6 @@ android {
 dependencies {
     implementation("dev.rikka.shizuku:api:13.1.5")
     implementation("dev.rikka.shizuku:provider:13.1.5")
-    // ComponentActivity installs the ViewTreeLifecycleOwner that AbstractComposeView requires.
     implementation("androidx.activity:activity:1.12.4")
     implementation(project(":design:miuix-console:ui"))
 }

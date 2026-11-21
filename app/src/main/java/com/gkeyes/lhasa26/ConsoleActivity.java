@@ -30,6 +30,9 @@ import rikka.shizuku.Shizuku;
 /**
  * Host for the Miuix console. ComponentActivity is required because AbstractComposeView resolves
  * ViewTreeLifecycleOwner and ViewTreeSavedStateRegistryOwner from the view tree.
+ *
+ * The primary action is never hard-disabled by Shizuku state: tapping it walks the user through
+ * starting Shizuku and granting access, then runs the workflow.
  */
 public final class ConsoleActivity extends ComponentActivity
         implements WorkflowCallbacks, FoldConsoleView.Listener {
@@ -55,9 +58,8 @@ public final class ConsoleActivity extends ComponentActivity
     private String compatibility = "待检测";
     private String latest = "";
     private boolean running;
-    private boolean authEnabled;
-    private boolean mainEnabled;
-    private boolean diagEnabled;
+    private boolean shizukuAlive;
+    private boolean shizukuGranted;
     private boolean keepScreenOn = true;
     private long startAt;
 
@@ -97,6 +99,12 @@ public final class ConsoleActivity extends ComponentActivity
     }
 
     @Override
+    protected void onResume() {
+        super.onResume();
+        refreshAuthorization();
+    }
+
+    @Override
     protected void onDestroy() {
         handler.removeCallbacksAndMessages(null);
         engine.stop();
@@ -113,23 +121,38 @@ public final class ConsoleActivity extends ComponentActivity
 
     private void refreshAuthorization() {
         runOnUiThread(() -> {
-            boolean alive = Shizuku.pingBinder();
-            boolean granted = false;
-            if (alive) {
+            shizukuAlive = Shizuku.pingBinder();
+            shizukuGranted = false;
+            if (shizukuAlive) {
                 try {
-                    granted = Shizuku.checkSelfPermission() == 0;
+                    shizukuGranted = Shizuku.checkSelfPermission() == 0;
                 } catch (Throwable ignored) {
-                    granted = false;
+                    shizukuGranted = false;
                 }
             }
-            authorization = !alive ? "Shizuku 未运行" : (granted ? "Shizuku 已授权" : "需要授权");
-            authEnabled = true;
-            if (!running) {
-                mainEnabled = alive && granted;
-                diagEnabled = alive && granted;
-            }
+            authorization = !shizukuAlive ? "未运行" : (shizukuGranted ? "已授权" : "需要授权");
+            refreshActionLabel();
             render();
         });
+    }
+
+    private void refreshActionLabel() {
+        WorkflowEngine.State state = engine == null ? WorkflowEngine.State.IDLE : engine.getState();
+        if (state == WorkflowEngine.State.ROOTED || state == WorkflowEngine.State.KSU_PENDING) {
+            actionLabel = "重试 KernelSU 接管";
+            return;
+        }
+        if (state == WorkflowEngine.State.COMPLETE) {
+            actionLabel = "全部完成";
+            return;
+        }
+        if (!shizukuAlive) {
+            actionLabel = "开启 Shizuku 并授权";
+        } else if (!shizukuGranted) {
+            actionLabel = "授权 Shizuku";
+        } else {
+            actionLabel = "一键临时 ROOT";
+        }
     }
 
     private void render() {
@@ -140,17 +163,56 @@ public final class ConsoleActivity extends ComponentActivity
                 status, privilege, authorization, actionLabel, stepText, elapsed,
                 device, build, kernel, compatibility,
                 sessionLog.toString(), latest,
-                mainEnabled, authEnabled, diagEnabled, running, running && !stepText.isEmpty(),
+                !running, true, !running, running, running && !stepText.isEmpty(),
                 keepScreenOn, 0f, versionName());
         console.render(state);
+    }
+
+    /**
+     * Walks the user through Shizuku: start the app, then grant the API permission.
+     * Returns true only when the binder is alive and the permission is granted.
+     */
+    private boolean ensureShizukuOrPrompt() {
+        refreshAuthorization();
+        if (!Shizuku.pingBinder()) {
+            status = "Shizuku 未运行，已为你打开 Shizuku";
+            render();
+            Intent launch = getPackageManager().getLaunchIntentForPackage("moe.shizuku.privileged.api");
+            if (launch != null) {
+                startActivity(launch);
+            } else {
+                toast("未安装 Shizuku");
+            }
+            return false;
+        }
+        int granted;
+        try {
+            granted = Shizuku.checkSelfPermission();
+        } catch (Throwable error) {
+            granted = -1;
+        }
+        if (granted != 0) {
+            try {
+                Shizuku.requestPermission(REQUEST_SHIZUKU);
+                status = "请在 Shizuku 弹窗中允许本应用";
+            } catch (Throwable error) {
+                status = "无法请求 Shizuku 授权：" + error.getMessage();
+            }
+            render();
+            return false;
+        }
+        return true;
     }
 
     @Override
     public void onEvent(FoldEvent event) {
         switch (event) {
-            case PRIMARY:
-                if (engine.getState() == WorkflowEngine.State.ROOTED
-                        || engine.getState() == WorkflowEngine.State.KSU_PENDING) {
+            case PRIMARY: {
+                if (!ensureShizukuOrPrompt()) {
+                    break;
+                }
+                WorkflowEngine.State state = engine.getState();
+                if (state == WorkflowEngine.State.ROOTED || state == WorkflowEngine.State.KSU_PENDING) {
                     if (engine.retryKernelSu()) {
                         beginRun();
                     }
@@ -158,24 +220,12 @@ public final class ConsoleActivity extends ComponentActivity
                     beginRun();
                 }
                 break;
+            }
             case AUTHORIZE:
-                if (!Shizuku.pingBinder()) {
-                    Intent launch = getPackageManager().getLaunchIntentForPackage("moe.shizuku.privileged.api");
-                    if (launch != null) {
-                        startActivity(launch);
-                    } else {
-                        toast("未安装 Shizuku");
-                    }
-                } else {
-                    try {
-                        Shizuku.requestPermission(REQUEST_SHIZUKU);
-                    } catch (Throwable ignored) {
-                        // Already granted or binder unavailable.
-                    }
-                }
+                ensureShizukuOrPrompt();
                 break;
             case DIAGNOSE:
-                if (engine.diagnose()) {
+                if (ensureShizukuOrPrompt() && engine.diagnose()) {
                     beginRun();
                 }
                 break;
@@ -197,7 +247,7 @@ public final class ConsoleActivity extends ComponentActivity
             case HELP:
                 new AlertDialog.Builder(this)
                         .setTitle("使用帮助")
-                        .setMessage("1. 启动 Shizuku 并授权\n2. 接口诊断确认环境\n3. 一键临时 ROOT\n4. 成功后 KernelSU 接管，重启后需重新执行")
+                        .setMessage("1. 点击主按钮：自动打开 Shizuku 并请求授权\n2. 接口诊断确认环境\n3. 一键临时 ROOT\n4. 成功后 KernelSU 接管，重启后需重新执行")
                         .setPositiveButton("知道了", null)
                         .show();
                 break;
@@ -215,14 +265,14 @@ public final class ConsoleActivity extends ComponentActivity
     private void beginRun() {
         running = true;
         startAt = System.currentTimeMillis();
+        refreshActionLabel();
         handler.removeCallbacks(ticker);
         handler.post(ticker);
         render();
     }
 
     private void maintenance(String command, String done) {
-        if (!"Shizuku 已授权".equals(authorization)) {
-            toast("请先授权 Shizuku");
+        if (!ensureShizukuOrPrompt()) {
             return;
         }
         if (!engine.runMaintenance(command)) {
@@ -340,8 +390,6 @@ public final class ConsoleActivity extends ComponentActivity
             switch (state) {
                 case RUNNING:
                     running = true;
-                    mainEnabled = false;
-                    diagEnabled = false;
                     if (startAt == 0) {
                         startAt = System.currentTimeMillis();
                     }
@@ -352,35 +400,24 @@ public final class ConsoleActivity extends ComponentActivity
                 case KSU_PENDING:
                     running = false;
                     privilege = "临时 ROOT";
-                    actionLabel = "重试 KernelSU 接管";
-                    mainEnabled = true;
-                    diagEnabled = true;
                     handler.removeCallbacks(ticker);
                     break;
                 case COMPLETE:
                     running = false;
                     privilege = "临时 ROOT";
-                    actionLabel = "全部完成";
-                    mainEnabled = false;
-                    diagEnabled = true;
                     handler.removeCallbacks(ticker);
                     break;
                 case FAILED:
                     running = false;
                     privilege = "失败";
-                    actionLabel = "重试";
-                    mainEnabled = true;
-                    diagEnabled = true;
                     handler.removeCallbacks(ticker);
                     break;
                 default:
                     running = false;
-                    actionLabel = "一键临时 ROOT";
-                    mainEnabled = true;
-                    diagEnabled = true;
                     handler.removeCallbacks(ticker);
                     break;
             }
+            refreshActionLabel();
             render();
         });
     }
