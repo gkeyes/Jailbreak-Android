@@ -1,0 +1,82 @@
+name: design-build
+
+# Verifies the standalone Miuix console library before it is wired into :app.
+on:
+  push:
+    paths:
+      - 'design/**'
+      - '.github/workflows/design-build.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  design:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Prepare Android SDK
+        run: |
+          set +e
+          for root in "${ANDROID_SDK_ROOT:-}" /usr/local/lib/android/sdk /opt/android-sdk; do
+            if [ -n "$root" ] && [ -d "$root" ]; then
+              echo "ANDROID_SDK_ROOT=$root" >> "$GITHUB_ENV"
+              export ANDROID_SDK_ROOT="$root"
+              if [ -x "$root/cmdline-tools/latest/bin/sdkmanager" ]; then
+                yes | "$root/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null 2>&1
+              fi
+              break
+            fi
+          done
+          java -version 2>&1 | head -1
+
+      - name: Build the console library
+        run: |
+          set -o pipefail
+          cd design/miuix-console
+          chmod +x gradlew
+          ./gradlew --no-daemon :ui:assembleRelease 2>&1 | tee design.log
+
+      - name: Upload AAR and log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: design-output
+          path: |
+            design/miuix-console/ui/build/outputs/aar/*.aar
+            design/miuix-console/design.log
+          if-no-files-found: warn
+
+      - name: Report failure as an issue
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tail -c 20000 design/miuix-console/design.log > /tmp/fail.log 2>/dev/null || true
+          {
+            echo "Commit: \`${GITHUB_SHA:0:8}\`"
+            echo
+            echo '```text'
+            cat /tmp/fail.log
+            echo '```'
+          } > /tmp/fail.md
+          gh issue create \
+            --title "design-build failed ${GITHUB_SHA:0:8}" \
+            --body-file /tmp/fail.md \
+            --label "" 2>/dev/null || gh issue create \
+            --title "design-build failed ${GITHUB_SHA:0:8}" \
+            --body-file /tmp/fail.md
+
+      - name: Report success
+        if: success()
+        run: |
+          echo "console library built ok" >> "$GITHUB_STEP_SUMMARY"
+          ls -l design/miuix-console/ui/build/outputs/aar/ >> "$GITHUB_STEP_SUMMARY"
