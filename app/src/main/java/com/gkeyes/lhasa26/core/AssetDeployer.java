@@ -45,7 +45,8 @@ public final class AssetDeployer {
             }
         }
         String output = CommandExecutor.readProcessOutput(process);
-        if (process.exitValue() != 0) {
+        int exitCode = process.waitFor();
+        if (exitCode != 0) {
             throw new IllegalStateException("写入 " + assetName + " 失败：" + output);
         }
     }

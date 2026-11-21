@@ -16,6 +16,7 @@ public final class ShizukuExecutor implements CommandExecutor {
             "HOME=/data/local/tmp",
             "TMPDIR=/data/local/tmp"
     };
+    private volatile Process active;
 
     @Override
     public boolean isAvailable() {
@@ -38,8 +39,6 @@ public final class ShizukuExecutor implements CommandExecutor {
         active = process;
         return process;
     }
-
-    private volatile Process active;
 
     @Override
     public void kill() {
@@ -90,13 +89,13 @@ public final class ShizukuExecutor implements CommandExecutor {
         ByteArrayOutputStream stderr = new ByteArrayOutputStream();
         Thread outThread = drainAsync(process.getInputStream(), stdout);
         Thread errThread = drainAsync(process.getErrorStream(), stderr);
-        if (!process.waitFor(120L, java.util.concurrent.TimeUnit.SECONDS)) {
+        int exitCode = CommandExecutor.waitWithTimeout(process, 120L);
+        if (exitCode == CommandExecutor.TIMEOUT) {
             kill();
             outThread.join(2000L);
             errThread.join(2000L);
             return new CommandResult(-1, "命令超时（120 秒）：" + command);
         }
-        int exitCode = process.exitValue();
         outThread.join(8000L);
         errThread.join(8000L);
         String out = stdout.toString(StandardCharsets.UTF_8.name());
