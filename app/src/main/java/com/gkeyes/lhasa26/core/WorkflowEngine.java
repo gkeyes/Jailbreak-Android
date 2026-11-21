@@ -122,8 +122,9 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
     }
 
     /**
-     * Serializes every background operation behind one busy flag. Diagnosis runs with ownsState=false
-     * so it never rewrites the root workflow state nor wipes the session log of a finished run.
+     * Serializes every background operation behind one busy flag. The owning workflows change the
+     * public state; diagnosis and maintenance keep it untouched and only report a closing event so the
+     * UI can end its timer without rewriting the recorded result.
      */
     private boolean start(String operation, WorkflowTask action, boolean ownsState) {
         synchronized (this) {
@@ -158,13 +159,16 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
                     fail("操作已中断");
                 } else {
                     append("操作已中断");
+                    callbacks.onState(state, "操作已中断");
                 }
             } catch (Throwable failure) {
                 append(friendly(failure));
                 if (ownsState) {
                     fail(friendly(failure));
                 } else {
-                    callbacks.onStatus("诊断失败 · " + friendly(failure));
+                    String message = "诊断失败 · " + friendly(failure);
+                    callbacks.onStatus(message);
+                    callbacks.onState(state, message);
                 }
             } finally {
                 busy = false;
@@ -279,18 +283,23 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
                     ? "perf_slide 实测可用（slide=" + slide + "），perf_event_open 一项为探针 attr.size 误报"
                     : "perf_slide 同样取不到 KASLR 偏移，该项按真实失败处理"));
             if (usable) {
-                status("诊断通过 · 环境可用（perf 项已覆盖）");
+                String message = "诊断通过 · 环境可用（perf 项已覆盖）";
                 append("[诊断] 通过 · 除 perf_event_open 探针项外全部达标");
+                status(message);
+                callbacks.onState(state, message);
                 return;
             }
         }
+        String message;
         if (report.contains("必需项全部通过")) {
-            status("诊断通过 · 环境可用");
+            message = "诊断通过 · 环境可用";
             append("[诊断] 通过 · 环境可用（仅代表探针达标，不代表固件已修补或未修补）");
         } else {
-            status("诊断未通过 · 详见日志");
+            message = "诊断未通过 · 详见日志";
             append(report.contains("必需接口不可用") ? "[诊断] 失败 · 有必需项未通过" : "[诊断] 未完成 · 详见日志");
         }
+        status(message);
+        callbacks.onState(state, message);
     }
 
     private void runKernelSuStep() {
