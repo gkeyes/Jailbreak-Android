@@ -103,10 +103,8 @@ jobs:
           if [ -n "$apksigner" ]; then
             "$apksigner" verify --print-certs "$apk" > /tmp/certs.txt 2>&1 || true
             cat /tmp/certs.txt >> ci.log
-            cert=$(grep -m1 'SHA-256 digest' /tmp/certs.txt | awk '{print $NF}' | cut -c1-16)
-            echo "cert=$cert" >> ci.log
           fi
-          echo "APK $size bytes, cert ${cert:-unknown}"
+          echo "APK $size bytes"
 
       - name: Upload APK
         if: success()
@@ -116,7 +114,7 @@ jobs:
           path: app/build/outputs/apk/release/*.apk
           if-no-files-found: error
 
-      - name: Publish release
+      - name: Publish release and prune older ones
         if: success()
         env:
           GH_TOKEN: ${{ github.token }}
@@ -137,6 +135,15 @@ jobs:
           else
             gh release create "$tag" "$asset" --title "18fold越狱 ${ver}" --notes "$notes" --target "$GITHUB_SHA"
           fi
+
+          # Only the newest release is kept; the older ones were build experiments.
+          set +e
+          for old in $(gh release list --limit 100 --json tagName --jq '.[].tagName'); do
+            if [ "$old" != "$tag" ]; then
+              echo "deleting release $old"
+              gh release delete "$old" --yes
+            fi
+          done
 
       - name: Report failure as an issue
         if: failure()
