@@ -5,7 +5,7 @@ plugins {
 
 android {
     namespace = "com.gkeyes.lhasa26.ui"
-    compileSdk = 37
+    compileSdk { version = release(37) { minorApiLevel = 2 } }
 
     defaultConfig {
         minSdk = 37
@@ -22,9 +22,13 @@ android {
 }
 
 dependencies {
-    api("androidx.compose.runtime:runtime:1.12.0")
-    api("androidx.compose.ui:ui:1.12.0")
-    implementation("androidx.compose.foundation:foundation:1.12.0")
+    api("androidx.compose.runtime:runtime:1.13.0-rc01")
+    api("androidx.compose.ui:ui:1.13.0-rc01")
+    implementation("androidx.compose.foundation:foundation:1.13.0-rc01")
     implementation("androidx.activity:activity-compose:1.12.4")
-    implementation("top.yukonga.miuix.kmp:miuix-ui:0.9.4")
+    val miuixVersion = "0.9.5-beta03"
+    implementation("top.yukonga.miuix.kmp:miuix-ui:$miuixVersion")
+    implementation("top.yukonga.miuix.kmp:miuix-blur:$miuixVersion")
+    implementation("top.yukonga.miuix.kmp:miuix-glass:$miuixVersion")
+    implementation("top.yukonga.miuix.kmp:miuix-glass-icons:$miuixVersion")
 }
