@@ -22,8 +22,8 @@ env:
 
 jobs:
   build:
-    # Skip the bookkeeping commit this workflow pushes on success.
-    if: "!contains(github.event.head_commit.message, 'ci: signed apk ok')"
+    # Skip the bookkeeping commits this workflow pushes on completion.
+    if: "!contains(github.event.head_commit.message, 'ci: signed apk ok') && !contains(github.event.head_commit.message, 'ci: build failed')"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -58,9 +58,11 @@ jobs:
       - name: Gradle build
         run: |
           chmod +x gradlew
-          ./gradlew --no-daemon --stacktrace :app:assembleRelease
+          set -o pipefail
+          ./gradlew --no-daemon :app:assembleRelease 2>&1 | tee gradle-build.log
 
       - name: Upload APK
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: lhasa26-release-apk
@@ -68,10 +70,20 @@ jobs:
           if-no-files-found: error
 
       - name: Record build
+        if: success()
         run: |
           set -e
           sha=$(sha256sum app/build/outputs/apk/release/*.apk | awk '{print $1}')
           git config user.name "lhasa-ci"
           git config user.email "lhasa-ci@users.noreply.github.com"
           git commit --allow-empty -m "ci: signed apk ok sha256=$sha"
+          git push
+
+      - name: Record failure
+        if: failure()
+        run: |
+          git config user.name "lhasa-ci"
+          git config user.email "lhasa-ci@users.noreply.github.com"
+          excerpt=$(tail -c 400 gradle-build.log 2>/dev/null | tr '\n' ' ' | tr -s ' ' | cut -c1-300)
+          git commit --allow-empty -m "ci: build failed :: ${excerpt:-no-log}"
           git push
