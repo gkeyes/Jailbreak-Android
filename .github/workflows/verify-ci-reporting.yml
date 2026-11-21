@@ -1,0 +1,57 @@
+name: Verify CI reporting
+on:
+  push:
+    branches: [ci/verify-actions-summary-4da1a89]
+    paths: ['.github/workflows/verify-ci-reporting.yml']
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 4da1a89a3308dd71024a6462d15113ab425b8b4f
+          persist-credentials: false
+          sparse-checkout: .github/workflows/build.yml
+          sparse-checkout-cone-mode: false
+
+      - name: Verify success and failure summaries with fixture data
+        shell: ruby {0}
+        run: |
+          require 'yaml'
+          require 'tmpdir'
+          require 'fileutils'
+          require 'digest'
+
+          config = YAML.load_file('.github/workflows/build.yml')
+          steps = config.fetch('jobs').fetch('build').fetch('steps')
+          actions_summary = ENV.fetch('GITHUB_STEP_SUMMARY')
+          cases = {'Record build' => 'success()', 'Record failure' => 'failure()'}
+
+          cases.each do |name, condition|
+            step = steps.find { |entry| entry['name'] == name } || abort("Missing #{name}")
+            abort("Unexpected condition for #{name}") unless step.fetch('if') == condition
+            Dir.mktmpdir do |dir|
+              report = File.join(dir, 'summary.md')
+              environment = {'GITHUB_STEP_SUMMARY' => report, 'KSUSD_SHA256' => '0' * 64}
+              if name == 'Record build'
+                fixture = 'app/build/outputs/apk/release/fixture.apk'
+                FileUtils.mkdir_p(File.dirname(File.join(dir, fixture)))
+                File.write(File.join(dir, fixture), 'plain text fixture')
+                expected = ["Build and upload succeeded.", Digest::SHA256.hexdigest('plain text fixture'), fixture, '0' * 64]
+              else
+                expected = ['See the first failed step']
+              end
+
+              ok = system(environment, 'bash', '-e', '-o', 'pipefail', '-c', step.fetch('run'), chdir: dir)
+              abort("#{name} exited unsuccessfully") unless ok
+              output = File.read(report)
+              abort("#{name} summary missing expected text") unless expected.all? { |part| output.include?(part) }
+              puts "#{name}: PASS"
+              File.open(actions_summary, 'a') { |f| f.puts "- #{name}: PASS" }
+            end
+          end
