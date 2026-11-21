@@ -338,19 +338,15 @@ jobs:
       - name: Record build
         if: success()
         run: |
-          set -e
-          sha=$(sha256sum app/build/outputs/apk/release/*.apk | awk '{print $1}')
-          ksud=$(unzip -p app/build/outputs/apk/release/*.apk assets/ksud | sha256sum | awk '{print $1}')
-          git config user.name "lhasa-ci"
-          git config user.email "lhasa-ci@users.noreply.github.com"
-          git commit --allow-empty -m "ci: signed apk ok sha256=$sha ksud=$ksud"
-          git push
+          {
+            echo "Build and upload succeeded."
+            echo
+            echo '```text'
+            sha256sum app/build/outputs/apk/release/*.apk
+            printf '%s  %s\n' "$KSUSD_SHA256" "assets/ksud"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Record failure
         if: failure()
-        run: |
-          git config user.name "lhasa-ci"
-          git config user.email "lhasa-ci@users.noreply.github.com"
-          excerpt=$(tail -c 600 ci.log 2>/dev/null | tr '\n' ' ' | tr -s ' ' | cut -c1-400)
-          git commit --allow-empty -m "ci: build failed :: ${excerpt:-no-log}"
-          git push
+        run: echo "See the first failed step in this job for the error." >> "$GITHUB_STEP_SUMMARY"
