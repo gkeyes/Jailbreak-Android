@@ -23,10 +23,6 @@
             android:name="moe.shizuku.client.V3_SUPPORT"
             android:value="true" />
         <activity
-            android:name=".DonateActivity"
-            android:exported="false"
-            android:screenOrientation="unspecified" />
-        <activity
             android:name=".MainActivity"
             android:configChanges="smallestScreenSize|screenSize|screenLayout|orientation|keyboardHidden"
             android:exported="true"

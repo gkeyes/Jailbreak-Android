@@ -6,9 +6,14 @@ import android.content.ContentValues;
 import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
+import android.content.res.ColorStateList;
+import android.content.res.Configuration;
+import android.graphics.Insets;
 import android.graphics.Typeface;
 import android.graphics.Color;
 import android.graphics.drawable.GradientDrawable;
+import android.graphics.drawable.RippleDrawable;
+import android.graphics.drawable.StateListDrawable;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
@@ -22,9 +27,11 @@ import android.text.TextUtils;
 import android.view.Gravity;
 import android.view.View;
 import android.view.Window;
+import android.view.WindowInsets;
+import android.view.WindowInsetsController;
 import android.widget.Button;
-import android.widget.CompoundButton;
 import android.widget.FrameLayout;
+import android.widget.ImageButton;
 import android.widget.LinearLayout;
 import android.widget.ProgressBar;
 import android.widget.ScrollView;
@@ -34,10 +41,10 @@ import android.widget.Toast;
 
 import com.gkeyes.lhasa26.core.CommandResult;
 import com.gkeyes.lhasa26.core.DeviceSnapshot;
-import com.gkeyes.lhasa26.core.KernelSupport;
 import com.gkeyes.lhasa26.core.ShizukuExecutor;
 import com.gkeyes.lhasa26.core.WorkflowCallbacks;
 import com.gkeyes.lhasa26.core.WorkflowEngine;
+import com.gkeyes.lhasa26.ui.GlassMaterial;
 import com.gkeyes.lhasa26.ui.StepProgressView;
 
 import java.io.File;
@@ -52,21 +59,33 @@ import rikka.shizuku.Shizuku;
 
 public final class MainActivity extends Activity implements WorkflowCallbacks {
     private static final int REQUEST_SHIZUKU = 1001;
-    private static final int BG = 0xFFF2F1F7;
-    private static final int INK = 0xFF1F2026;
-    private static final int SUB = 0xFF8A8994;
-    private static final int ACCENT = 0xFF3478F6;
-    private static final int GREEN = 0xFF159447;
-    private static final int RED = 0xFFD93632;
+    private boolean dark;
+    private int ink;
+    private int muted;
+    private int accent;
+    private int line;
+    private int success;
+    private int danger;
+    private GlassMaterial glass;
+    private SharedPreferences preferences;
 
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private final ShizukuExecutor executor = new ShizukuExecutor();
+    private final Shizuku.OnBinderReceivedListener binderReceived = this::refreshConnection;
+    private final Shizuku.OnBinderDeadListener binderDead = this::refreshConnection;
+    private final Shizuku.OnRequestPermissionResultListener permissionResult = (requestCode, grantResult) -> {
+        if (requestCode == REQUEST_SHIZUKU) refreshConnection();
+    };
     private WorkflowEngine engine;
     private long startAt;
     private boolean timing;
 
     private LinearLayout root;
-    private LinearLayout hero;
+    private View statusRing;
+    private LinearLayout progressDetails;
+    private TextView shizukuState;
+    private TextView privilegeState;
+    private TextView emptyLog;
     private TextView status;
     private TextView stepLabel;
     private TextView timer;
@@ -77,7 +96,7 @@ public final class MainActivity extends Activity implements WorkflowCallbacks {
     private TextView fitValue;
     private Button action;
     private Button diagnose;
-    private Button export;
+    private Button authorization;
     private ProgressBar spinner;
     private StepProgressView stepProgress;
     private ScrollView scroll;
@@ -98,6 +117,16 @@ public final class MainActivity extends Activity implements WorkflowCallbacks {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        dark = (getResources().getConfiguration().uiMode & Configuration.UI_MODE_NIGHT_MASK)
+                == Configuration.UI_MODE_NIGHT_YES;
+        ink = getColor(R.color.ink);
+        muted = getColor(R.color.sub);
+        accent = getColor(R.color.accent);
+        line = getColor(R.color.line);
+        success = getColor(R.color.success);
+        danger = getColor(R.color.danger);
+        preferences = getSharedPreferences("lhasa26", MODE_PRIVATE);
+        applyKeepScreenOn(preferences.getBoolean("keep_screen_on", true));
         configureWindow(getWindow());
         engine = new WorkflowEngine(getAssets(), executor, this);
         buildUi();
@@ -106,188 +135,233 @@ public final class MainActivity extends Activity implements WorkflowCallbacks {
     }
 
     private void configureWindow(Window window) {
-        window.setStatusBarColor(BG);
-        window.setNavigationBarColor(BG);
-        window.getDecorView().setSystemUiVisibility(View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR);
+        View decor = window.getDecorView();
+        if (Build.VERSION.SDK_INT >= 30) {
+            window.setDecorFitsSystemWindows(false);
+            WindowInsetsController controller = window.getInsetsController();
+            if (controller != null) {
+                int flags = WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS
+                        | WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS;
+                controller.setSystemBarsAppearance(dark ? 0 : flags, flags);
+            }
+        } else {
+            int layout = View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+                    | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION;
+            int lightBars = View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR | View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR;
+            decor.setSystemUiVisibility(dark ? layout : layout | lightBars);
+        }
+        window.setStatusBarColor(Color.TRANSPARENT);
+        window.setNavigationBarColor(Color.TRANSPARENT);
     }
 
     private void buildUi() {
-        root = new LinearLayout(this);
+        FrameLayout viewport = new FrameLayout(this);
+        glass = new GlassMaterial(viewport, dark);
+        viewport.setBackground(glass.backdrop());
+        scroll = new ScrollView(this);
+        scroll.setFillViewport(true);
+        scroll.setClipToPadding(false);
+        scroll.setVerticalScrollBarEnabled(false);
+        scroll.setOnApplyWindowInsetsListener((view, insets) -> {
+            if (Build.VERSION.SDK_INT >= 30) {
+                Insets safe = insets.getInsets(WindowInsets.Type.systemBars() | WindowInsets.Type.displayCutout());
+                view.setPadding(safe.left, safe.top, safe.right, safe.bottom);
+            } else {
+                view.setPadding(insets.getSystemWindowInsetLeft(), insets.getSystemWindowInsetTop(),
+                        insets.getSystemWindowInsetRight(), insets.getSystemWindowInsetBottom());
+            }
+            return insets;
+        });
+        viewport.addView(scroll, new FrameLayout.LayoutParams(-1, -1));
+
+        FrameLayout page = new FrameLayout(this);
+        root = new LinearLayout(this) {
+            @Override
+            protected void onMeasure(int widthSpec, int heightSpec) {
+                int width = Math.min(MeasureSpec.getSize(widthSpec), dp(520));
+                super.onMeasure(MeasureSpec.makeMeasureSpec(width, MeasureSpec.EXACTLY), heightSpec);
+            }
+        };
         root.setOrientation(LinearLayout.VERTICAL);
-        root.setPadding(dp(16), statusBarHeight() + dp(10), dp(16), navBarHeight() + dp(16));
-        root.setBackgroundColor(BG);
+        root.setPadding(dp(16), dp(10), dp(16), dp(20));
+        page.addView(root, new FrameLayout.LayoutParams(-1, -2, Gravity.TOP | Gravity.CENTER_HORIZONTAL));
+        scroll.addView(page, new ScrollView.LayoutParams(-1, -2));
 
-        root.addView(text("v" + versionName(), 10, SUB, false));
-        root.addView(text("LHASA · Android 设备工具链", 12, SUB, false));
-        TextView title = text("临时 ROOT", 32, INK, true);
-        title.setPadding(0, dp(4), 0, 0);
-        root.addView(title);
-        TextView subtitle = text("本次开机内有效 · 重启后失效", 13, SUB, false);
-        subtitle.setPadding(0, dp(5), 0, 0);
-        root.addView(subtitle);
+        LinearLayout header = horizontalRow();
+        TextView title = text(getString(R.string.app_name), 31, ink, true);
+        if (Build.VERSION.SDK_INT >= 28) title.setAccessibilityHeading(true);
+        header.addView(title, new LinearLayout.LayoutParams(0, -2, 1f));
+        header.addView(iconButton(R.drawable.ic_settings, "设置", this::showSettings),
+                new LinearLayout.LayoutParams(dp(44), dp(44)));
+        root.addView(header);
 
-        hero = new LinearLayout(this);
-        hero.setOrientation(LinearLayout.VERTICAL);
-        hero.setPadding(dp(16), dp(14), dp(16), dp(16));
-        hero.setBackground(gradient(0xFF3478F6, 0xFF2850B8, 28));
-        LinearLayout.LayoutParams heroParams = new LinearLayout.LayoutParams(-1, -2);
-        heroParams.topMargin = dp(12);
-        hero.setLayoutParams(heroParams);
-        hero.addView(text("当前状态", 12, 0x99FFFFFF, false));
+        buildHero();
+        buildDeviceCard();
+        buildLogCard();
+        buildMaintenanceCard();
 
-        LinearLayout statusRow = new LinearLayout(this);
-        statusRow.setGravity(Gravity.CENTER_VERTICAL);
-        status = text("正在检测", 24, Color.WHITE, true);
+        TextView help = text("在状态卡查看 Shizuku 和临时 ROOT 的状态。接口诊断可查看设备信息，日志可从运行记录导出。",
+                14, muted, false);
+        help.setPadding(0, 0, 0, dp(12));
+        root.addView(collapsible("使用帮助", help));
+        setContentView(viewport);
+        scroll.requestApplyInsets();
+    }
+
+    private void buildHero() {
+        LinearLayout hero = card(GlassMaterial.Layer.HERO, 20, 16);
+        hero.addView(heading("设备状态"));
+
+        LinearLayout statusRow = horizontalRow();
+        statusRow.setPadding(0, dp(8), 0, dp(8));
+        statusRing = new View(this);
+        setHero(muted);
+        LinearLayout.LayoutParams ringParams = new LinearLayout.LayoutParams(dp(18), dp(18));
+        ringParams.setMarginEnd(dp(9));
+        statusRow.addView(statusRing, ringParams);
+        status = text("正在检测", 25, ink, true);
+        status.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);
         statusRow.addView(status, new LinearLayout.LayoutParams(0, -2, 1f));
         spinner = new ProgressBar(this);
-        spinner.setIndeterminate(true);
+        spinner.setIndeterminateTintList(ColorStateList.valueOf(accent));
         spinner.setVisibility(View.GONE);
         statusRow.addView(spinner, new LinearLayout.LayoutParams(dp(22), dp(22)));
         hero.addView(statusRow);
 
-        LinearLayout progressRow = new LinearLayout(this);
-        progressRow.setGravity(Gravity.CENTER_VERTICAL);
-        stepLabel = text("准备就绪", 12, 0xCCFFFFFF, false);
-        progressRow.addView(stepLabel, new LinearLayout.LayoutParams(0, -2, 1f));
-        timer = text("用时 0.00 秒", 12, 0xCCFFFFFF, false);
-        timer.setGravity(Gravity.END);
-        progressRow.addView(timer, new LinearLayout.LayoutParams(dp(110), -2));
-        hero.addView(progressRow);
+        LinearLayout metrics = horizontalRow();
+        shizukuState = text("检测中", 12, ink, true);
+        privilegeState = text("未知", 12, ink, true);
+        metrics.addView(statusMetric("Shizuku", shizukuState), flatParams(0, 0));
+        metrics.addView(statusMetric("临时 ROOT", privilegeState), flatParams(1, 6));
+        hero.addView(metrics);
 
-        stepProgress = new StepProgressView(this);
+        authorization = new Button(this, null, android.R.attr.borderlessButtonStyle);
+        authorization.setAllCaps(false);
+        authorization.setText("请求 Shizuku 授权");
+        authorization.setTextColor(accent);
+        authorization.setTextSize(13);
+        authorization.setTypeface(Typeface.DEFAULT_BOLD);
+        authorization.setMinimumHeight(dp(44));
+        authorization.setGravity(Gravity.START | Gravity.CENTER_VERTICAL);
+        authorization.setPadding(0, 0, 0, 0);
+        authorization.setOnClickListener(view -> {
+            if (ensureShizuku()) toast("Shizuku 已授权");
+        });
+        hero.addView(authorization, new LinearLayout.LayoutParams(-2, -2));
+
+        LinearLayout buttons = horizontalRow();
+        action = button("一键临时 ROOT", true);
+        action.setOnClickListener(view -> onAction());
+        diagnose = button("接口诊断", false);
+        diagnose.setOnClickListener(view -> onDiagnose());
+        buttons.addView(action, flatParams(0, 0));
+        buttons.addView(diagnose, flatParams(1, 8));
+        hero.addView(buttons);
+
+        progressDetails = new LinearLayout(this);
+        progressDetails.setOrientation(LinearLayout.VERTICAL);
+        progressDetails.setPadding(0, dp(12), 0, 0);
+        progressDetails.setVisibility(View.GONE);
+        LinearLayout progressRow = horizontalRow();
+        stepLabel = text("准备就绪", 12, muted, false);
+        progressRow.addView(stepLabel, new LinearLayout.LayoutParams(0, -2, 1f));
+        timer = text("", 12, muted, false);
+        timer.setGravity(Gravity.END);
+        progressRow.addView(timer, new LinearLayout.LayoutParams(-2, -2));
+        progressDetails.addView(progressRow);
+        stepProgress = new StepProgressView(this, accent, line);
         LinearLayout.LayoutParams stepParams = new LinearLayout.LayoutParams(-1, dp(4));
         stepParams.topMargin = dp(7);
-        hero.addView(stepProgress, stepParams);
-        TextView shellHint = text("Shizuku 提供与 adb shell 相同的权限身份", 12, 0xB3FFFFFF, false);
-        shellHint.setPadding(0, dp(8), 0, 0);
-        hero.addView(shellHint);
+        progressDetails.addView(stepProgress, stepParams);
+        hero.addView(progressDetails);
         root.addView(hero);
+    }
 
-        root.addView(section("设备"));
-        LinearLayout deviceCard = listCard();
-        deviceValue = text("—", 13, SUB, false);
-        buildValue = text("—", 11, SUB, false);
-        kernelValue = text("—", 11, SUB, false);
-        fitValue = text("检测中", 13, SUB, false);
-        deviceCard.addView(row("设备", deviceValue, false));
-        deviceCard.addView(row("系统", buildValue, false));
-        deviceCard.addView(row("内核", kernelValue, false));
-        deviceCard.addView(row("适配", fitValue, false));
-        deviceCard.addView(infoRow("支持", "18 Fold / 平板 9 Pro Max", true));
+    private void buildDeviceCard() {
+        LinearLayout deviceCard = card(GlassMaterial.Layer.CARD, 20, 14);
+        deviceCard.addView(heading("设备信息"));
+        deviceValue = text("—", 13, muted, false);
+        buildValue = text("—", 13, muted, false);
+        kernelValue = text("—", 13, muted, false);
+        fitValue = text("待检测", 13, muted, false);
+        addDeviceRow(deviceCard, "设备代号", deviceValue, true);
+        addDeviceRow(deviceCard, "系统版本", buildValue, false);
+        addDeviceRow(deviceCard, "内核版本", kernelValue, false);
+        addDeviceRow(deviceCard, "适配状态", fitValue, false);
         root.addView(deviceCard);
+    }
 
-        root.addView(section("操作"));
-        action = primaryButton("一键临时 ROOT", ACCENT, Color.WHITE);
-        action.setOnClickListener(v -> onAction());
-        root.addView(action);
+    private void buildLogCard() {
+        LinearLayout logCard = card(GlassMaterial.Layer.CARD, 20, 10);
+        LinearLayout bar = horizontalRow();
+        bar.addView(heading("运行记录"), new LinearLayout.LayoutParams(0, -2, 1f));
+        bar.addView(iconButton(R.drawable.ic_download, "导出日志", this::exportLog),
+                new LinearLayout.LayoutParams(dp(44), dp(44)));
+        logCard.addView(bar);
+        emptyLog = text("暂无记录", 13, muted, false);
+        emptyLog.setGravity(Gravity.CENTER);
+        emptyLog.setMinHeight(dp(38));
+        logCard.addView(emptyLog, new LinearLayout.LayoutParams(-1, -2));
+        log = text("", 12, ink, false);
+        log.setTypeface(Typeface.MONOSPACE);
+        log.setTextIsSelectable(true);
+        log.setLineSpacing(dp(3), 1f);
+        log.setVisibility(View.GONE);
+        logCard.addView(log, new LinearLayout.LayoutParams(-1, -2));
+        root.addView(logCard);
+    }
 
-        LinearLayout secondary = new LinearLayout(this);
-        secondary.setOrientation(LinearLayout.HORIZONTAL);
-        diagnose = primaryButton("接口诊断", Color.WHITE, INK);
-        diagnose.setLayoutParams(new LinearLayout.LayoutParams(0, -2, 1f));
-        diagnose.setOnClickListener(v -> onDiagnose());
-        export = primaryButton("导出日志", Color.WHITE, INK);
-        LinearLayout.LayoutParams exportParams = new LinearLayout.LayoutParams(0, -2, 1f);
-        exportParams.leftMargin = dp(10);
-        export.setLayoutParams(exportParams);
-        export.setOnClickListener(v -> exportLog());
-        secondary.addView(diagnose);
-        secondary.addView(export);
-        root.addView(secondary);
-
-        Button donate = primaryButton("捐赠", ACCENT, Color.WHITE);
-        donate.setOnClickListener(v -> startActivity(new Intent(this, DonateActivity.class)));
-        root.addView(donate);
-
-        LinearLayout maintenance = new LinearLayout(this);
-        maintenance.setOrientation(LinearLayout.HORIZONTAL);
-        Button reboot = toneButton("重启");
-        Button softReboot = toneButton("软重启");
-        Button clean = toneButton("清理临时文件");
+    private void buildMaintenanceCard() {
+        LinearLayout maintenance = horizontalRow();
+        maintenance.setPadding(0, 0, 0, dp(12));
+        Button reboot = button("重启", false);
+        Button softReboot = button("软重启", false);
+        Button clean = button("清理临时文件", false);
         reboot.setOnClickListener(v -> confirm("重启", "确认立即重启？\n\n本次开机获取的临时 ROOT 将失效。", this::reboot));
         softReboot.setOnClickListener(v -> confirm("软重启", "将尝试重启系统服务，界面会短暂消失。确认继续？", this::softReboot));
         clean.setOnClickListener(v -> confirm("清理临时文件", "将清理日志与诊断程序，正在使用的 ROOT 组件会保留。确认继续？", this::cleanTemp));
         maintenance.addView(reboot, flatParams(0, 0));
-        maintenance.addView(softReboot, flatParams(1, 8));
-        maintenance.addView(clean, flatParams(2, 8));
-        root.addView(maintenance);
+        maintenance.addView(softReboot, flatParams(1, 6));
+        maintenance.addView(clean, flatParams(2, 6));
+        root.addView(collapsible("维护工具", maintenance));
+    }
 
-        root.addView(section("记录"));
-        LinearLayout logCard = card();
-        logCard.addView(text("运行记录", 14, INK, true));
-        log = text("尚未开始。", 11, SUB, false);
-        log.setTypeface(Typeface.MONOSPACE);
-        log.setLineSpacing(dp(3), 1f);
-        log.setPadding(0, dp(7), 0, 0);
-        logCard.addView(log);
-        root.addView(logCard);
-
-        root.addView(section("帮助"));
-        LinearLayout help = listCard();
-        TextView helpTitle = text("使用帮助 · 点击展开", 13, INK, true);
-        helpTitle.setPadding(0, dp(10), 0, dp(10));
-        LinearLayout helpBody = new LinearLayout(this);
-        helpBody.setOrientation(LinearLayout.VERTICAL);
-        helpBody.setVisibility(View.GONE);
-        help.addView(helpTitle);
-        help.addView(helpBody);
-        helpBody.addView(helpStep(1, "安装并启动 Shizuku", "首次使用需安装 Shizuku 并启动一次，通过无线调试启动。"));
-        helpBody.addView(helpStep(2, "授权本应用", "首次点击按钮时允许 Shizuku 权限。"));
-        helpBody.addView(helpStep(3, "一键临时 ROOT", "运行期间请勿锁屏、清理后台或重复点击。"));
-        helpBody.addView(helpStep(4, "验证结果", "成功后可使用 /data/local/tmp/pc98260-su 执行 id 验证。"));
-        helpBody.addView(helpStep(5, "KernelSU 接管", "临时 ROOT 成功后会自动尝试加载 KernelSU；失败时可再次点击重试。"));
-        helpBody.addView(helpStep(6, "失败后须重启", "提权失败后请重启设备，再进行下一次尝试。"));
-        helpTitle.setOnClickListener(v -> {
-            boolean expand = helpBody.getVisibility() != View.VISIBLE;
-            helpBody.setVisibility(expand ? View.VISIBLE : View.GONE);
-            helpTitle.setText(expand ? "使用帮助 · 点击收起" : "使用帮助 · 点击展开");
-        });
-        root.addView(help);
-
-        root.addView(section("设置"));
-        LinearLayout settings = listCard();
+    private void showSettings() {
         Switch keepScreenOn = new Switch(this);
-        SharedPreferences preferences = getSharedPreferences("lhasa26", MODE_PRIVATE);
-        boolean keep = preferences.getBoolean("keep_screen_on", true);
-        keepScreenOn.setChecked(keep);
-        applyKeepScreenOn(keep);
+        keepScreenOn.setText("保持屏幕常亮");
+        keepScreenOn.setTextColor(ink);
+        keepScreenOn.setMinHeight(dp(48));
+        keepScreenOn.setChecked(preferences.getBoolean("keep_screen_on", true));
         keepScreenOn.setOnCheckedChangeListener((button, checked) -> {
             applyKeepScreenOn(checked);
             preferences.edit().putBoolean("keep_screen_on", checked).apply();
         });
-        settings.addView(switchRow("保持屏幕常亮", "提权过程中避免 Shizuku 连接中断", keepScreenOn));
-        root.addView(settings);
-
-        root.addView(section("关于"));
-        LinearLayout about = listCard();
-        about.addView(infoRow("版本", versionName(), false));
-        about.addView(infoRow("设备", "18 Fold（lhasa）\nPad 9 Pro Max（yingtian）", false));
-        about.addView(infoRow("漏洞", "CVE-2026-98260", true));
-        about.addView(infoRow("重构", "Lhasa26-Android · clean-room orchestration", true));
-        root.addView(about);
-
-        FrameLayout shell = new FrameLayout(this);
-        shell.setBackgroundColor(BG);
-        shell.addView(root, new FrameLayout.LayoutParams(-1, -2));
-        scroll = new ScrollView(this);
-        scroll.setFillViewport(true);
-        scroll.setClipToPadding(false);
-        scroll.setBackgroundColor(BG);
-        scroll.addView(shell, new ScrollView.LayoutParams(-1, -2));
-        setContentView(scroll);
+        LinearLayout content = new LinearLayout(this);
+        content.setOrientation(LinearLayout.VERTICAL);
+        content.setPadding(dp(24), dp(8), dp(24), 0);
+        content.addView(keepScreenOn, new LinearLayout.LayoutParams(-1, -2));
+        content.addView(text("外观跟随系统", 13, muted, false));
+        content.addView(text("版本 " + versionName(), 13, muted, false));
+        new AlertDialog.Builder(this)
+                .setTitle("设置")
+                .setView(content)
+                .setPositiveButton("完成", null)
+                .show();
     }
 
     private void registerShizukuCallbacks() {
-        Shizuku.addBinderReceivedListenerSticky(this::refreshConnection);
-        Shizuku.addBinderDeadListener(this::refreshConnection);
-        Shizuku.addRequestPermissionResultListener((requestCode, grantResult) -> refreshConnection());
+        Shizuku.addBinderReceivedListenerSticky(binderReceived);
+        Shizuku.addBinderDeadListener(binderDead);
+        Shizuku.addRequestPermissionResultListener(permissionResult);
     }
 
     private void refreshConnection() {
         runOnUiThread(() -> {
+            if (isDestroyed()) return;
             WorkflowEngine.State state = engine.getState();
+            updateShizukuStatus();
             if (state == WorkflowEngine.State.COMPLETE) {
-                setHero(GREEN, 0xFF0C6236);
+                setHero(success);
                 status.setText("全部完成 · KernelSU 已接管");
                 action.setText("全部完成");
                 action.setEnabled(false);
@@ -296,7 +370,7 @@ public final class MainActivity extends Activity implements WorkflowCallbacks {
                 return;
             }
             if (state == WorkflowEngine.State.ROOTED || state == WorkflowEngine.State.KSU_PENDING) {
-                setHero(GREEN, 0xFF0C6236);
+                setHero(success);
                 if (state == WorkflowEngine.State.ROOTED) {
                     status.setText("已获得临时 ROOT");
                 }
@@ -309,15 +383,15 @@ public final class MainActivity extends Activity implements WorkflowCallbacks {
                 return;
             }
             if (!Shizuku.pingBinder()) {
-                setHero(ACCENT, 0xFF2850B8);
+                setHero(accent);
                 status.setText("Shizuku 未运行");
-                action.setText("打开 Shizuku");
+                action.setText("一键临时 ROOT");
                 action.setEnabled(true);
                 return;
             }
             if (Shizuku.checkSelfPermission() != 0) {
                 status.setText("需要授权");
-                action.setText("请求 Shizuku 授权");
+                action.setText("一键临时 ROOT");
                 action.setEnabled(true);
                 return;
             }
@@ -365,8 +439,10 @@ public final class MainActivity extends Activity implements WorkflowCallbacks {
         action.setEnabled(false);
         diagnose.setEnabled(false);
         spinner.setVisibility(View.VISIBLE);
+        progressDetails.setVisibility(View.VISIBLE);
         log.setText("");
-        setHero(ACCENT, 0xFF2850B8);
+        showLogContent();
+        setHero(accent);
     }
 
     private boolean ensureShizuku() {
@@ -407,12 +483,16 @@ public final class MainActivity extends Activity implements WorkflowCallbacks {
             if (log.length() > 48000) {
                 log.setText(log.getText().subSequence(Math.max(0, log.length() - 40000), log.length()));
             }
+            showLogContent();
         });
     }
 
     @Override
     public void onTail(String value) {
-        runOnUiThread(() -> log.setText(lastLines(value, 14)));
+        runOnUiThread(() -> {
+            log.setText(lastLines(value, 14));
+            showLogContent();
+        });
     }
 
     @Override
@@ -432,13 +512,15 @@ public final class MainActivity extends Activity implements WorkflowCallbacks {
             buildValue.setText(snapshot.build);
             kernelValue.setText(snapshot.kernel);
             fitValue.setText(snapshot.isKernelSupported() ? "已适配" : "未适配");
-            fitValue.setTextColor(snapshot.isKernelSupported() ? GREEN : RED);
+            fitValue.setTextColor(snapshot.isKernelSupported() ? success : danger);
         });
     }
 
     @Override
     public void onState(WorkflowEngine.State state, String message) {
         runOnUiThread(() -> {
+            updateShizukuStatus();
+            if (state == WorkflowEngine.State.RUNNING) progressDetails.setVisibility(View.VISIBLE);
             if (state == WorkflowEngine.State.RUNNING) {
                 status.setText("正在运行");
                 action.setEnabled(false);
@@ -451,24 +533,24 @@ public final class MainActivity extends Activity implements WorkflowCallbacks {
             diagnose.setEnabled(true);
             action.setEnabled(state != WorkflowEngine.State.COMPLETE);
             if (state == WorkflowEngine.State.ROOTED || state == WorkflowEngine.State.KSU_PENDING) {
-                setHero(GREEN, 0xFF0C6236);
+                setHero(success);
+                privilegeState.setText("已获得");
                 status.setText(message);
                 action.setText("重试 KernelSU 接管");
-                action.setTextColor(Color.WHITE);
-                action.setBackground(buttonBackground(GREEN));
                 vibrate();
             } else if (state == WorkflowEngine.State.COMPLETE) {
-                setHero(GREEN, 0xFF0C6236);
+                setHero(success);
+                privilegeState.setText("已获得");
                 status.setText(message);
                 action.setText("全部完成");
-                action.setTextColor(Color.WHITE);
-                action.setBackground(buttonBackground(GREEN));
+                stepProgress.setRatio(1f);
                 vibrate();
             } else if (state == WorkflowEngine.State.FAILED) {
-                setHero(RED, 0xFF8E1E2B);
+                setHero(danger);
                 status.setText(message);
                 action.setText("重启后重试");
             } else {
+                setHero(muted);
                 status.setText(message);
                 action.setText("一键临时 ROOT");
             }
@@ -595,8 +677,166 @@ public final class MainActivity extends Activity implements WorkflowCallbacks {
         }
     }
 
-    private void setHero(int start, int end) {
-        hero.setBackground(gradient(start, end, 28));
+    private void setHero(int color) {
+        GradientDrawable ring = new GradientDrawable();
+        ring.setShape(GradientDrawable.OVAL);
+        ring.setColor(Color.TRANSPARENT);
+        ring.setStroke(dp(2), color);
+        statusRing.setBackground(ring);
+    }
+
+    private void showLogContent() {
+        boolean hasLog = log.length() > 0;
+        log.setVisibility(hasLog ? View.VISIBLE : View.GONE);
+        emptyLog.setVisibility(hasLog ? View.GONE : View.VISIBLE);
+    }
+
+    private void updateShizukuStatus() {
+        boolean connected = Shizuku.pingBinder();
+        boolean authorized = connected && Shizuku.checkSelfPermission() == 0;
+        shizukuState.setText(!connected ? "未连接" : authorized ? "已授权" : "待授权");
+        authorization.setText(!connected ? "打开 Shizuku" : authorized ? "Shizuku 已授权" : "请求 Shizuku 授权");
+        authorization.setEnabled(!authorized);
+    }
+
+    private LinearLayout card(GlassMaterial.Layer layer, int radius, int verticalPadding) {
+        LinearLayout card = new LinearLayout(this);
+        card.setOrientation(LinearLayout.VERTICAL);
+        card.setBackground(glass.surface(card, layer, radius));
+        card.setPadding(dp(16), dp(verticalPadding), dp(16), dp(verticalPadding));
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-1, -2);
+        params.topMargin = dp(12);
+        card.setLayoutParams(params);
+        return card;
+    }
+
+    private LinearLayout collapsible(String label, View body) {
+        LinearLayout card = card(GlassMaterial.Layer.CARD, 18, 0);
+        Button header = new Button(this, null, android.R.attr.borderlessButtonStyle);
+        header.setAllCaps(false);
+        header.setText(label);
+        header.setTextSize(15);
+        header.setTypeface(Typeface.DEFAULT_BOLD);
+        header.setTextColor(ink);
+        header.setGravity(Gravity.START | Gravity.CENTER_VERTICAL);
+        header.setPadding(0, 0, 0, 0);
+        header.setMinHeight(dp(48));
+        header.setCompoundDrawablesRelativeWithIntrinsicBounds(0, 0, R.drawable.ic_expand, 0);
+        header.setCompoundDrawableTintList(ColorStateList.valueOf(muted));
+        header.setContentDescription(label + "，已折叠");
+        card.addView(header, new LinearLayout.LayoutParams(-1, -2));
+        body.setVisibility(View.GONE);
+        card.addView(body, new LinearLayout.LayoutParams(-1, -2));
+        header.setOnClickListener(view -> {
+            boolean expanded = body.getVisibility() != View.VISIBLE;
+            body.setVisibility(expanded ? View.VISIBLE : View.GONE);
+            header.setCompoundDrawablesRelativeWithIntrinsicBounds(0, 0,
+                    expanded ? R.drawable.ic_collapse : R.drawable.ic_expand, 0);
+            header.setContentDescription(label + (expanded ? "，已展开" : "，已折叠"));
+        });
+        return card;
+    }
+
+    private LinearLayout horizontalRow() {
+        LinearLayout row = new LinearLayout(this);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        return row;
+    }
+
+    private TextView heading(String label) {
+        TextView title = text(label, 16, ink, true);
+        if (Build.VERSION.SDK_INT >= 28) title.setAccessibilityHeading(true);
+        return title;
+    }
+
+    private TextView text(String value, float size, int color, boolean bold) {
+        TextView view = new TextView(this);
+        view.setText(value);
+        view.setTextSize(size);
+        view.setTextColor(color);
+        if (bold) view.setTypeface(Typeface.DEFAULT_BOLD);
+        return view;
+    }
+
+    private Button button(String label, boolean primary) {
+        Button button = new Button(this);
+        button.setAllCaps(false);
+        button.setText(label);
+        button.setTextSize(13);
+        button.setTypeface(Typeface.DEFAULT_BOLD);
+        button.setTextColor(primary ? getColor(R.color.on_accent) : ink);
+        button.setMinHeight(0);
+        button.setMinimumHeight(dp(44));
+        button.setMinWidth(0);
+        button.setMinimumWidth(0);
+        button.setStateListAnimator(null);
+        button.setBackgroundTintList(null);
+        button.setBackground(ripple(button, primary));
+        button.setPadding(dp(8), dp(7), dp(8), dp(7));
+        return button;
+    }
+
+    private ImageButton iconButton(int icon, String description, Runnable run) {
+        ImageButton button = new ImageButton(this);
+        button.setContentDescription(description);
+        button.setImageResource(icon);
+        button.setImageTintList(ColorStateList.valueOf(ink));
+        button.setBackgroundTintList(null);
+        button.setBackground(ripple(button, false));
+        button.setOnClickListener(view -> run.run());
+        return button;
+    }
+
+    private RippleDrawable ripple(View target, boolean primary) {
+        GradientDrawable mask = new GradientDrawable();
+        mask.setCornerRadius(dp(24));
+        mask.setColor(Color.WHITE);
+        if (primary) {
+            GradientDrawable fill = new GradientDrawable(GradientDrawable.Orientation.TL_BR,
+                    new int[]{getColor(R.color.accent_highlight), accent});
+            fill.setCornerRadius(dp(24));
+            fill.setStroke(dp(1), dark ? 0xA5D8FFF8 : 0x80AEF0E8);
+            StateListDrawable backgrounds = new StateListDrawable();
+            GradientDrawable disabled = new GradientDrawable();
+            disabled.setCornerRadius(dp(24));
+            disabled.setColor(getColor(R.color.accent_disabled));
+            backgrounds.addState(new int[]{-android.R.attr.state_enabled}, disabled);
+            backgrounds.addState(new int[0], fill);
+            return new RippleDrawable(ColorStateList.valueOf(0x35FFFFFF), backgrounds, mask);
+        }
+        return new RippleDrawable(ColorStateList.valueOf(dark ? 0x35CBF8FF : 0x22467B88),
+                glass.surface(target, GlassMaterial.Layer.BUTTON, 24), mask);
+    }
+
+    private LinearLayout.LayoutParams flatParams(int index, int gap) {
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(0, -2, 1f);
+        if (index > 0) params.setMarginStart(dp(gap));
+        return params;
+    }
+
+    private LinearLayout statusMetric(String label, TextView value) {
+        LinearLayout pair = new LinearLayout(this);
+        pair.setOrientation(LinearLayout.VERTICAL);
+        pair.addView(text(label, 12, muted, false), new LinearLayout.LayoutParams(-1, -2));
+        pair.addView(value, new LinearLayout.LayoutParams(-1, -2));
+        return pair;
+    }
+
+    private void addDeviceRow(LinearLayout container, String label, TextView value, boolean first) {
+        if (!first) {
+            View divider = new View(this);
+            divider.setBackgroundColor(line);
+            container.addView(divider, new LinearLayout.LayoutParams(-1, 1));
+        }
+        LinearLayout row = horizontalRow();
+        row.setPadding(0, dp(9), 0, dp(9));
+        TextView name = text(label, 13, ink, false);
+        LinearLayout.LayoutParams keyParams = new LinearLayout.LayoutParams(-2, -2);
+        keyParams.setMarginEnd(dp(16));
+        row.addView(name, keyParams);
+        value.setGravity(Gravity.END);
+        row.addView(value, new LinearLayout.LayoutParams(0, -2, 1f));
+        container.addView(row, new LinearLayout.LayoutParams(-1, -2));
     }
 
     private void stopTimer() {
@@ -614,146 +854,6 @@ public final class MainActivity extends Activity implements WorkflowCallbacks {
                 .setNegativeButton("取消", null)
                 .setPositiveButton("确认", (dialog, which) -> action.run())
                 .show();
-    }
-
-    private LinearLayout card() {
-        LinearLayout card = new LinearLayout(this);
-        card.setOrientation(LinearLayout.VERTICAL);
-        card.setPadding(dp(16), dp(14), dp(16), dp(14));
-        card.setBackground(round(Color.WHITE, 24));
-        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-1, -2);
-        params.topMargin = dp(8);
-        card.setLayoutParams(params);
-        return card;
-    }
-
-    private LinearLayout listCard() {
-        LinearLayout card = new LinearLayout(this);
-        card.setOrientation(LinearLayout.VERTICAL);
-        card.setPadding(dp(16), dp(4), dp(16), dp(4));
-        card.setBackground(round(Color.WHITE, 26));
-        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-1, -2);
-        params.topMargin = dp(6);
-        card.setLayoutParams(params);
-        return card;
-    }
-
-    private TextView section(String text) {
-        TextView label = text(text, 12, SUB, true);
-        label.setPadding(0, dp(16), 0, dp(3));
-        return label;
-    }
-
-    private TextView text(String value, float size, int color, boolean bold) {
-        TextView view = new TextView(this);
-        view.setText(value);
-        view.setTextSize(size);
-        view.setTextColor(color);
-        if (bold) {
-            view.setTypeface(Typeface.DEFAULT_BOLD);
-        }
-        return view;
-    }
-
-    private Button primaryButton(String label, int background, int foreground) {
-        Button button = new Button(this);
-        button.setAllCaps(false);
-        button.setText(label);
-        button.setTextSize(13.2f);
-        button.setTextColor(foreground);
-        button.setTypeface(Typeface.DEFAULT_BOLD);
-        button.setPadding(dp(14), dp(11), dp(14), dp(11));
-        button.setMinHeight(0);
-        button.setMinimumHeight(dp(44));
-        button.setMinWidth(0);
-        button.setMinimumWidth(0);
-        button.setStateListAnimator(null);
-        button.setBackground(buttonBackground(background));
-        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-1, -2);
-        params.topMargin = dp(7);
-        button.setLayoutParams(params);
-        return button;
-    }
-
-    private Button toneButton(String label) {
-        Button button = primaryButton(label, Color.WHITE, INK);
-        button.setTextSize(11.5f);
-        return button;
-    }
-
-    private LinearLayout.LayoutParams flatParams(int index, int gap) {
-        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(0, -2, 1f);
-        if (index > 0) {
-            params.leftMargin = dp(gap);
-        }
-        return params;
-    }
-
-    private LinearLayout row(String label, TextView value, boolean last) {
-        LinearLayout row = new LinearLayout(this);
-        row.setGravity(Gravity.CENTER_VERTICAL);
-        row.setPadding(0, dp(10), 0, last ? dp(10) : 0);
-        TextView key = text(label, 12, SUB, false);
-        row.addView(key, new LinearLayout.LayoutParams(dp(58), -2));
-        row.addView(value, new LinearLayout.LayoutParams(0, -2, 1f));
-        if (!last) {
-            row.setPadding(0, dp(10), 0, dp(5));
-        }
-        return row;
-    }
-
-    private LinearLayout infoRow(String label, String value, boolean last) {
-        return row(label, text(value, 11, SUB, false), last);
-    }
-
-    private LinearLayout switchRow(String title, String description, Switch toggle) {
-        LinearLayout row = new LinearLayout(this);
-        row.setGravity(Gravity.CENTER_VERTICAL);
-        row.setPadding(0, dp(9), 0, dp(9));
-        LinearLayout labels = new LinearLayout(this);
-        labels.setOrientation(LinearLayout.VERTICAL);
-        labels.addView(text(title, 13, INK, true));
-        TextView detail = text(description, 11, SUB, false);
-        detail.setPadding(0, dp(3), 0, 0);
-        labels.addView(detail);
-        row.addView(labels, new LinearLayout.LayoutParams(0, -2, 1f));
-        row.addView(toggle, new LinearLayout.LayoutParams(-2, -2));
-        return row;
-    }
-
-    private LinearLayout helpStep(int number, String title, String detail) {
-        LinearLayout row = new LinearLayout(this);
-        row.setPadding(0, dp(7), 0, dp(7));
-        TextView badge = text(String.valueOf(number), 12, Color.WHITE, true);
-        badge.setGravity(Gravity.CENTER);
-        badge.setBackground(round(ACCENT, 16));
-        row.addView(badge, new LinearLayout.LayoutParams(dp(26), dp(26)));
-        LinearLayout content = new LinearLayout(this);
-        content.setOrientation(LinearLayout.VERTICAL);
-        content.setPadding(dp(10), 0, 0, 0);
-        content.addView(text(title, 12.5f, INK, true));
-        TextView body = text(detail, 11, SUB, false);
-        body.setPadding(0, dp(3), 0, 0);
-        content.addView(body);
-        row.addView(content, new LinearLayout.LayoutParams(0, -2, 1f));
-        return row;
-    }
-
-    private GradientDrawable round(int color, int radius) {
-        GradientDrawable drawable = new GradientDrawable();
-        drawable.setColor(color);
-        drawable.setCornerRadius(dp(radius));
-        return drawable;
-    }
-
-    private GradientDrawable gradient(int start, int end, int radius) {
-        GradientDrawable drawable = new GradientDrawable(GradientDrawable.Orientation.TL_BR, new int[]{start, end});
-        drawable.setCornerRadius(dp(radius));
-        return drawable;
-    }
-
-    private GradientDrawable buttonBackground(int color) {
-        return round(color, 18);
     }
 
     private String versionName() {
@@ -794,22 +894,15 @@ public final class MainActivity extends Activity implements WorkflowCallbacks {
         return Math.round(value * getResources().getDisplayMetrics().density);
     }
 
-    private int statusBarHeight() {
-        int id = getResources().getIdentifier("status_bar_height", "dimen", "android");
-        return id > 0 ? getResources().getDimensionPixelSize(id) : dp(28);
-    }
-
-    private int navBarHeight() {
-        int id = getResources().getIdentifier("navigation_bar_height", "dimen", "android");
-        return id > 0 ? getResources().getDimensionPixelSize(id) : dp(24);
-    }
-
     private static String elapsedText(long millis) {
         return String.format(Locale.US, "%.2f 秒", millis / 1000.0);
     }
 
     @Override
     protected void onDestroy() {
+        Shizuku.removeRequestPermissionResultListener(permissionResult);
+        Shizuku.removeBinderDeadListener(binderDead);
+        Shizuku.removeBinderReceivedListener(binderReceived);
         timing = false;
         mainHandler.removeCallbacks(timerTicker);
         if (engine != null) {
