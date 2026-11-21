@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
   issues: write
 
 jobs:
@@ -32,6 +32,7 @@ jobs:
               export ANDROID_SDK_ROOT="$root"
               if [ -x "$root/cmdline-tools/latest/bin/sdkmanager" ]; then
                 yes | "$root/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null 2>&1
+                "$root/cmdline-tools/latest/bin/sdkmanager" --list 2>/dev/null | grep -c 'platforms;android-37' | sed 's/^/android-37 entries: /'
               fi
               break
             fi
@@ -55,6 +56,17 @@ jobs:
             design/miuix-console/design.log
           if-no-files-found: warn
 
+      - name: Tag success
+        if: success()
+        run: |
+          set +e
+          git config user.name "lhasa-ci"
+          git config user.email "lhasa-ci@users.noreply.github.com"
+          tag="design-ok-${GITHUB_SHA:0:8}"
+          git tag -f "$tag"
+          git push origin "refs/tags/$tag" --force
+          echo "tagged $tag" >> "$GITHUB_STEP_SUMMARY"
+
       - name: Report failure as an issue
         if: failure()
         env:
@@ -68,15 +80,4 @@ jobs:
             cat /tmp/fail.log
             echo '```'
           } > /tmp/fail.md
-          gh issue create \
-            --title "design-build failed ${GITHUB_SHA:0:8}" \
-            --body-file /tmp/fail.md \
-            --label "" 2>/dev/null || gh issue create \
-            --title "design-build failed ${GITHUB_SHA:0:8}" \
-            --body-file /tmp/fail.md
-
-      - name: Report success
-        if: success()
-        run: |
-          echo "console library built ok" >> "$GITHUB_STEP_SUMMARY"
-          ls -l design/miuix-console/ui/build/outputs/aar/ >> "$GITHUB_STEP_SUMMARY"
+          gh issue create --title "design-build failed ${GITHUB_SHA:0:8}" --body-file /tmp/fail.md
