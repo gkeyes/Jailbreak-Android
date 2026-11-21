@@ -10,8 +10,8 @@ android {
         applicationId = "com.gkeyes.lhasa26"
         minSdk = 37
         targetSdk = 37
-        versionCode = 304
-        versionName = "0.3.4"
+        versionCode = 305
+        versionName = "0.3.5"
         resourceConfigurations += listOf("zh", "en")
     }
 
