@@ -22,6 +22,8 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
 
     /** MemFree is dominated by page cache, so the idle gate follows MemAvailable instead. */
     private static final long IDLE_AVAILABLE_KB = 1500000L;
+    /** Above this much available memory the force-stop of chat apps buys nothing. */
+    private static final long CLEAN_SKIP_AVAILABLE_KB = 3000000L;
     private static final Pattern RUNNING_PAYLOAD = Pattern.compile("uaf_plant_replay");
     private static final String RUN_MARKER = "/data/local/tmp/.lhasa_run";
     private static final String FAILED_MARKER = "/data/local/tmp/.lhasa_failed_boot";
@@ -186,9 +188,8 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
             } finally {
                 busy = false;
                 if (ownsState) {
-                    cleanupBinaries(state == State.ROOTED
-                            || state == State.KSU_PENDING
-                            || state == State.COMPLETE);
+                    // KernelSU took over (COMPLETE) means the temporary channel is no longer needed.
+                    cleanupBinaries(state == State.ROOTED || state == State.KSU_PENDING);
                 }
             }
         });
@@ -507,16 +508,19 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
 
     /**
      * Removes the world-executable exploit binaries from /data/local/tmp once the workflow is over.
-     * Logs stay for debugging; while a temporary root is alive its client and socket are kept.
+     * Logs stay for debugging. While a temporary root is the only way up, its client and socket stay;
+     * once KernelSU has taken over they are dead weight and are removed too.
      */
     private void cleanupBinaries(boolean keepRootClient) {
-        String targets = EXPLOIT_BINARIES + (keepRootClient ? "" : " pc98260-su");
         try {
+            if (!keepRootClient) {
+                run("pkill -f uaf_plant_replay 2>/dev/null; true", true);
+            }
+            String targets = EXPLOIT_BINARIES + (keepRootClient ? "" : " pc98260-su pc98260-root.sock");
             run("cd /data/local/tmp 2>/dev/null; rm -f " + targets + "; true", true);
-            append("[清理] 已移除 " + targets
-                    + (keepRootClient
+            append("[清理] 已移除 " + targets + (keepRootClient
                     ? "（保留 pc98260-su 与 rootd socket，临时 ROOT 仍在用）"
-                    : "（提权未成立，客户端一并移除）"));
+                    : "（KernelSU 已接管，临时通道一并移除）"));
         } catch (Exception ignored) {
             // Cleanup is best effort and must not change the workflow result.
         }
@@ -582,10 +586,18 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
         }
     }
 
-    /** Frees memory before the exploit runs; the payload needs large contiguous allocations. */
+    /**
+     * Frees memory before the exploit runs, but only when it is actually short: on a 16 GB phone with
+     * several GB available the force-stop of chat apps costs more than it buys.
+     */
     private void cleanMemory() {
         try {
             long[] before = memoryState();
+            if (before[1] >= CLEAN_SKIP_AVAILABLE_KB) {
+                append("清理系统内存：跳过（MemAvailable " + before[1] + " kB 已超过 "
+                        + CLEAN_SKIP_AVAILABLE_KB + " kB，无需中断后台应用）");
+                return;
+            }
             CommandResult stop = run("am force-stop com.tencent.mm 2>/dev/null; am force-stop com.tencent.mobileqq 2>/dev/null; true", true);
             long[] after = memoryState();
             append("清理系统内存：MemFree " + before[0] + "→" + after[0] + " kB · MemAvailable "
