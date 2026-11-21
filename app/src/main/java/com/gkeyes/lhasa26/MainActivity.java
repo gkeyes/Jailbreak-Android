@@ -156,8 +156,8 @@ public final class MainActivity extends Activity implements WorkflowCallbacks {
 
     private void buildUi() {
         FrameLayout viewport = new FrameLayout(this);
-        glass = new GlassMaterial(viewport, dark);
-        viewport.setBackground(glass.backdrop());
+        glass = new GlassMaterial(getResources().getDisplayMetrics().density, dark);
+        viewport.setBackgroundColor(getColor(R.color.surface));
         scroll = new ScrollView(this);
         scroll.setFillViewport(true);
         scroll.setClipToPadding(false);
@@ -702,7 +702,7 @@ public final class MainActivity extends Activity implements WorkflowCallbacks {
     private LinearLayout card(GlassMaterial.Layer layer, int radius, int verticalPadding) {
         LinearLayout card = new LinearLayout(this);
         card.setOrientation(LinearLayout.VERTICAL);
-        card.setBackground(glass.surface(card, layer, radius));
+        card.setBackground(glass.surface(layer, radius));
         card.setPadding(dp(16), dp(verticalPadding), dp(16), dp(verticalPadding));
         LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-1, -2);
         params.topMargin = dp(12);
@@ -771,7 +771,7 @@ public final class MainActivity extends Activity implements WorkflowCallbacks {
         button.setMinimumWidth(0);
         button.setStateListAnimator(null);
         button.setBackgroundTintList(null);
-        button.setBackground(ripple(button, primary));
+        button.setBackground(ripple(primary));
         button.setPadding(dp(8), dp(7), dp(8), dp(7));
         return button;
     }
@@ -782,12 +782,12 @@ public final class MainActivity extends Activity implements WorkflowCallbacks {
         button.setImageResource(icon);
         button.setImageTintList(ColorStateList.valueOf(ink));
         button.setBackgroundTintList(null);
-        button.setBackground(ripple(button, false));
+        button.setBackground(ripple(false));
         button.setOnClickListener(view -> run.run());
         return button;
     }
 
-    private RippleDrawable ripple(View target, boolean primary) {
+    private RippleDrawable ripple(boolean primary) {
         GradientDrawable mask = new GradientDrawable();
         mask.setCornerRadius(dp(24));
         mask.setColor(Color.WHITE);
@@ -805,7 +805,7 @@ public final class MainActivity extends Activity implements WorkflowCallbacks {
             return new RippleDrawable(ColorStateList.valueOf(0x35FFFFFF), backgrounds, mask);
         }
         return new RippleDrawable(ColorStateList.valueOf(dark ? 0x35CBF8FF : 0x22467B88),
-                glass.surface(target, GlassMaterial.Layer.BUTTON, 24), mask);
+                glass.surface(GlassMaterial.Layer.BUTTON, 24), mask);
     }
 
     private LinearLayout.LayoutParams flatParams(int index, int gap) {
