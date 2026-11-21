@@ -21,6 +21,8 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
     };
 
     private static final Pattern RUNNING_PAYLOAD = Pattern.compile("uaf_plant_replay");
+    private static final String RUN_MARKER = "/data/local/tmp/.lhasa_run";
+    private static final String FAILED_MARKER = "/data/local/tmp/.lhasa_failed_boot";
     private final CommandExecutor executor;
     private final AssetDeployer deployer;
     private final WorkflowCallbacks callbacks;
@@ -150,14 +152,41 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
         if (payloadProcessCount() > 0) {
             throw new IllegalStateException("上次运行的进程仍在运行，请重启设备后重试。");
         }
+        String boot = bootId();
+        writeRunMarker(boot);
+        String failed = run("cat " + FAILED_MARKER + " 2>/dev/null", true).output.trim();
+        if (!boot.isEmpty() && !failed.isEmpty()) {
+            String[] parts = failed.split("\\s+");
+            if (boot.equals(parts[0])) {
+                boolean permissive = parts.length > 1 && "0".equals(parts[1]);
+                if (!permissive) {
+                    throw new IllegalStateException("本次开机已失败且 SELinux 仍为 Enforcing，请重启后重试。");
+                }
+                append("（提示）本次开机已为 Permissive，将直接重试 cred 阶段。");
+            }
+        }
+        cleanMemory();
 
         step(1);
         status("等待系统空闲");
+        final java.util.concurrent.atomic.AtomicReference<Exception> deployError =
+                new java.util.concurrent.atomic.AtomicReference<>();
+        Thread deploy = new Thread(() -> {
+            try {
+                deployer.stageAll();
+            } catch (Exception error) {
+                deployError.set(error);
+            }
+        }, "lhasa-deploy");
+        deploy.start();
         waitForIdle();
+        deploy.join(8000L);
+        if (deployError.get() != null) {
+            throw deployError.get();
+        }
 
         step(2);
-        status("写入程序");
-        deployer.stageAll();
+        status("程序已就位");
 
         step(3);
         status("测量本次开机的内核地址");
@@ -167,6 +196,7 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
         status("提权执行中，请稍候");
         if (!runPayload(addressArgument)) {
             stopPayload();
+            recordFailedBoot(boot);
             throw new IllegalStateException("提权失败 · 请重启设备");
         }
 
@@ -175,8 +205,11 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
         CommandResult verify = run("/data/local/tmp/pc98260-su -c 'id; getenforce; grep CapEff /proc/self/status'", false);
         append(verify.output);
         if (!isRoot(verify.output)) {
+            recordFailedBoot(boot);
             throw new IllegalStateException("rootd 无响应 · 请重启设备");
         }
+        run("rm -f " + FAILED_MARKER, true);
+        clearRunMarker();
         state = State.ROOTED;
         callbacks.onState(State.ROOTED, "已获得临时 ROOT");
         append("临时 ROOT 已就绪。");
@@ -225,8 +258,19 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
                 callbacks.onState(State.KSU_PENDING, "KernelSU 未接管 · 临时 ROOT 仍有效，可再次尝试");
             }
         } catch (Throwable failure) {
-            state = State.KSU_PENDING;
             append(friendly(failure));
+            if (shizukuGone()) {
+                state = State.KSU_PENDING;
+                callbacks.onState(State.KSU_PENDING,
+                        "KernelSU 可能已接管 · Shizuku 已断开，请重新启动 Shizuku 后再确认");
+                return;
+            }
+            if (isPanic()) {
+                state = State.FAILED;
+                callbacks.onState(State.FAILED, "内核已 panic（pstore 有记录），必须重启后再试");
+                return;
+            }
+            state = State.KSU_PENDING;
             callbacks.onState(State.KSU_PENDING, "KernelSU 未接管 · 临时 ROOT 仍有效，可再次尝试");
         }
     }
@@ -235,6 +279,7 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
         long started = System.currentTimeMillis();
         int runnable = -1;
         long freeKb = -1;
+        boolean reached = false;
         while (System.currentTimeMillis() - started < 20000L) {
             String[] lines = run("cat /proc/loadavg 2>/dev/null; awk '/MemFree/{print $2}' /proc/meminfo 2>/dev/null", true).output.trim().split("\\n");
             if (lines.length > 0) {
@@ -255,11 +300,14 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
                 }
             }
             if (runnable >= 0 && runnable <= 6 && freeKb >= 200000) {
+                reached = true;
                 break;
             }
             Thread.sleep(300L);
         }
-        append(String.format(Locale.US, "[空闲] 等待 %.1fs · runnable=%d · MemFree=%d kB", (System.currentTimeMillis() - started) / 1000.0, runnable, freeKb));
+        append(String.format(Locale.US, "[空闲] 等待 %.1fs · runnable=%d · MemFree=%d kB · %s",
+                (System.currentTimeMillis() - started) / 1000.0, runnable, freeKb,
+                reached ? "达标，开跑" : "未达标，仍开跑"));
     }
 
     private String measureAddress() throws Exception {
@@ -357,6 +405,82 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
 
     private CommandResult run(String command, boolean quiet) throws Exception {
         return executor.run(command, quiet);
+    }
+
+    /** Boot id of the running kernel; empty when the value cannot be read. */
+    private String bootId() {
+        try {
+            return run("cat /proc/sys/kernel/random/boot_id 2>/dev/null", true).output.trim();
+        } catch (Exception ignored) {
+            return "";
+        }
+    }
+
+    private void writeRunMarker(String boot) {
+        if (boot == null || boot.isEmpty()) {
+            return;
+        }
+        try {
+            run("echo '" + boot + " " + System.currentTimeMillis() + "' > " + RUN_MARKER, true);
+        } catch (Exception ignored) {
+            // A missing marker only degrades diagnostics.
+        }
+    }
+
+    private void clearRunMarker() {
+        try {
+            run("rm -f " + RUN_MARKER, true);
+        } catch (Exception ignored) {
+            // Best effort only.
+        }
+    }
+
+    /**
+     * Records the failed boot so a second attempt inside the same boot can be gated exactly like the
+     * original tool: SELinux already permissive means the first phase landed, so only the cred stage
+     * has to be retried; still Enforcing means the kernel state is polluted and a reboot is required.
+     */
+    private void recordFailedBoot(String boot) {
+        if (boot == null || boot.isEmpty()) {
+            return;
+        }
+        try {
+            boolean permissive = "Permissive".equalsIgnoreCase(run("getenforce 2>/dev/null", true).output.trim());
+            run("echo '" + boot + " " + (permissive ? 0 : 1) + "' > " + FAILED_MARKER, true);
+            append(permissive
+                    ? "已记录本次失败：SELinux 已 Permissive，可直接重试 cred 阶段（无需重启）。"
+                    : "已记录本次失败：SELinux 仍 Enforcing，请重启后重试，切勿重复点击。");
+        } catch (Exception ignored) {
+            // Recording the failure must never mask the original error.
+        }
+    }
+
+    /** Frees memory before the exploit runs; the payload needs large contiguous allocations. */
+    private void cleanMemory() {
+        try {
+            run("am force-stop com.tencent.mm 2>/dev/null; am force-stop com.tencent.mobileqq 2>/dev/null; true", true);
+            append("清理系统内存：完成");
+        } catch (Exception ignored) {
+            append("清理系统内存：跳过");
+        }
+    }
+
+    private boolean shizukuGone() {
+        try {
+            return !executor.isAvailable();
+        } catch (Throwable ignored) {
+            return true;
+        }
+    }
+
+    private boolean isPanic() {
+        try {
+            String out = run("grep -m1 -aE 'Kernel panic|Internal error|Unable to handle kernel|BUG: ' "
+                    + "/sys/fs/pstore/console-ramoops* 2>/dev/null", true).output;
+            return out != null && !out.trim().isEmpty();
+        } catch (Exception ignored) {
+            return false;
+        }
     }
 
     private void step(int value) {
