@@ -131,3 +131,27 @@ jobs:
       - name: Record failure
         if: failure()
         run: echo "See the first failed step in this job for the error." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Publish result tag
+        if: always()
+        env:
+          RESULT: ${{ job.status }}
+        run: |
+          set +e
+          git config user.name "lhasa-ci"
+          git config user.email "lhasa-ci@users.noreply.github.com"
+          ver=$(sed -n 's/.*versionName = "\(.*\)".*/\1/p' app/build.gradle.kts | head -1)
+          apk=$(ls app/build/outputs/apk/release/*.apk 2>/dev/null | head -1)
+          if [ "$RESULT" = "success" ] && [ -n "$apk" ]; then
+            sha=$(sha256sum "$apk" | awk '{print $1}')
+            tag="apk-${ver}-$(echo "$sha" | cut -c1-12)"
+            git tag -f "$tag"
+            git push origin "refs/tags/$tag" --force
+            echo "tagged $tag" >> "$GITHUB_STEP_SUMMARY"
+          else
+            hint=$(grep -i -E 'error:|FAILURE:|MARKER-NOT-FOUND' ci.log 2>/dev/null | tail -1 | tr -c 'A-Za-z0-9._' '-' | cut -c1-60)
+            tag="fail-${ver}-${hint:-unknown}"
+            git tag -f "$tag"
+            git push origin "refs/tags/$tag" --force
+            echo "tagged $tag" >> "$GITHUB_STEP_SUMMARY"
+          fi
