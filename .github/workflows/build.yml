@@ -19,6 +19,8 @@ env:
   LHASA_STORE_PASSWORD: lhasa26pass
   LHASA_KEY_ALIAS: lhasa26
   LHASA_KEY_PASSWORD: lhasa26pass
+  KSUSD_SHA256: 4f7d5fd65631915ea579ff406bd9cbe58217f2c91dac6527f5b2f28ad4508171
+  KSU_APK_SHA256: b4a059ace71de2fa65cc7f12b1c58d55fc23ab25e057ee4230ce779742abe450
 
 jobs:
   build:
@@ -30,7 +32,30 @@ jobs:
       - name: Marker A (checkout)
         run: |
           echo "A: checkout ok $(date -u +%H:%M:%S)" > ci.log
-          ls -1 | head -20 >> ci.log
+          sha256sum app/src/main/assets/ksud >> ci.log
+
+      - name: Repair ksud asset
+        run: |
+          echo "B: ksud check start" >> ci.log
+          actual=$(sha256sum app/src/main/assets/ksud | awk '{print $1}')
+          if [ "$actual" = "$KSUSD_SHA256" ]; then
+            echo "B: ksud ok ($actual)" >> ci.log
+            exit 0
+          fi
+          echo "B: ksud mismatch actual=$actual expected=$KSUSD_SHA256, restoring from KernelSU v3.3.1" >> ci.log
+          curl -fsSL -o /tmp/ksu-manager.apk \
+            https://github.com/tiann/KernelSU/releases/download/v3.3.1/KernelSU_v3.3.1_32680-release.apk
+          echo "$KSU_APK_SHA256  /tmp/ksu-manager.apk" | sha256sum -c - >> ci.log
+          unzip -p /tmp/ksu-manager.apk lib/arm64-v8a/libksud.so > /tmp/libksud.so
+          echo "$KSUSD_SHA256  /tmp/libksud.so" | sha256sum -c - >> ci.log
+          cp /tmp/libksud.so app/src/main/assets/ksud
+          git config user.name "lhasa-ci"
+          git config user.email "lhasa-ci@users.noreply.github.com"
+          # .gitignore ignores *.so; nothing else does, but force-add keeps the binary in the repo.
+          git add -f app/src/main/assets/ksud
+          git commit -m "ci: restore truncated ksud asset (KernelSU v3.3.1 libksud.so sha256=$KSUSD_SHA256)"
+          git push
+          echo "B: ksud restored" >> ci.log
 
       - name: Ensure fixed signing key
         run: |
@@ -50,31 +75,44 @@ jobs:
             git commit -m "ci: add fixed release signing key"
             git push
           fi
-          echo "B: keystore ready" >> ci.log
+          echo "C: keystore ready" >> ci.log
 
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
 
-      - name: Marker C (java + sdk)
+      - name: Marker D (java + sdk)
         run: |
           set +e
-          { echo "C: java $(java -version 2>&1 | head -1)"; } >> ci.log
+          echo "D: java $(java -version 2>&1 | head -1)" >> ci.log
           for root in "${ANDROID_SDK_ROOT:-}" /usr/local/lib/android/sdk /opt/android-sdk; do
             if [ -n "$root" ] && [ -d "$root/platforms" ]; then
-              echo "C: sdk=$root platforms=$(ls "$root/platforms" | tr '\n' ' ')" >> ci.log
+              echo "D: sdk=$root platforms=$(ls "$root/platforms" | tr '\n' ' ')" >> ci.log
               echo "ANDROID_SDK_ROOT=$root" >> "$GITHUB_ENV"
               break
             fi
           done
-          echo "C: done" >> ci.log
+
+      - name: Verify packaged natives
+        run: |
+          set +e
+          for f in perf_slide slide_probe reach_probe uaf_plant_replay pc98260-su ksud lhasa_profile.txt; do
+            echo "E: $(sha256sum "app/src/main/assets/$f" 2>/dev/null | awk '{print $1"  "$2}')" >> ci.log
+          done
 
       - name: Gradle build
         run: |
           chmod +x gradlew
           set -o pipefail
           ./gradlew --no-daemon :app:assembleRelease 2>&1 | tee -a ci.log
+
+      - name: Verify APK contents
+        run: |
+          apk=$(ls app/build/outputs/apk/release/*.apk | head -1)
+          unzip -p "$apk" assets/ksud > /tmp/apk-ksud
+          echo "F: apk=$(basename "$apk") ksud=$(sha256sum /tmp/apk-ksud | awk '{print $1}') size=$(stat -c%s /tmp/apk-ksud)" >> ci.log
+          echo "$KSUSD_SHA256  /tmp/apk-ksud" | sha256sum -c - >> ci.log
 
       - name: Upload APK
         if: success()
@@ -89,9 +127,10 @@ jobs:
         run: |
           set -e
           sha=$(sha256sum app/build/outputs/apk/release/*.apk | awk '{print $1}')
+          ksud=$(unzip -p app/build/outputs/apk/release/*.apk assets/ksud | sha256sum | awk '{print $1}')
           git config user.name "lhasa-ci"
           git config user.email "lhasa-ci@users.noreply.github.com"
-          git commit --allow-empty -m "ci: signed apk ok sha256=$sha"
+          git commit --allow-empty -m "ci: signed apk ok sha256=$sha ksud=$ksud"
           git push
 
       - name: Record failure
