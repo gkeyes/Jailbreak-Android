@@ -20,9 +20,12 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
             "提权执行", "结果验证", "KernelSU 接管"
     };
 
+    /** MemFree is dominated by page cache, so the idle gate follows MemAvailable instead. */
+    private static final long IDLE_AVAILABLE_KB = 1500000L;
     private static final Pattern RUNNING_PAYLOAD = Pattern.compile("uaf_plant_replay");
     private static final String RUN_MARKER = "/data/local/tmp/.lhasa_run";
     private static final String FAILED_MARKER = "/data/local/tmp/.lhasa_failed_boot";
+    private static final String EXPLOIT_BINARIES = "uaf_plant_replay perf_slide slide_probe reach_probe";
     private final CommandExecutor executor;
     private final AssetDeployer deployer;
     private final WorkflowCallbacks callbacks;
@@ -96,18 +99,19 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
         executor.kill();
     }
 
+    /** Share-safe session log: kernel addresses are masked. */
     public String getSessionLog() {
+        return getShareableLog();
+    }
+
+    public String getRawSessionLog() {
         synchronized (logLock) {
             return sessionLog.toString();
         }
     }
 
-    /**
-     * Session log with kernel addresses masked, for pasting into issue reports.
-     */
     public String getShareableLog() {
-        String raw = getSessionLog();
-        return raw.replaceAll("0x[0-9a-fA-F]{6,}", "0x<addr>");
+        return getRawSessionLog().replaceAll("0x[0-9a-fA-F]{6,}", "0x<addr>");
     }
 
     @Override
@@ -181,6 +185,11 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
                 }
             } finally {
                 busy = false;
+                if (ownsState) {
+                    cleanupBinaries(state == State.ROOTED
+                            || state == State.KSU_PENDING
+                            || state == State.COMPLETE);
+                }
             }
         });
         return true;
@@ -391,15 +400,16 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
                     }
                 }
             }
-            if (runnable >= 0 && runnable <= 6 && freeKb >= 200000) {
+            if (runnable >= 0 && runnable <= 6 && availableKb >= IDLE_AVAILABLE_KB) {
                 reached = true;
                 break;
             }
             Thread.sleep(300L);
         }
-        append(String.format(Locale.US, "[空闲] 等待 %.1fs · runnable=%d · MemFree=%d kB · MemAvailable=%d kB · %s",
-                (System.currentTimeMillis() - started) / 1000.0, runnable, freeKb, availableKb,
-                reached ? "达标，开跑" : "未达标，仍开跑"));
+        append(String.format(Locale.US,
+                "[空闲] 等待 %.1fs · runnable=%d · MemAvailable=%d kB（门限 %d）· MemFree=%d kB · %s",
+                (System.currentTimeMillis() - started) / 1000.0, runnable, availableKb, IDLE_AVAILABLE_KB,
+                freeKb, reached ? "达标，开跑" : "未达标，仍开跑"));
     }
 
     private String measureAddress() throws Exception {
@@ -492,6 +502,23 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
         } catch (NumberFormatException ignored) {
             Matcher matcher = RUNNING_PAYLOAD.matcher(output);
             return matcher.find() ? 1 : 0;
+        }
+    }
+
+    /**
+     * Removes the world-executable exploit binaries from /data/local/tmp once the workflow is over.
+     * Logs stay for debugging; while a temporary root is alive its client and socket are kept.
+     */
+    private void cleanupBinaries(boolean keepRootClient) {
+        String targets = EXPLOIT_BINARIES + (keepRootClient ? "" : " pc98260-su");
+        try {
+            run("cd /data/local/tmp 2>/dev/null; rm -f " + targets + "; true", true);
+            append("[清理] 已移除 " + targets
+                    + (keepRootClient
+                    ? "（保留 pc98260-su 与 rootd socket，临时 ROOT 仍在用）"
+                    : "（提权未成立，客户端一并移除）"));
+        } catch (Exception ignored) {
+            // Cleanup is best effort and must not change the workflow result.
         }
     }
 
