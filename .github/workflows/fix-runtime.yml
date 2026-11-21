@@ -1,0 +1,146 @@
+name: fix-runtime
+on:
+  push:
+    paths: [ '.github/workflows/fix-runtime.yml' ]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Replace exitValue() with a bounded remote-safe wait
+        run: |
+          set -o pipefail
+          python3 - <<'PY'
+          import pathlib, sys
+
+          def patch(path, pairs):
+              p = pathlib.Path(path)
+              text = p.read_text(encoding='utf-8')
+              for marker, old, new in pairs:
+                  if new in text:
+                      print('skip  %s' % marker)
+                      continue
+                  if old not in text:
+                      sys.exit('MARKER-NOT-FOUND %s in %s' % (marker, path))
+                  text = text.replace(old, new, 1)
+                  print('apply %s' % marker)
+              p.write_text(text, encoding='utf-8')
+
+          patch('app/src/main/java/com/gkeyes/lhasa26/core/CommandExecutor.java', [
+              ('helper',
+               "    boolean isAvailable();\n",
+               "    boolean isAvailable();\n"
+               "\n"
+               "    /** Returned by waitWithTimeout when the bounded wait expired. */\n"
+               "    int TIMEOUT = Integer.MIN_VALUE;\n"
+               "\n"
+               "    /**\n"
+               "     * Waits for a Shizuku-backed process without calling {@code exitValue()}: the remote\n"
+               "     * implementation keeps its own exited flag, so the plain {@code waitFor(long, unit)}\n"
+               "     * default reports completion early and a manual {@code exitValue()} then throws\n"
+               "     * \"process hasn't exited\".\n"
+               "     */\n"
+               "    static int waitWithTimeout(Process process, long seconds) throws InterruptedException {\n"
+               "        final java.util.concurrent.FutureTask<Integer> task =\n"
+               "                new java.util.concurrent.FutureTask<>(() -> process.waitFor());\n"
+               "        Thread thread = new Thread(task, \"lhasa-wait\");\n"
+               "        thread.setDaemon(true);\n"
+               "        thread.start();\n"
+               "        try {\n"
+               "            return task.get(seconds, java.util.concurrent.TimeUnit.SECONDS);\n"
+               "        } catch (java.util.concurrent.TimeoutException timeout) {\n"
+               "            task.cancel(true);\n"
+               "            try {\n"
+               "                process.destroy();\n"
+               "            } catch (Throwable ignored) {\n"
+               "                // Remote process may already be gone.\n"
+               "            }\n"
+               "            try {\n"
+               "                process.destroyForcibly();\n"
+               "            } catch (Throwable ignored) {\n"
+               "                // Nothing else to do.\n"
+               "            }\n"
+               "            return TIMEOUT;\n"
+               "        } catch (java.util.concurrent.ExecutionException failure) {\n"
+               "            return TIMEOUT;\n"
+               "        }\n"
+               "    }\n"),
+              ('read-output',
+               "        int exitCode;\n"
+               "        if (!process.waitFor(120L, java.util.concurrent.TimeUnit.SECONDS)) {\n"
+               "            process.destroy();\n"
+               "            if (!process.waitFor(5L, java.util.concurrent.TimeUnit.SECONDS)) {\n"
+               "                process.destroyForcibly();\n"
+               "            }\n"
+               "            joinQuietly(stdout);\n"
+               "            joinQuietly(stderr);\n"
+               "            output.append(\"命令超时（120 秒）\");\n"
+               "            return output.toString();\n"
+               "        }\n"
+               "        exitCode = process.exitValue();\n"
+               "        joinQuietly(stdout);\n"
+               "        joinQuietly(stderr);\n",
+               "        int exitCode = waitWithTimeout(process, 120L);\n"
+               "        joinQuietly(stdout);\n"
+               "        joinQuietly(stderr);\n"
+               "        if (exitCode == TIMEOUT) {\n"
+               "            throw new IOException(\"命令超时（120 秒）\");\n"
+               "        }\n"),
+          ])
+
+          patch('app/src/main/java/com/gkeyes/lhasa26/core/ShizukuExecutor.java', [
+              ('run-exit-value',
+               "        if (!process.waitFor(120L, java.util.concurrent.TimeUnit.SECONDS)) {\n"
+               "            kill();\n"
+               "            outThread.join(2000L);\n"
+               "            errThread.join(2000L);\n"
+               "            return new CommandResult(-1, \"命令超时（120 秒）：\" + command);\n"
+               "        }\n"
+               "        int exitCode = process.exitValue();\n",
+               "        int exitCode = CommandExecutor.waitWithTimeout(process, 120L);\n"
+               "        if (exitCode == CommandExecutor.TIMEOUT) {\n"
+               "            kill();\n"
+               "            outThread.join(2000L);\n"
+               "            errThread.join(2000L);\n"
+               "            return new CommandResult(-1, \"命令超时（120 秒）：\" + command);\n"
+               "        }\n"),
+          ])
+
+          patch('app/src/main/java/com/gkeyes/lhasa26/core/AssetDeployer.java', [
+              ('stage-exit-value',
+               "        String output = CommandExecutor.readProcessOutput(process);\n"
+               "        if (process.exitValue() != 0) {\n",
+               "        String output = CommandExecutor.readProcessOutput(process);\n"
+               "        int exitCode = process.waitFor();\n"
+               "        if (exitCode != 0) {\n"),
+          ])
+          PY
+
+      - name: Verify no exitValue() remains
+        run: |
+          set -e
+          if grep -rn 'exitValue()' app/src/main/java; then
+            echo "exitValue() still present" >&2
+            exit 1
+          fi
+
+      - name: Commit and retire this workflow
+        run: |
+          set -e
+          git config user.name "lhasa-ci"
+          git config user.email "lhasa-ci@users.noreply.github.com"
+          git add app/src/main/java
+          git commit -m "fix(runtime): stop polling exitValue() on Shizuku processes
+
+The remote process keeps its own exited flag, so Process.waitFor(long, TimeUnit) reported
+completion immediately and the following exitValue() threw \"process hasn't exited\".
+Both command paths now wait through a FutureTask with the same 120 s budget, and the
+deploy step uses waitFor() instead of exitValue()."
+          git rm -q .github/workflows/fix-runtime.yml
+          git commit -m "ci: remove one-shot runtime patch workflow"
+          git push
