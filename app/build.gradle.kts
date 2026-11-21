@@ -4,14 +4,14 @@ plugins {
 
 android {
     namespace = "com.gkeyes.lhasa26"
-    compileSdk = 35
+    compileSdk = 37
 
     defaultConfig {
         applicationId = "com.gkeyes.lhasa26"
-        minSdk = 26
-        targetSdk = 35
-        versionCode = 200
-        versionName = "0.2.0"
+        minSdk = 37
+        targetSdk = 37
+        versionCode = 300
+        versionName = "0.3.0"
     }
 
     // Fixed release key so later builds keep the same signature and can overwrite-install.
