@@ -10,8 +10,9 @@ android {
         applicationId = "com.gkeyes.lhasa26"
         minSdk = 37
         targetSdk = 37
-        versionCode = 302
-        versionName = "0.3.2"
+        versionCode = 303
+        versionName = "0.3.3"
+        resourceConfigurations += listOf("zh", "en")
     }
 
     // Fixed release key so later builds keep the same signature and can overwrite-install.
@@ -30,8 +31,9 @@ android {
 
     buildTypes {
         release {
-            isMinifyEnabled = false
-            isShrinkResources = false
+            // Shrinking matters here: the Compose/Miuix runtime is far larger than this app's code.
+            isMinifyEnabled = true
+            isShrinkResources = true
             signingConfigs.findByName("release")?.let { signing ->
                 if (signing.storeFile != null) {
                     signingConfig = signing
