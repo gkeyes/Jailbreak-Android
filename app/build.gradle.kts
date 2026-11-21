@@ -10,14 +10,33 @@ android {
         applicationId = "com.gkeyes.lhasa26"
         minSdk = 26
         targetSdk = 35
-        versionCode = 100
-        versionName = "0.1.0"
+        versionCode = 101
+        versionName = "0.1.1"
+    }
+
+    // Fixed release key so later builds keep the same signature and can overwrite-install.
+    // The keystore is created once by CI (see .github/workflows/build.yml) and then reused.
+    signingConfigs {
+        create("release") {
+            val keystoreFile = rootProject.file(System.getenv("LHASA_KEYSTORE") ?: "keystore/lhasa26.jks")
+            if (keystoreFile.exists()) {
+                storeFile = keystoreFile
+                storePassword = System.getenv("LHASA_STORE_PASSWORD") ?: "lhasa26pass"
+                keyAlias = System.getenv("LHASA_KEY_ALIAS") ?: "lhasa26"
+                keyPassword = System.getenv("LHASA_KEY_PASSWORD") ?: "lhasa26pass"
+            }
+        }
     }
 
     buildTypes {
         release {
             isMinifyEnabled = false
             isShrinkResources = false
+            signingConfigs.findByName("release")?.let { signing ->
+                if (signing.storeFile != null) {
+                    signingConfig = signing
+                }
+            }
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro",
