@@ -9,13 +9,28 @@ public interface CommandExecutor {
 
     boolean isAvailable();
 
+    /** Stops whatever remote process is currently running, if any. */
+    default void kill() {
+    }
+
     static String readProcessOutput(Process process) throws IOException, InterruptedException {
         StringBuilder output = new StringBuilder();
         Thread stdout = new Thread(() -> drain(process.getInputStream(), output), "lhasa-stdout");
         Thread stderr = new Thread(() -> drain(process.getErrorStream(), output), "lhasa-stderr");
         stdout.start();
         stderr.start();
-        int exitCode = process.waitFor();
+        int exitCode;
+        if (!process.waitFor(120L, java.util.concurrent.TimeUnit.SECONDS)) {
+            process.destroy();
+            if (!process.waitFor(5L, java.util.concurrent.TimeUnit.SECONDS)) {
+                process.destroyForcibly();
+            }
+            joinQuietly(stdout);
+            joinQuietly(stderr);
+            output.append("命令超时（120 秒）");
+            return output.toString();
+        }
+        exitCode = process.exitValue();
         joinQuietly(stdout);
         joinQuietly(stderr);
         if (exitCode != 0 && output.length() == 0) {

@@ -88,8 +88,10 @@ public final class MainActivity extends Activity implements WorkflowCallbacks {
             if (!timing) {
                 return;
             }
-            timer.setText("用时 " + elapsedText(SystemClock.elapsedRealtime() - startAt));
-            mainHandler.postDelayed(this, 50L);
+            if (hasWindowFocus()) {
+                timer.setText("用时 " + elapsedText(SystemClock.elapsedRealtime() - startAt));
+            }
+            mainHandler.postDelayed(this, 250L);
         }
     };
 
@@ -439,6 +441,9 @@ public final class MainActivity extends Activity implements WorkflowCallbacks {
         runOnUiThread(() -> {
             if (state == WorkflowEngine.State.RUNNING) {
                 status.setText("正在运行");
+                action.setEnabled(false);
+                diagnose.setEnabled(false);
+                spinner.setVisibility(View.VISIBLE);
                 return;
             }
             stopTimer();
@@ -575,14 +580,11 @@ public final class MainActivity extends Activity implements WorkflowCallbacks {
         if (!ensureShizuku()) {
             return;
         }
-        new Thread(() -> {
-            try {
-                CommandResult result = executor.run(command, true);
-                runOnUiThread(() -> toast(result.isSuccess() ? success : "命令执行失败：" + result.output));
-            } catch (Exception error) {
-                runOnUiThread(() -> toast("命令执行失败：" + error.getMessage()));
-            }
-        }, "lhasa-maintenance").start();
+        if (!engine.runMaintenance(command)) {
+            toast("正在运行，维护操作已取消");
+            return;
+        }
+        toast(success);
     }
 
     private void applyKeepScreenOn(boolean keep) {
