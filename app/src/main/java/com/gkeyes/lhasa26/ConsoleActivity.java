@@ -1,6 +1,5 @@
 package com.gkeyes.lhasa26;
 
-import android.app.Activity;
 import android.app.AlertDialog;
 import android.content.ContentValues;
 import android.content.Intent;
@@ -9,6 +8,8 @@ import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.provider.MediaStore;
+
+import androidx.activity.ComponentActivity;
 
 import com.gkeyes.lhasa26.core.DeviceSnapshot;
 import com.gkeyes.lhasa26.core.ShizukuExecutor;
@@ -27,10 +28,10 @@ import java.util.Locale;
 import rikka.shizuku.Shizuku;
 
 /**
- * Host for the Miuix console. It owns no UI logic of its own: the engine drives the state and the
- * console reports intents back as {@link FoldEvent}.
+ * Host for the Miuix console. ComponentActivity is required because AbstractComposeView resolves
+ * ViewTreeLifecycleOwner and ViewTreeSavedStateRegistryOwner from the view tree.
  */
-public final class ConsoleActivity extends Activity
+public final class ConsoleActivity extends ComponentActivity
         implements WorkflowCallbacks, FoldConsoleView.Listener {
 
     private static final int REQUEST_SHIZUKU = 1001;

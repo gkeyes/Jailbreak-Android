@@ -10,8 +10,8 @@ android {
         applicationId = "com.gkeyes.lhasa26"
         minSdk = 37
         targetSdk = 37
-        versionCode = 303
-        versionName = "0.3.3"
+        versionCode = 304
+        versionName = "0.3.4"
         resourceConfigurations += listOf("zh", "en")
     }
 
@@ -59,5 +59,7 @@ android {
 dependencies {
     implementation("dev.rikka.shizuku:api:13.1.5")
     implementation("dev.rikka.shizuku:provider:13.1.5")
+    // ComponentActivity installs the ViewTreeLifecycleOwner that AbstractComposeView requires.
+    implementation("androidx.activity:activity:1.12.4")
     implementation(project(":design:miuix-console:ui"))
 }
