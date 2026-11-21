@@ -39,6 +39,7 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
     private volatile boolean busy;
     private volatile boolean rootBeforeRun;
     private volatile String enforceBeforeRun = "";
+    private volatile String selinuxAfterRoot = "?";
     private volatile long lastDeviceRefresh;
 
     public WorkflowEngine(AssetManager assets, CommandExecutor executor, WorkflowCallbacks callbacks) {
@@ -99,6 +100,14 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
         synchronized (logLock) {
             return sessionLog.toString();
         }
+    }
+
+    /**
+     * Session log with kernel addresses masked, for pasting into issue reports.
+     */
+    public String getShareableLog() {
+        String raw = getSessionLog();
+        return raw.replaceAll("0x[0-9a-fA-F]{6,}", "0x<addr>");
     }
 
     @Override
@@ -178,6 +187,7 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
     }
 
     private void runRootChain() throws Exception {
+        long chainStart = System.currentTimeMillis();
         step(0);
         status("核对内核");
         String kernel = run("uname -r", false).output.trim();
@@ -248,15 +258,18 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
         run("rm -f " + FAILED_MARKER, true);
         clearRunMarker();
         state = State.ROOTED;
-        callbacks.onStatus("已获得临时 ROOT · 正在加载 KernelSU");
+        selinuxAfterRoot = enforceNow();
+        callbacks.onStatus("已获得临时 ROOT · 正在加载 KernelSU · SELinux " + selinuxAfterRoot);
         append("临时 ROOT 已就绪。");
         append("[归因] " + (rootBeforeRun
-                ? "运行前已具备 uid=0（root 非本次取得），本次只确认根通道可用"
-                : "运行前无 uid=0，运行后 uid=0 → 本次提权链路生效")
+                ? "开始时检查进程已是 uid=0（root 非本次取得），本次只确认根通道可用"
+                : "开始时检查进程为 shell（未持有 root），结束时获得 uid=0")
                 + " · SELinux " + (enforceBeforeRun.isEmpty() ? "?" : enforceBeforeRun)
-                + " → " + enforceNow());
+                + " → " + selinuxAfterRoot);
 
         runKernelSuStep();
+        append(String.format(Locale.US, "[耗时] 从点击到核管接管结束 %.1fs",
+                (System.currentTimeMillis() - chainStart) / 1000.0));
     }
 
     private void runDiagnosis() throws Exception {
@@ -320,19 +333,22 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
             CommandResult ksudProbe = run("/system/bin/su -c '/data/local/tmp/ksud -V' 2>/dev/null", true);
             append("[KSU] su -c id → " + oneLine(suProbe.output));
             append("[KSU] ksud -V → " + oneLine(ksudProbe.output));
+            selinuxAfterRoot = enforceNow();
+            append("[SELinux] 最终实测 " + selinuxAfterRoot);
             if (suProbe.output.contains("uid=0")) {
                 state = State.COMPLETE;
-                callbacks.onState(State.COMPLETE, "全部完成 · 已接管");
+                callbacks.onState(State.COMPLETE, "全部完成 · 已接管 · SELinux " + selinuxAfterRoot);
             } else {
                 state = State.KSU_PENDING;
-                callbacks.onState(State.KSU_PENDING, "未接管 · 临时 ROOT 仍有效，可再次尝试");
+                callbacks.onState(State.KSU_PENDING,
+                        "未接管 · 临时 ROOT 仍有效 · SELinux " + selinuxAfterRoot);
             }
         } catch (Throwable failure) {
             append(friendly(failure));
             if (shizukuGone()) {
                 state = State.KSU_PENDING;
                 callbacks.onState(State.KSU_PENDING,
-                        "可能已接管 · Shizuku 已断开，请重新启动 Shizuku 后再确认");
+                        "可能已接管 · Shizuku 已断开，请重新启动 Shizuku 后再确认 · SELinux " + selinuxAfterRoot);
                 return;
             }
             if (isPanic()) {
@@ -341,7 +357,8 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
                 return;
             }
             state = State.KSU_PENDING;
-            callbacks.onState(State.KSU_PENDING, "未接管 · 临时 ROOT 仍有效，可再次尝试");
+            callbacks.onState(State.KSU_PENDING,
+                    "未接管 · 临时 ROOT 仍有效 · SELinux " + selinuxAfterRoot);
         }
     }
 
@@ -349,24 +366,29 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
         long started = System.currentTimeMillis();
         int runnable = -1;
         long freeKb = -1;
+        long availableKb = -1;
         boolean reached = false;
         while (System.currentTimeMillis() - started < 20000L) {
-            String[] lines = run("cat /proc/loadavg 2>/dev/null; awk '/MemFree/{print $2}' /proc/meminfo 2>/dev/null", true).output.trim().split("\\n");
-            if (lines.length > 0) {
-                String[] fields = lines[0].trim().split("\\s+");
+            String[] dump = run("cat /proc/loadavg 2>/dev/null; grep -E '^(MemFree|MemAvailable):' /proc/meminfo 2>/dev/null", true)
+                    .output.trim().split("\\n");
+            for (String line : dump) {
+                String[] fields = line.trim().split("\\s+");
                 if (fields.length >= 4 && fields[3].contains("/")) {
                     try {
                         runnable = Integer.parseInt(fields[3].substring(0, fields[3].indexOf('/')));
                     } catch (NumberFormatException ignored) {
                         runnable = -1;
                     }
-                }
-            }
-            if (lines.length > 1) {
-                try {
-                    freeKb = Long.parseLong(lines[1].trim());
-                } catch (NumberFormatException ignored) {
-                    freeKb = -1;
+                } else if (fields.length >= 2) {
+                    try {
+                        if (fields[0].startsWith("MemFree")) {
+                            freeKb = Long.parseLong(fields[1]);
+                        } else if (fields[0].startsWith("MemAvailable")) {
+                            availableKb = Long.parseLong(fields[1]);
+                        }
+                    } catch (NumberFormatException ignored) {
+                        // keep the previous sample
+                    }
                 }
             }
             if (runnable >= 0 && runnable <= 6 && freeKb >= 200000) {
@@ -375,8 +397,8 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
             }
             Thread.sleep(300L);
         }
-        append(String.format(Locale.US, "[空闲] 等待 %.1fs · runnable=%d · MemFree=%d kB · %s",
-                (System.currentTimeMillis() - started) / 1000.0, runnable, freeKb,
+        append(String.format(Locale.US, "[空闲] 等待 %.1fs · runnable=%d · MemFree=%d kB · MemAvailable=%d kB · %s",
+                (System.currentTimeMillis() - started) / 1000.0, runnable, freeKb, availableKb,
                 reached ? "达标，开跑" : "未达标，仍开跑"));
     }
 
@@ -536,22 +558,37 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
     /** Frees memory before the exploit runs; the payload needs large contiguous allocations. */
     private void cleanMemory() {
         try {
-            long before = memFreeKb();
+            long[] before = memoryState();
             CommandResult stop = run("am force-stop com.tencent.mm 2>/dev/null; am force-stop com.tencent.mobileqq 2>/dev/null; true", true);
-            long after = memFreeKb();
-            append("清理系统内存：MemFree " + before + " kB → " + after + " kB"
+            long[] after = memoryState();
+            append("清理系统内存：MemFree " + before[0] + "→" + after[0] + " kB · MemAvailable "
+                    + before[1] + "→" + after[1] + " kB"
                     + (stop.exitCode == 0 ? "" : "（命令退出码 " + stop.exitCode + "）"));
         } catch (Exception ignored) {
             append("清理系统内存：跳过");
         }
     }
 
-    private long memFreeKb() {
+    /** {MemFree, MemAvailable} in kB, -1 when unreadable. */
+    private long[] memoryState() {
         try {
-            String out = run("awk '/MemFree/{print $2}' /proc/meminfo 2>/dev/null", true).output.trim();
-            return Long.parseLong(out);
+            String out = run("grep -E '^(MemFree|MemAvailable):' /proc/meminfo 2>/dev/null", true).output.trim();
+            long free = -1L;
+            long available = -1L;
+            for (String line : out.split("\\n")) {
+                String[] fields = line.trim().split("\\s+");
+                if (fields.length < 2) {
+                    continue;
+                }
+                if (fields[0].startsWith("MemFree")) {
+                    free = Long.parseLong(fields[1]);
+                } else if (fields[0].startsWith("MemAvailable")) {
+                    available = Long.parseLong(fields[1]);
+                }
+            }
+            return new long[]{free, available};
         } catch (Exception ignored) {
-            return -1L;
+            return new long[]{-1L, -1L};
         }
     }
 
