@@ -36,6 +36,7 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
     private volatile State state = State.IDLE;
     private volatile long startedAt;
     private volatile int currentStep = -1;
+    private volatile boolean busy;
 
     public WorkflowEngine(AssetManager assets, CommandExecutor executor, WorkflowCallbacks callbacks) {
         this.executor = executor;
@@ -48,18 +49,18 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
     }
 
     public boolean startRoot() {
-        return start("root", this::runRootChain);
+        return start("root", this::runRootChain, true);
     }
 
     public boolean retryKernelSu() {
         if (state != State.ROOTED && state != State.KSU_PENDING) {
             return false;
         }
-        return start("ksu", this::runKernelSuStep);
+        return start("ksu", this::runKernelSuStep, true);
     }
 
     public boolean diagnose() {
-        return start("diagnose", this::runDiagnosis);
+        return start("diagnose", this::runDiagnosis, false);
     }
 
     public void refreshDeviceInfo() {
@@ -96,8 +97,9 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
         }
         String value = line.endsWith("\n") ? line : line + "\n";
         synchronized (logLock) {
-            if (sessionLog.length() < 48000) {
-                sessionLog.append(value);
+            sessionLog.append(value);
+            if (sessionLog.length() > 96000) {
+                sessionLog.delete(0, sessionLog.length() - 64000);
             }
         }
         callbacks.onLog(value);
@@ -108,9 +110,13 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
         void run() throws Exception;
     }
 
-    private boolean start(String operation, WorkflowTask action) {
+    /**
+     * Serializes every background operation behind one busy flag. Diagnosis runs with ownsState=false
+     * so it never rewrites the root workflow state nor wipes the session log of a finished run.
+     */
+    private boolean start(String operation, WorkflowTask action, boolean ownsState) {
         synchronized (this) {
-            if (state == State.RUNNING) {
+            if (busy) {
                 append("正在运行，请勿重复点击。");
                 return false;
             }
@@ -119,23 +125,38 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
                 append("请先启动 Shizuku 并授权本应用。");
                 return false;
             }
-            state = State.RUNNING;
+            busy = true;
             startedAt = System.currentTimeMillis();
             currentStep = -1;
-            synchronized (logLock) {
-                sessionLog.setLength(0);
+            if (ownsState) {
+                state = State.RUNNING;
+                synchronized (logLock) {
+                    sessionLog.setLength(0);
+                }
+                callbacks.onState(State.RUNNING, operation);
+            } else {
+                callbacks.onStatus("正在诊断");
             }
-            callbacks.onState(State.RUNNING, operation);
         }
         worker.execute(() -> {
             try {
                 action.run();
             } catch (InterruptedException interrupted) {
                 Thread.currentThread().interrupt();
-                fail("操作已中断");
+                if (ownsState) {
+                    fail("操作已中断");
+                } else {
+                    append("操作已中断");
+                }
             } catch (Throwable failure) {
                 append(friendly(failure));
-                fail(friendly(failure));
+                if (ownsState) {
+                    fail(friendly(failure));
+                } else {
+                    callbacks.onStatus("诊断失败 · " + friendly(failure));
+                }
+            } finally {
+                busy = false;
             }
         });
         return true;
@@ -228,11 +249,11 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
         append(report);
         run("echo '!enable_event:kmem:kmem_cache_alloc' > /sys/kernel/tracing/events/kmem/rss_stat/trigger 2>/dev/null; echo 0 > /sys/kernel/tracing/tracing_on 2>/dev/null", true);
         if (report.contains("必需项全部通过")) {
-            state = State.IDLE;
             status("诊断通过 · 环境可用");
-            callbacks.onState(State.IDLE, "诊断通过");
+            append("[诊断] 通过 · 环境可用");
         } else {
-            fail(report.contains("必需接口不可用") ? "诊断失败 · 有必需项未通过" : "诊断未完成 · 详见日志");
+            status("诊断未通过 · 详见日志");
+            append(report.contains("必需接口不可用") ? "[诊断] 失败 · 有必需项未通过" : "[诊断] 未完成 · 详见日志");
         }
     }
 
