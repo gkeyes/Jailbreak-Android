@@ -12,7 +12,7 @@ fun readSigningProperties(): Map<String, String> {
     file.inputStream().use { properties.load(it) }
     val result = mutableMapOf<String, String>()
     for (name in properties.stringPropertyNames()) {
-        result[name] = properties.getProperty(name)
+        properties.getProperty(name)?.let { value -> result[name] = value }
     }
     return result
 }
