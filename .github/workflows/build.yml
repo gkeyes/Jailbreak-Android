@@ -6,7 +6,7 @@ name: build-apk
 # keystore/keystore.properties；不依赖 Actions Secrets。
 #
 # 关于 Artifact：免费配额经常是满的，upload/download-artifact 会 403。
-# 所以 release job **自己构建**，不经过 Artifact —— 发布链路不能依赖存储配额。
+# 所以 release job **自己构建**，不经过 Artifact。
 
 on:
   push:
@@ -173,10 +173,32 @@ jobs:
           tag="v${ver}"
           asset="/tmp/lhasa26-${ver}.apk"
           cp "$apk" "$asset"
-          notes=$(printf '## 18fold越狱 %s\n\n- size: %s bytes\n- sha256: `%s`\n- signer: `%s`\n- ksud: `%s`\n- commit: `%s`\n\n四个探针由 plant/*.c 构建；uaf_plant_replay 与 ksud 保持原件。\n' \
-            "$ver" "$size" "$sha" "${cert:-unknown}" "$ksud" "${GITHUB_SHA:0:8}")
+
+          # assets 清单（让 Releases 页面能自证装的是哪些二进制）
+          assets_note=$(python3 - <<'PY'
+          import json, pathlib
+          ledger = json.loads(pathlib.Path("tools/assets-ledger.json").read_text(encoding="utf-8"))
+          lines = []
+          for entry in ledger["assets"]:
+              if not entry.get("inApk"):
+                  continue
+              lines.append("- `%s` %s 字节 · %s%s" % (
+                  entry["name"],
+                  entry.get("size", "?"),
+                  entry.get("status", "?"),
+                  (" · 源码 " + entry["sourceDraft"]) if entry.get("sourceDraft") else "",
+              ))
+          print("\n".join(lines))
+          PY
+          )
+
+          notes=$(printf '## 18fold越狱 %s\n\n- size: %s bytes\n- sha256: `%s`\n- signer: `%s`\n- ksud: `%s`\n- commit: `%s`\n\n### APK 内的原生件\n%s\n' \
+            "$ver" "$size" "$sha" "${cert:-unknown}" "$ksud" "${GITHUB_SHA:0:8}" "$assets_note")
+
           if gh release view "$tag" >/dev/null 2>&1; then
             gh release upload "$tag" "$asset" --clobber
+            # 覆盖上传不会改说明，必须显式更新，否则页面还显示上一版的信息
+            gh release edit "$tag" --notes "$notes"
           else
             gh release create "$tag" "$asset" --title "18fold越狱 ${ver}" --notes "$notes" --target "$GITHUB_SHA"
           fi
