@@ -35,7 +35,6 @@ android {
     signingConfigs {
         create("release") {
             // 取值顺序：环境变量 → keystore/keystore.properties → 不签名。
-            // 环境变量优先，是为了以后想把口令挪到 Secrets 时不用改这里。
             val stored = readSigningProperties()
             val keystorePath = System.getenv("LHASA_KEYSTORE")
                 ?: stored["storeFile"]
@@ -63,8 +62,10 @@ android {
 
     buildTypes {
         release {
-            isMinifyEnabled = true
-            isShrinkResources = true
+            // 测试阶段关掉 R8：压缩要 4–6 分钟，还把栈帧混淆到没法看。
+            // 要正式发布时把下面两行改回 true，并确认 proguard-rules.pro 完整。
+            isMinifyEnabled = false
+            isShrinkResources = false
             signingConfigs.findByName("release")?.let { signing ->
                 if (signing.storeFile != null) {
                     signingConfig = signing
