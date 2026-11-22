@@ -3,8 +3,6 @@ name: plant
 # plant/ 下的自有 C 源码：交叉编译 + 与原件/基线的等价性验证。
 #
 # 默认全只读。唯一会写仓库的是 publish job：提交信息里带 [publish] 才会跑。
-# （不上 workflow_dispatch 的 inputs，是因为带 inputs 的那版推上去后
-#   整个工作流都没启动——GitHub 对无效工作流是静默跳过。）
 
 on:
   push:
@@ -139,9 +137,11 @@ jobs:
         run: |
           set -e
           for name in reach_probe slide_probe perf_slide pc98260-su; do
-            src="$RUNNER_TEMP/plant/$name"
+            src="$RUNNER_TEMP/plant/out/$name"
+            [ -f "$src" ] || src="$RUNNER_TEMP/plant/$name"
             if [ ! -f "$src" ]; then
               echo "::error::缺少产物 $name"
+              find "$RUNNER_TEMP/plant" -maxdepth 3 -type f | head -20
               exit 1
             fi
             cp "$src" "app/src/main/assets/$name"
@@ -195,6 +195,27 @@ jobs:
           fi
           git commit -m "feat(assets): 四个探针改为自有源码构建产物 [apk] [release]"
           git push
+
+      - name: 失败时把日志写进 issue
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          body="$RUNNER_TEMP/publish-failure.md"
+          {
+            echo "commit: \`$GITHUB_SHA\`"
+            echo
+            echo "publish job 失败，现场："
+            echo '```text'
+            ls -R "$RUNNER_TEMP/plant" 2>/dev/null | head -40 || true
+            echo '```'
+            echo '```text'
+            git status --short 2>/dev/null | head -20 || true
+            echo '```'
+          } > "$body"
+          gh issue create --title "ci: publish 失败 ${GITHUB_SHA:0:8}" --body-file "$body" \
+            --repo "${{ github.repository }}" || true
 
   scan:
     name: 常量扫描
