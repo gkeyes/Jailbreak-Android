@@ -5,7 +5,7 @@
 - 每个打进 APK 的文件都必须在台账里登记，且 size / git blob SHA-1 对得上；
 - 台账里填了 sha256 就一并校验；
 - 有未登记的新文件 → 报警（--strict 下失败）；
-- tools/ksud.lock.properties 的字段必须齐全、链接与 tag 一致。
+- tools/ksud.lock.properties 的字段必须齐全、链接与 tag/repo 一致。
 
 用法：
   tools/check_assets.py            # 打印核对表，只有硬错误才返回 1
@@ -29,14 +29,16 @@ ASSETS_DIR = ROOT / "app" / "src" / "main" / "assets"
 # 不参与安装的说明文件，允许不出现在台账里
 ALLOWLIST = {"README.payloads.md", "README.md"}
 
+LOCK_REQUIRED = ("repo", "tag", "url", "apkSha256", "entry", "size", "sha256", "license")
+
 
 def blob_sha1(data: bytes) -> str:
     """git 对象内容的 SHA-1，等价于 `git hash-object <file>`。"""
     return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
 
 
-def load_lock() -> dict[str, str]:
-    values: dict[str, str] = {}
+def load_lock() -> dict:
+    values = {}
     for line in LOCK.read_text(encoding="utf-8").splitlines():
         line = line.strip()
         if not line or line.startswith("#") or "=" not in line:
@@ -46,27 +48,45 @@ def load_lock() -> dict[str, str]:
     return values
 
 
-def check_lock(errors: list[str], notes: list[str]) -> None:
+def is_sha256(value: str) -> bool:
+    return len(value) == 64 and all(c in "0123456789abcdef" for c in value.lower())
+
+
+def check_lock(errors: list, notes: list) -> None:
     if not LOCK.exists():
         errors.append("缺少 tools/ksud.lock.properties")
         return
+
     lock = load_lock()
-    for key in ("repo", "tag", "asset", "url", "size", "sha256", "license"):
+    for key in LOCK_REQUIRED:
         if not lock.get(key):
             errors.append(f"ksud.lock 缺少字段 {key}")
-    sha = lock.get("sha256", "")
-    if sha and (len(sha) != 64 or any(c not in "0123456789abcdef" for c in sha.lower())):
-        errors.append("ksud.lock 的 sha256 不是 64 位十六进制")
+
+    for key in ("sha256", "apkSha256"):
+        value = lock.get(key, "")
+        if value and not is_sha256(value):
+            errors.append(f"ksud.lock 的 {key} 不是 64 位十六进制")
+
+    if not lock.get("size", "").isdigit():
+        errors.append(f"ksud.lock 的 size 不是十进制字节数：{lock.get('size')}")
+
     url = lock.get("url", "")
-    tag, asset = lock.get("tag", ""), lock.get("asset", "")
-    if url and tag and asset and f"/{tag}/{asset}" not in urllib.parse.urlparse(url).path:
-        errors.append(f"ksud.lock 的 url 与 tag/asset 不一致：{url}")
-    if lock.get("repo") and url and lock["repo"] not in url:
-        errors.append(f"ksud.lock 的 url 与 repo 不一致：{url}")
+    tag = lock.get("tag", "")
+    repo = lock.get("repo", "")
+    if url:
+        path = urllib.parse.urlparse(url).path
+        if tag and f"/{tag}/" not in path:
+            errors.append(f"ksud.lock 的 url 里没有 /{tag}/：{url}")
+        if repo and repo not in url:
+            errors.append(f"ksud.lock 的 url 与 repo={repo} 不一致：{url}")
+    entry = lock.get("entry", "")
+    if entry and not entry.startswith("lib/"):
+        notes.append(f"ksud.lock 的 entry 不在 APK 的 lib/ 下：{entry}")
+
     notes.append(
-        "ksud 锁定：" + " ".join(
-            f"{k}={lock.get(k, '?')}" for k in ("repo", "tag", "asset", "size")
-        )
+        "ksud 锁定："
+        + " ".join(f"{k}={lock.get(k, '?')}" for k in ("repo", "tag", "entry"))
+        + f" sha256={lock.get('sha256', '?')[:16]}…"
     )
 
 
@@ -78,10 +98,10 @@ def main() -> int:
         return 1
     ledger = json.loads(LEDGER.read_text(encoding="utf-8"))
 
-    errors: list[str] = []
-    warnings: list[str] = []
-    notes: list[str] = []
-    listed: set[str] = set()
+    errors: list = []
+    warnings: list = []
+    notes: list = []
+    listed = set()
     changed = False
 
     for entry in ledger.get("assets", []):
@@ -120,7 +140,6 @@ def main() -> int:
             notes.append(f"{label} 状态 {status} → {entry.get('action', '待处置')}")
         print(f"{'OK ' if not flags else 'BAD'} {label:<18} {size:>9}  {status:<24} {sha256[:16]}")
 
-    # 目录里有、台账里没有的文件
     if ASSETS_DIR.is_dir():
         actual = {p.name for p in ASSETS_DIR.iterdir() if p.is_file()}
         for extra in sorted(actual - listed - ALLOWLIST):
