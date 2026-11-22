@@ -1,11 +1,11 @@
 # 构建与验收
 
-- commit: `8dfbe7b6`
-- 接线: success
+- commit: `2eb4ae5c`
+- 接线: n/a
 - 单测: success
 - 构建: success
 - APK: app/build/outputs/apk/debug/app-debug.apk (43M)
-- 已固化: yes
+- 已固化: no
 
 ## 用例
 
