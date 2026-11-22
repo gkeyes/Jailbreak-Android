@@ -2,7 +2,9 @@ package com.gkeyes.lhasa26.core;
 
 import android.content.res.AssetManager;
 
+import java.util.LinkedHashSet;
 import java.util.Locale;
+import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
@@ -19,15 +21,12 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
             "提权执行", "结果验证", "KernelSU 接管"
     };
 
-    /** MemFree is dominated by page cache, so the idle gate follows MemAvailable instead. */
     private static final long IDLE_AVAILABLE_KB = 1500000L;
-    /** Above this much available memory the force-stop of chat apps buys nothing. */
     private static final long CLEAN_SKIP_AVAILABLE_KB = 3000000L;
     private static final long DEPLOY_TIMEOUT_MS = 8000L;
     private static final String RUN_MARKER = "/data/local/tmp/.lhasa_run";
     private static final String ROOTD_SOCKET = "/data/local/tmp/pc98260-root.sock";
     private static final String EXPLOIT_BINARIES = "uaf_plant_replay slide_probe reach_probe";
-    /** 单次探测的硬上限（秒）。超出就 kill，绝不允许探针以 root 常驻。 */
     private static final int SLIDE_PROBE_TIMEOUT_S = 12;
     private static final int DIAGNOSE_TIMEOUT_S = 25;
     private final CommandExecutor executor;
@@ -40,6 +39,8 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
     });
     private final Object logLock = new Object();
     private final StringBuilder sessionLog = new StringBuilder();
+    /** payload 输出去重：同一条日志行只进 sessionLog 一次。 */
+    private final Set<String> payloadLines = new LinkedHashSet<>();
     private volatile State state = State.IDLE;
     private volatile long startedAt;
     private volatile int currentStep = -1;
@@ -103,7 +104,6 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
         executor.kill();
     }
 
-    /** Share-safe session log: kernel addresses are masked. */
     public String getSessionLog() {
         return getShareableLog();
     }
@@ -133,6 +133,22 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
         callbacks.onLog(value);
     }
 
+    /** 把 payload 的新增输出写进会话日志（去重），保证导出时能看到它到底停在哪。 */
+    private void appendPayloadOutput(String tail) {
+        if (tail == null || tail.trim().isEmpty()) {
+            return;
+        }
+        for (String line : tail.split("\\n")) {
+            String trimmed = line.trim();
+            if (trimmed.isEmpty()) {
+                continue;
+            }
+            if (payloadLines.add(trimmed)) {
+                append(trimmed);
+            }
+        }
+    }
+
     @FunctionalInterface
     private interface WorkflowTask {
         void run() throws Exception;
@@ -157,6 +173,7 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
                 synchronized (logLock) {
                     sessionLog.setLength(0);
                 }
+                payloadLines.clear();
                 callbacks.onState(State.RUNNING, operation);
             } else {
                 callbacks.onStatus("正在诊断");
@@ -202,6 +219,22 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
             append(BootGuard.kernelWarning(kernel));
         }
         String boot = bootId();
+        captureBaseline();
+
+        // 已经持有 KernelSU root（/system/bin/su 给出 uid=0）时，不要再跑 UAF：
+        // 内核模块已加载，堆状态与 exploit 假设不同，重跑只增加 panic 风险。
+        if (rootBeforeRun) {
+            clearRunMarker();
+            run(BootGuard.clearStageCommand(), true);
+            state = State.COMPLETE;
+            selinuxAfterRoot = enforceNow();
+            append("[跳过] 检测到 /system/bin/su 已可用且为 uid=0 —— 本机已由 KernelSU 接管。");
+            append("[跳过] 不再执行 UAF 提权；如需重新验证请先重启设备。");
+            callbacks.onState(State.COMPLETE,
+                    "已由 KernelSU 接管 · 无需执行 · SELinux " + selinuxAfterRoot);
+            return;
+        }
+
         if (payloadProcessCount() > 0) {
             throw new IllegalStateException("上次运行的进程仍在运行，请重启设备后重试。");
         }
@@ -212,7 +245,6 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
             append("[上次] " + hint);
         }
 
-        // 本次开机能不能重跑，只由失败记录决定：abort 一律禁止，与 SELinux 状态无关。
         String recorded = run("cat " + BootGuard.FAILED_FILE + " 2>/dev/null", true).output.trim();
         BootGuard.Retry retry = BootGuard.parseFailure(recorded, boot);
         if (retry == BootGuard.Retry.BLOCKED) {
@@ -224,7 +256,6 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
             append("（提示）本次开机已为 Permissive，将直接重试 cred 阶段。");
         }
 
-        captureBaseline();
         cleanMemory();
 
         step(1);
@@ -281,11 +312,8 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
         selinuxAfterRoot = enforceNow();
         callbacks.onStatus("已获得临时 ROOT · SELinux " + selinuxAfterRoot);
         append("临时 ROOT 已就绪。");
-        append("[归因] " + (rootBeforeRun
-                ? "开始时检查进程已是 uid=0（root 非本次取得），本次只确认根通道可用"
-                : "开始时检查进程为 shell（未持有 root），结束时获得 uid=0")
-                + " · SELinux " + (enforceBeforeRun.isEmpty() ? "?" : enforceBeforeRun)
-                + " → " + selinuxAfterRoot);
+        append("[归因] 开始时为 shell（未持有 root），结束时获得 uid=0 · SELinux "
+                + (enforceBeforeRun.isEmpty() ? "?" : enforceBeforeRun) + " → " + selinuxAfterRoot);
         append("[下一步] 需要 KernelSU 常驻时，再点一次主按钮执行接管（会加载内核模块，可能重启）。");
         callbacks.onState(State.ROOTED,
                 "已获得临时 ROOT · 需要常驻再点一次加载 KernelSU · SELinux " + selinuxAfterRoot);
@@ -315,8 +343,6 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
                 + (patch.isEmpty() ? "" : (patch.compareTo("2026-10-06") < 0
                 ? " · 未修补窗口"
                 : " · 可能已回补")));
-        // 本 ROM 对 shell 关掉了 perf 内核采样、kallsyms、kprobe，reach_probe 必然标 FAIL。
-        // 只要 slide_probe 能真的拿到 slide，就说明这条链需要的能力是可用的。
         CommandResult probe = run(BootGuard.withTimeout(SLIDE_PROBE_TIMEOUT_S,
                 "/data/local/tmp/slide_probe"), true);
         append(filterProbe(probe.output));
@@ -420,13 +446,6 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
                 freeKb, reached ? "达标，开跑" : "未达标，仍开跑"));
     }
 
-    /**
-     * 测量本次开机的内核地址。
-     *
-     * 只有一条来源：slide_probe（扫 trace_pipe_raw 的二进制记录，
-     * 用 call_site − profile.alloc_timer_site 得到 2 MiB 对齐的 slide）。
-     * 拿不到时打印原因并返回空参数，让 payload 用 profile 自行判定。
-     */
     private String measureAddress() throws Exception {
         run(BootGuard.markCommand("probe-slide"), true);
         CommandResult probe = run(BootGuard.withTimeout(SLIDE_PROBE_TIMEOUT_S,
@@ -465,6 +484,7 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
         } else {
             append("[payload] 不带地址参数启动（由 payload 自行判定）");
         }
+        payloadLines.clear();
         for (int attempt = 1; attempt <= 3; attempt++) {
             run("rm -f /data/local/tmp/uaf_replay.log; " + BootGuard.launchCommand(
                     "/data/local/tmp/uaf_plant_replay",
@@ -476,13 +496,13 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
                 String tail = run("tail -n 24 /data/local/tmp/uaf_replay.log 2>/dev/null", true).output;
                 if (!tail.trim().isEmpty()) {
                     callbacks.onTail(tail);
+                    appendPayloadOutput(tail);
                 }
                 BootGuard.Outcome outcome = BootGuard.classify(tail);
                 if (outcome == BootGuard.Outcome.SUCCESS) {
                     return null;
                 }
                 if (outcome == BootGuard.Outcome.ABORT_BOOT) {
-                    // 节点已挂树：本次开机永久禁止重跑，必须重启。
                     run(BootGuard.recordFailureCommand(boot, true, false), true);
                     return "payload 报告节点已挂树（holding zombie）· 本次开机禁止重跑，请重启设备";
                 }
@@ -491,7 +511,6 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
                     if (isRoot(verify.output)) {
                         return null;
                     }
-                    // 进程已经退出且没有成功标记 → 没必要再等满 200 轮。
                     if (Integer.parseInt(run(BootGuard.aliveCommand(), true).output.trim()) == 0) {
                         exited = true;
                         break;
@@ -503,10 +522,10 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
                 Thread.sleep(800L);
             }
             if (exited) {
-                String tail = run("tail -n 6 /data/local/tmp/uaf_replay.log 2>/dev/null", true).output.trim();
-                append("[payload] 进程已退出但没有成功标记" + (tail.isEmpty() ? "" : "，最后输出："));
-                if (!tail.isEmpty()) {
-                    append(tail);
+                String tail = run("cat /data/local/tmp/uaf_replay.log 2>/dev/null", true).output;
+                appendPayloadOutput(tail);
+                if (tail.trim().isEmpty()) {
+                    append("[payload] 进程已退出且日志为空");
                 }
                 return "payload 提前退出（未进入提权阶段）· 详见上方输出";
             }
@@ -532,11 +551,6 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
         return "1".equals(socket) ? 1 : 0;
     }
 
-    /**
-     * Removes the world-executable exploit binaries from /data/local/tmp once the workflow is over.
-     * Logs stay for debugging. While a temporary root is the only way up, its client and socket stay;
-     * once KernelSU has taken over they are dead weight and removed too.
-     */
     private void cleanupBinaries(boolean keepRootClient) {
         try {
             if (!keepRootClient) {
@@ -547,9 +561,7 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
             run("cd /data/local/tmp 2>/dev/null; rm -f " + targets + "; true", true);
             String reason;
             if (keepRootClient) {
-                reason = state == State.ROOTED || state == State.KSU_PENDING
-                        ? "（保留 pc98260-su 与 rootd socket，临时 ROOT 仍在用）"
-                        : "（保留 pc98260-su 与 rootd socket）";
+                reason = "（保留 pc98260-su 与 rootd socket，临时 ROOT 仍在用）";
             } else if (state == State.COMPLETE) {
                 reason = "（KernelSU 已接管，临时通道一并移除）";
             } else {
@@ -614,7 +626,6 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
         }
     }
 
-    /** Records the failed boot; abort=true blocks any retry in this boot. */
     private void recordFailedBoot(String boot, boolean abort) {
         if (boot == null || boot.isEmpty()) {
             return;
