@@ -2,12 +2,9 @@ name: plant
 
 # plant/ 下的自有 C 源码：交叉编译 + 与原件/基线的等价性验证。
 #
-# 默认全只读。唯一会写仓库的是 publish job，两种触发方式：
-#   1. workflow_dispatch 且勾选 publish（注意：只在默认分支上能看到按钮）
-#   2. 提交信息里带 [publish]（默认分支被冻结时用这条）
-#
-# 它把编译产物提交进 app/src/main/assets，并带 [apk] [release] 回来，
-# 于是 verify 会保留 APK、build-apk 会产出带签名的发布包。
+# 默认全只读。唯一会写仓库的是 publish job：提交信息里带 [publish] 才会跑。
+# （不上 workflow_dispatch 的 inputs，是因为带 inputs 的那版推上去后
+#   整个工作流都没启动——GitHub 对无效工作流是静默跳过。）
 
 on:
   push:
@@ -19,11 +16,6 @@ on:
       - 'tools/equiv.py'
       - '.github/workflows/plant.yml'
   workflow_dispatch:
-    inputs:
-      publish:
-        description: '把编译产物提交进 app/src/main/assets（会写仓库，并触发带签名的发布）'
-        type: boolean
-        default: false
 
 permissions:
   contents: read
@@ -31,7 +23,7 @@ permissions:
 
 jobs:
   compile:
-    name: 编译 + 等价性验证
+    name: 编译与等价性验证
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -46,7 +38,7 @@ jobs:
           tar -xf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP"
           echo "$RUNNER_TEMP/zig-linux-x86_64-0.13.0" >> "$GITHUB_PATH"
 
-      - name: 编译 plant/*.c
+      - name: 编译 plant 源码
         id: compile
         run: |
           set -uo pipefail
@@ -56,7 +48,7 @@ jobs:
           files=(plant/*.c)
           mkdir -p "$RUNNER_TEMP/out"
           if [ ${#files[@]} -eq 0 ]; then
-            echo "plant/ 下还没有源码。" | tee -a "$LOG"
+            echo "plant 下还没有源码" | tee -a "$LOG"
             exit 0
           fi
           CFLAGS=(-target aarch64-linux-musl -O2 -static -s
@@ -83,19 +75,6 @@ jobs:
           python3 tools/equiv.py check-dir "$RUNNER_TEMP/out" 2>&1 | tee "$RUNNER_TEMP/equiv.log"
           exit "${PIPESTATUS[0]}"
 
-      - name: 导出字符串表
-        if: always()
-        run: |
-          set -uo pipefail
-          mkdir -p "$RUNNER_TEMP/strings"
-          for name in uaf_plant_replay reach_probe slide_probe perf_slide pc98260-su; do
-            src="app/src/main/assets/$name"
-            [ -f "$src" ] && strings -n 4 "$src" | sort -u > "$RUNNER_TEMP/strings/$name.orig.txt"
-            [ -f "$RUNNER_TEMP/out/$name" ] && \
-              strings -n 4 "$RUNNER_TEMP/out/$name" | sort -u > "$RUNNER_TEMP/strings/$name.rebuilt.txt"
-          done
-          wc -l "$RUNNER_TEMP"/strings/*.txt || true
-
       - name: 上传产物
         if: always()
         continue-on-error: true
@@ -106,7 +85,6 @@ jobs:
             ${{ runner.temp }}/out/*
             ${{ runner.temp }}/equiv.log
             ${{ runner.temp }}/compile.log
-            ${{ runner.temp }}/strings/*.txt
           if-no-files-found: ignore
           retention-days: 7
 
@@ -122,31 +100,23 @@ jobs:
           {
             echo "commit: \`$GITHUB_SHA\`"
             echo
-            echo "### 各步结果"
-            echo '```text'
             echo "compile = ${OUT_COMPILE}"
             echo "equiv   = ${OUT_EQUIV}"
-            echo '```'
-            echo "### 报错行"
+            echo
             echo '```text'
-            grep -nE '(^e: |error:|FAIL |GAP |FAILED)' "$RUNNER_TEMP/compile.log" "$RUNNER_TEMP/equiv.log" 2>/dev/null | head -60 \
-              || echo "（无）"
+            grep -nE '(^e: |error:|FAIL |GAP |FAILED)' "$RUNNER_TEMP/compile.log" "$RUNNER_TEMP/equiv.log" 2>/dev/null | head -60 || echo "（无报错行）"
             echo '```'
-            echo "### compile.log"
             echo '```text'
-            tail -c 10000 "$RUNNER_TEMP/compile.log" 2>/dev/null || echo "（无）"
-            echo '```'
-            echo "### equiv.log"
-            echo '```text'
-            tail -c 10000 "$RUNNER_TEMP/equiv.log" 2>/dev/null || echo "（无）"
+            tail -c 8000 "$RUNNER_TEMP/compile.log" 2>/dev/null || true
+            tail -c 8000 "$RUNNER_TEMP/equiv.log" 2>/dev/null || true
             echo '```'
           } > "$body"
           gh issue create --title "ci: plant 失败 ${GITHUB_SHA:0:8}" --body-file "$body" \
             --repo "${{ github.repository }}" || true
 
   publish:
-    name: 把自有产物替换进 assets
-    if: (github.event_name == 'workflow_dispatch' && inputs.publish) || contains(github.event.head_commit.message, '[publish]')
+    name: 替换 assets
+    if: contains(github.event.head_commit.message, '[publish]')
     needs: compile
     runs-on: ubuntu-latest
     permissions:
@@ -159,13 +129,13 @@ jobs:
           name: plant-binaries
           path: "${{ runner.temp }}/plant"
 
-      - name: 归档原件基线（严格模式的参照）
+      - name: 归档原件基线
         run: |
           set -e
           python3 tools/equiv.py baseline
           ls -l plant/equiv/
 
-      - name: 用自有产物覆盖 assets
+      - name: 覆盖 assets
         run: |
           set -e
           for name in reach_probe slide_probe perf_slide pc98260-su; do
@@ -206,7 +176,7 @@ jobs:
               entry["origin"] = "rebuilt-from-source"
               entry["sourceDraft"] = sources[name]
               entry["status"] = "rebuilt"
-              entry["action"] = f"{today} 由 {sources[name]} 交叉编译后替换；基线见 plant/equiv/{name}.json"
+              entry["action"] = today + " 由 " + sources[name] + " 交叉编译后替换"
           ledger["updatedAt"] = today
           ledger_path.write_text(json.dumps(ledger, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
           print("台账已更新")
@@ -223,34 +193,29 @@ jobs:
             echo "没有变化，跳过提交"
             exit 0
           fi
-          git commit -m "feat(assets): 四个探针改为自有源码构建产物 [apk] [release]
-
-- reach_probe / slide_probe / perf_slide / pc98260-su 由 plant/*.c 交叉编译替换
-- 原件指纹归档到 plant/equiv/，此后等价性检查进入严格模式
-- 台账同步：origin=rebuilt-from-source、status=rebuilt
-- uaf_plant_replay 与 ksud 保持原样（前者无源码，后者上游开源）"
+          git commit -m "feat(assets): 四个探针改为自有源码构建产物 [apk] [release]"
           git push
 
   scan:
-    name: 现有 payload 常量扫描
+    name: 常量扫描
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: 扫描 64 位内核立即数与日志标记
+      - name: 扫描内核立即数
         run: |
           python3 - <<'PY'
           import collections, pathlib, re, os
 
           KNOWN = {
-              0xffffffc08042aa68: "profile timer (alloc_posix_timer+0x30)",
-              0xffffffc08026c02c: "profile cred (prepare_creds+0x2c)",
+              0xffffffc08042aa68: "profile timer",
+              0xffffffc08026c02c: "profile cred",
               0xffffffc082959630: "profile selinux",
               0xffffffc0826d10d8: "profile userns",
               0xffffffc0826d1388: "profile rootuser",
               0xffffffc0826d2a48: "profile groups",
               0xffffffc0826d2f08: "profile ucounts",
-              0xffffffc0801f2ec8: "profile task_site (copy_process+0x138)",
+              0xffffffc0801f2ec8: "profile task_site",
           }
           LO, HI = 0xffffff8000000000, 0xffffffff00000000
           BASE = pathlib.Path("app/src/main/assets")
@@ -258,13 +223,11 @@ jobs:
           KEYWORDS = ("zombie", "leak", "selinux", "cred", "slide", "uid=0",
                       "holding", "perf", "ring", "pipe", "rootd", "cap")
 
-          out = ["# payload 常量扫描", "",
-                 "由 CI 从 `app/src/main/assets/` 的二进制直接扫描得出，未执行任何代码。", ""]
-
+          out = ["# payload 常量扫描", ""]
           for name in TARGETS:
               path = BASE / name
               if not path.exists():
-                  out += [f"## {name}", "", "资产不存在。", ""]
+                  out += ["## " + name, "", "资产不存在。", ""]
                   continue
               data = path.read_bytes()
               hits = collections.OrderedDict()
@@ -275,28 +238,19 @@ jobs:
                           hits[value][1] += 1
                       else:
                           hits[value] = [off, 1]
-
               rows = sorted(hits.items(), key=lambda kv: -kv[1][1])
-              shown = rows[:220]
-              out += [f"## {name}", "", f"`{len(data)}` bytes，内核地址立即数 `{len(hits)}` 个。", ""]
-              if not hits:
-                  out += ["无匹配（位置无关或运行时计算）。", ""]
-              else:
-                  out += ["| addr | off | hits | note |", "|---|---|---|---|"]
-                  for value, (off, count) in shown:
-                      out.append(f"| `0x{value:016x}` | `0x{off:x}` | {count} | {KNOWN.get(value, '')} |")
-                  if len(rows) > len(shown):
-                      out += ["", f"其余 {len(rows) - len(shown)} 项省略。"]
-                  out.append("")
-
+              out += ["## " + name, "", "`" + str(len(data)) + "` bytes，立即数 " + str(len(hits)) + " 个。", ""]
+              for value, (off, count) in rows[:120]:
+                  out.append("| `0x" + format(value, "016x") + "` | `0x" + format(off, "x") + "` | " + str(count) + " | " + KNOWN.get(value, "") + " |")
+              out.append("")
               strings = [s.decode("ascii", "replace") for s in re.findall(rb"[ -~]{6,}", data)]
               marks = [s for s in strings if any(k in s.lower() for k in KEYWORDS)]
               if marks:
-                  out += ["日志标记 / 关键字：", "", "```text", *marks[:80], "```", ""]
+                  out += ["```text", *marks[:60], "```", ""]
 
           dest = pathlib.Path(os.environ["RUNNER_TEMP"]) / "analysis-report.md"
           dest.write_text("\n".join(out) + "\n")
-          print(f"wrote {dest} ({len(out)} lines)")
+          print("wrote", dest)
           PY
 
       - name: 上传扫描报告
