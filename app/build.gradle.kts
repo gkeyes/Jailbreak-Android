@@ -43,6 +43,10 @@ android {
         }
     }
 
+    testOptions {
+        unitTests.isReturnDefaultValues = true
+    }
+
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
@@ -58,4 +62,6 @@ dependencies {
     implementation("dev.rikka.shizuku:provider:13.1.5")
     implementation("androidx.activity:activity:1.12.4")
     implementation(project(":design:miuix-console:ui"))
+
+    testImplementation("junit:junit:4.13.2")
 }
