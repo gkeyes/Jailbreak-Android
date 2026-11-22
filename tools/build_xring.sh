@@ -3,21 +3,22 @@
 #
 # 用法：tools/build_xring.sh <输出目录>
 #
-# 流程：按 tools/xring.lock.properties 下载 tarball → 校验 sha256 → 解包 →
-#       用 zig cc 交叉编译 → 产物写到 <输出目录>/。
+# 关键：不用上游的 src/xr98260_profiles.c（它只认作者手上那两条内核），
+# 而是先用 tools/gen_xr_profiles.py 从 app/src/main/assets/lhasa_profile.txt
+# 生成本机支持的 profile 表，再和开源码一起编译。这样产物与原件
+# （读同一份 profile 文件）行为一致，OTA 换内核只需改文件里的一行。
 #
-# 编译选项与自有产物保持一致：-s 去符号表，-ffunction-sections/--gc-sections 砍死代码，
-# 关掉 unwind 表。少了这些，musl 静态件会从 26 KB 涨到 1 MB。
-#
-# 只做本地编译，不接触设备。
+# 编译选项与自有产物一致：-s 去符号、--gc-sections 砍死代码、关 unwind 表。
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 LOCK="$ROOT/tools/xring.lock.properties"
 OUT="${1:-$ROOT/build/xring}"
 CACHE="${XRING_CACHE:-$ROOT/.gradle/xring-cache}"
+PROFILE="$ROOT/app/src/main/assets/lhasa_profile.txt"
 
 [ -f "$LOCK" ] || { echo "缺少 $LOCK" >&2; exit 1; }
+[ -f "$PROFILE" ] || { echo "缺少 $PROFILE" >&2; exit 1; }
 get() { sed -n "s/^$1=//p" "$LOCK" | head -1; }
 
 COMMIT=$(get commit)
@@ -53,13 +54,20 @@ if [ ! -d "$SRC" ]; then
 fi
 echo "源码目录 $SRC"
 
+# 生成的 profile 表放到源码目录旁边，头文件按相对路径引用
+GEN="$CACHE/gen-$COMMIT"
+mkdir -p "$GEN"
+cp "$SRC/src/xr98260_profiles.h" "$GEN/"
+python3 "$ROOT/tools/gen_xr_profiles.py" "$PROFILE" "$GEN/xr98260_profiles.c"
+
 CFLAGS=(-target aarch64-linux-musl -std=gnu11 -O2 -static -s -pthread
         -ffunction-sections -fdata-sections -Wl,--gc-sections
-        -fno-asynchronous-unwind-tables -fno-unwind-tables)
+        -fno-asynchronous-unwind-tables -fno-unwind-tables
+        -I"$GEN")
 
 echo "== slide_probe（tracefs 二进制记录扫描）"
 zig cc "${CFLAGS[@]}" \
-  "$SRC/src/xr98260_profiles.c" \
+  "$GEN/xr98260_profiles.c" \
   "$SRC/src/xr98260_slide_probe.c" \
   -o "$OUT/slide_probe"
 
@@ -71,7 +79,7 @@ zig cc "${CFLAGS[@]}" \
 echo "== uaf_plant_replay（早期单文件变体，CLI 与 App 现有调用一致）"
 zig cc "${CFLAGS[@]}" \
   "$SRC/src/exploit-android-perf.c" \
-  "$SRC/src/xr98260_profiles.c" \
+  "$GEN/xr98260_profiles.c" \
   -o "$OUT/uaf_plant_replay"
 
 ls -l "$OUT"/
