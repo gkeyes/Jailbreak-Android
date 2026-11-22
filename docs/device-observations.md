@@ -4,6 +4,10 @@
 为什么单独存一份：从字符串反推行为会错得离谱（见下面的 `slide_probe`），
 真机跑一次的输出比一百行推断都准。
 
+> 2026-11-22 起，`reach_probe` / `slide_probe` / `perf_slide` / `pc98260-su` 已替换为
+> `plant/*.c` 编译出的自有产物（台账 `status: rebuilt`）。本文件记录的是**替换前**原件的
+> 行为，作为等价性比对的参照；`uaf_plant_replay` 与 `ksud` 保持原样。
+
 ## 环境
 
 | 项 | 值 |
@@ -12,7 +16,7 @@
 | 内核 | `6.18.21-android17-5-g284297031c53-abogki553682993-4k`（在 `KernelSupport.SUPPORTED_KERNELS` 里） |
 | 系统增量 | `OS4.0.21.0.XPNCNXM` |
 | SELinux | Enforcing（提权前） |
-| 提权 | 工作流跑通后 `su -c id` → `uid=0(root) ... context=u:r:ksu:s0` |
+| 提权 | 工作流跑通后 `su -c id` → `uid=0(root) ... context=u:r=ksu:s0` |
 
 观测日期：2026-11-22。
 
@@ -95,5 +99,5 @@
 ## 由此产生的待办
 
 1. `perf_slide` 的 `--duration` 语义待定；在真机上只能用 `timeout 5` 试探。
-2. 三个探针的闸 2（成对执行比对）需要在重开 Shizuku、重新取得临时 ROOT 后进行。
+2. 四个自有产物的闸 2（成对执行比对）需要在重开 Shizuku、重新取得临时 ROOT 后进行。
 3. `uaf_plant_replay` 无源码，维持不可重建结论（见 `tools/assets-ledger.json`）。
