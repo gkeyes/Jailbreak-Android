@@ -1,7 +1,7 @@
 # plant 源码可替换性验证
 
-- commit: `282acb8e`
-- 结果: **failure**
+- commit: `5f7810ee`
+- 结果: **success**
 - 方法: zig cc -target aarch64-linux-musl -O2 -static -pthread
 
 ## 编译日志
@@ -22,77 +22,13 @@ plant/out/pc98260-su: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), 
 == zig cc plant/perf_slide.c -> plant/out/perf_slide
 plant/out/perf_slide: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, with debug_info, not stripped
 == zig cc plant/reach_probe.c -> plant/out/reach_probe
-plant/reach_probe.c:80:9: error: call to undeclared library function 'strtol' with type 'long (const char *, char **, int)'; ISO C99 and later do not support implicit function declarations [-Wimplicit-function-declaration]
-   80 |         return strtol(buffer, NULL, 10);
-      |                ^
-plant/reach_probe.c:80:9: note: include the header <stdlib.h> or explicitly provide a declaration for 'strtol'
-plant/reach_probe.c:97:2: error: use of undeclared identifier 'timer_t'
-   97 |         timer_t timer;
-      |         ^
-plant/reach_probe.c:98:18: error: variable has incomplete type 'struct sigevent'
-   98 |         struct sigevent sev;
-      |                         ^
-plant/reach_probe.c:98:9: note: forward declaration of 'struct sigevent'
-   98 |         struct sigevent sev;
-      |                ^
-plant/reach_probe.c:100:21: error: use of undeclared identifier 'SIGEV_SIGNAL'
-  100 |         sev.sigev_notify = SIGEV_SIGNAL;
-      |                            ^
-plant/reach_probe.c:101:20: error: use of undeclared identifier 'SIGUSR1'
-  101 |         sev.sigev_signo = SIGUSR1;
-      |                           ^
-plant/reach_probe.c:102:6: error: call to undeclared function 'timer_create'; ISO C99 and later do not support implicit function declarations [-Wimplicit-function-declaration]
-  102 |         if (timer_create(CLOCK_THREAD_CPUTIME_ID, &sev, &timer) != 0) {
-      |             ^
-plant/reach_probe.c:102:19: error: use of undeclared identifier 'CLOCK_THREAD_CPUTIME_ID'
-  102 |         if (timer_create(CLOCK_THREAD_CPUTIME_ID, &sev, &timer) != 0) {
-      |                          ^
-plant/reach_probe.c:102:51: error: use of undeclared identifier 'timer'
-  102 |         if (timer_create(CLOCK_THREAD_CPUTIME_ID, &sev, &timer) != 0) {
-      |                                                          ^
-plant/reach_probe.c:106:2: error: call to undeclared function 'timer_delete'; ISO C99 and later do not support implicit function declarations [-Wimplicit-function-declaration]
-  106 |         timer_delete(timer);
-      |         ^
-plant/reach_probe.c:106:15: error: use of undeclared identifier 'timer'
-  106 |         timer_delete(timer);
-      |                      ^
-10 errors generated.
-FAILED plant/reach_probe.c
+plant/out/reach_probe: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, with debug_info, not stripped
 == zig cc plant/slide_probe.c -> plant/out/slide_probe
-plant/slide_probe.c:108:18: error: variable has incomplete type 'struct sigevent'
-  108 |         struct sigevent sev;
-      |                         ^
-plant/slide_probe.c:108:9: note: forward declaration of 'struct sigevent'
-  108 |         struct sigevent sev;
-      |                ^
-plant/slide_probe.c:109:2: error: use of undeclared identifier 'timer_t'
-  109 |         timer_t timer;
-      |         ^
-plant/slide_probe.c:111:21: error: use of undeclared identifier 'SIGEV_SIGNAL'
-  111 |         sev.sigev_notify = SIGEV_SIGNAL;
-      |                            ^
-plant/slide_probe.c:112:20: error: use of undeclared identifier 'SIGUSR1'
-  112 |         sev.sigev_signo = SIGUSR1;
-      |                           ^
-plant/slide_probe.c:113:6: error: call to undeclared function 'timer_create'; ISO C99 and later do not support implicit function declarations [-Wimplicit-function-declaration]
-  113 |         if (timer_create(CLOCK_THREAD_CPUTIME_ID, &sev, &timer) != 0)
-      |             ^
-plant/slide_probe.c:113:19: error: use of undeclared identifier 'CLOCK_THREAD_CPUTIME_ID'
-  113 |         if (timer_create(CLOCK_THREAD_CPUTIME_ID, &sev, &timer) != 0)
-      |                          ^
-plant/slide_probe.c:113:51: error: use of undeclared identifier 'timer'
-  113 |         if (timer_create(CLOCK_THREAD_CPUTIME_ID, &sev, &timer) != 0)
-      |                                                          ^
-plant/slide_probe.c:116:3: error: call to undeclared function 'timer_delete'; ISO C99 and later do not support implicit function declarations [-Wimplicit-function-declaration]
-  116 |                 timer_delete(timer);
-      |                 ^
-plant/slide_probe.c:116:16: error: use of undeclared identifier 'timer'
-  116 |                 timer_delete(timer);
-      |                              ^
-9 errors generated.
-FAILED plant/slide_probe.c
-built=2 failed=2
-total 2060
--rwxr-xr-x 1 runner runner 1007656 Nov 22 04:06 pc98260-su
--rwxr-xr-x 1 runner runner 1097320 Nov 22 04:06 perf_slide
+plant/out/slide_probe: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, with debug_info, not stripped
+built=4 failed=0
+total 4272
+-rwxr-xr-x 1 runner runner 1007656 Nov 22 04:11 pc98260-su
+-rwxr-xr-x 1 runner runner 1097320 Nov 22 04:11 perf_slide
+-rwxr-xr-x 1 runner runner 1097296 Nov 22 04:11 reach_probe
+-rwxr-xr-x 1 runner runner 1166264 Nov 22 04:11 slide_probe
 ```
