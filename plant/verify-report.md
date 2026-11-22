@@ -1,8 +1,8 @@
 # 验收结果
 
-- commit: `5f7810ee`
+- commit: `5ec703d2`
 - plant: success
-- 接线: success
+- 接线: failure
 - 单测: failure
 - 编译: failure
 - 回写源码: 0
@@ -15,32 +15,27 @@
 ## 接线日志
 
 ```text
-applied=3 skipped=10
-BootGuard.classify: 1
-DeployGate:         4
-markCompleted:      1
-DEPLOY_TIMEOUT_MS:  4
-no leftovers
+::error::DEPLOY_TIMEOUT_MS 常量: 候选锚点命中次数 [0]，均不为 1
 ```
 
 ## 入口调用
 
 ```text
 BootGuard.classify x1
-markCompleted      x1
-deployError        x0
+markCompleted      x0
 0
+deployError        x3
 ```
 
 ## 测试日志尾部
 
 ```text
-  /home/runner/work/Lhasa26-Android/Lhasa26-Android/app/src/main/java/com/gkeyes/lhasa26/core/WorkflowEngine.java:28: error: variable DEPLOY_TIMEOUT_MS is already defined in class WorkflowEngine
-      private static final long DEPLOY_TIMEOUT_MS = 8000L;
-                                ^
-  /home/runner/work/Lhasa26-Android/Lhasa26-Android/app/src/main/java/com/gkeyes/lhasa26/core/WorkflowEngine.java:29: error: variable DEPLOY_TIMEOUT_MS is already defined in class WorkflowEngine
-      private static final long DEPLOY_TIMEOUT_MS = 8000L;
-                                ^
+  /home/runner/work/Lhasa26-Android/Lhasa26-Android/app/src/main/java/com/gkeyes/lhasa26/core/WorkflowEngine.java:244: error: method await in class DeployGate cannot be applied to given types;
+                  .await(deploy, deployError);
+                  ^
+    required: Thread
+    found:    Thread,AtomicReference<Exception>
+    reason: actual and formal argument lists differ in length
   2 errors
 
 * Try:
@@ -53,6 +48,6 @@ You can use '--warning-mode all' to show the individual deprecation warnings and
 
 For more on this, please refer to https://docs.gradle.org/9.9.1/userguide/command_line_interface.html#sec:command_line_warnings in the Gradle documentation.
 
-BUILD FAILED in 26s
+BUILD FAILED in 35s
 15 actionable tasks: 15 executed
 ```
