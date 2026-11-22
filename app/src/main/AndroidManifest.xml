@@ -1,7 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <uses-permission android:name="moe.shizuku.manager.permission.API_V23" />
-    <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.VIBRATE" />
 
     <queries>
@@ -26,10 +25,16 @@
             android:name="moe.shizuku.client.V3_SUPPORT"
             android:value="true" />
 
+        <!--
+            configChanges 必须覆盖折叠屏与系统外观变化：
+            展开/闭合会改 density、screenLayout、screenSize，深色模式会改 uiMode，
+            这些一旦漏掉就会重建 Activity，而 onDestroy 里有 engine.stop()，
+            等于在 UAF 利用中途把会话强杀。
+        -->
         <activity
             android:name=".ConsoleActivity"
             android:exported="true"
-            android:configChanges="keyboardHidden|orientation|screenLayout|screenSize|smallestScreenSize"
+            android:configChanges="keyboardHidden|orientation|screenLayout|screenSize|smallestScreenSize|density|fontScale|uiMode|layoutDirection|locale"
             android:resizeableActivity="true">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
