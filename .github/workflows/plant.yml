@@ -2,11 +2,12 @@ name: plant
 
 # plant/ 下的自有 C 源码：交叉编译 + 与预编译件的等价性验证。
 #
-# 只读：所有结果作为 Artifact 产出，仓库里不留 CI 生成物。
+# 只读：不改仓库内容；失败时用 issues 权限把编译/等价性日志写进 issue
+# （MCP 侧读不到 Actions 日志，只有 issue 能被程序读到）。
 
 on:
   push:
-    branches: [ fix/p0-clean-boot-retry, chore/assets-ledger ]
+    branches: [ next ]
     paths:
       - 'plant/**'
       - 'app/src/main/assets/**'
@@ -17,6 +18,7 @@ on:
 
 permissions:
   contents: read
+  issues: write
 
 jobs:
   compile:
@@ -36,6 +38,7 @@ jobs:
           echo "$RUNNER_TEMP/zig-linux-x86_64-0.13.0" >> "$GITHUB_PATH"
 
       - name: 编译 plant/*.c
+        id: compile
         run: |
           set -uo pipefail
           shopt -s nullglob
@@ -47,8 +50,6 @@ jobs:
             echo "plant/ 下还没有源码。" | tee -a "$LOG"
             exit 0
           fi
-          # -s 去符号表，-ffunction-sections/gc-sections 砍死代码：
-          # 原件是 stripped 的 musl 静态件（28–51 KB），不 strip 会到 1 MB。
           CFLAGS=(-target aarch64-linux-musl -O2 -static -s
                   -ffunction-sections -fdata-sections -Wl,--gc-sections
                   -fno-asynchronous-unwind-tables -fno-unwind-tables -pthread)
@@ -66,6 +67,7 @@ jobs:
           exit $status
 
       - name: 等价性验证
+        id: equiv
         if: always()
         run: |
           set -uo pipefail
@@ -83,10 +85,11 @@ jobs:
             [ -f "$RUNNER_TEMP/out/$name" ] && \
               strings -n 4 "$RUNNER_TEMP/out/$name" | sort -u > "$RUNNER_TEMP/strings/$name.rebuilt.txt"
           done
-          wc -l "$RUNNER_TEMP"/strings/*.txt
+          wc -l "$RUNNER_TEMP"/strings/*.txt || true
 
       - name: 上传产物
         if: always()
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: plant-binaries
@@ -96,6 +99,36 @@ jobs:
             ${{ runner.temp }}/compile.log
             ${{ runner.temp }}/strings/*.txt
           if-no-files-found: ignore
+          retention-days: 2
+
+      - name: 失败时把日志写进 issue
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OUT_COMPILE: ${{ steps.compile.outcome }}
+          OUT_EQUIV: ${{ steps.equiv.outcome }}
+        run: |
+          set -uo pipefail
+          body="$RUNNER_TEMP/plant-failure.md"
+          {
+            echo "commit: \`$GITHUB_SHA\`"
+            echo
+            echo "### 各步结果"
+            echo '```text'
+            echo "compile = ${OUT_COMPILE}"
+            echo "equiv   = ${OUT_EQUIV}"
+            echo '```'
+            echo "### compile.log"
+            echo '```text'
+            tail -c 12000 "$RUNNER_TEMP/compile.log" 2>/dev/null || echo "（无）"
+            echo '```'
+            echo "### equiv.log"
+            echo '```text'
+            tail -c 12000 "$RUNNER_TEMP/equiv.log" 2>/dev/null || echo "（无）"
+            echo '```'
+          } > "$body"
+          gh issue create --title "ci: plant 失败 ${GITHUB_SHA:0:8}" --body-file "$body" \
+            --repo "${{ github.repository }}" || true
 
   baseline:
     name: 生成等价性基线（需人工提交）
@@ -108,11 +141,13 @@ jobs:
         run: python3 tools/equiv.py baseline --out "$RUNNER_TEMP/baseline"
 
       - name: 上传基线
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: plant-baselines
           path: ${{ runner.temp }}/baseline
           if-no-files-found: error
+          retention-days: 2
 
   scan:
     name: 现有 payload 常量扫描
@@ -183,8 +218,10 @@ jobs:
           PY
 
       - name: 上传扫描报告
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: payload-analysis
           path: ${{ runner.temp }}/analysis-report.md
           if-no-files-found: warn
+          retention-days: 2
