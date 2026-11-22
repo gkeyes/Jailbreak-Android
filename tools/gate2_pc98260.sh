@@ -11,8 +11,9 @@
 #
 # 全程只写 $WORK（默认 /data/local/tmp/gate2），不需要 root、不起监听、不读 tracefs。
 #
-# 用法：gate2_pc98260.sh [原件路径] [重建件路径]
-#       默认 /data/local/tmp/plant/orig/pc98260-su 与 .../new/pc98260-su
+# 用法：
+#   gate2_pc98260.sh [原件路径] [重建件路径]
+#   默认 /data/local/tmp/plant/orig/pc98260-su 与 .../new/pc98260-su
 
 set -u
 
