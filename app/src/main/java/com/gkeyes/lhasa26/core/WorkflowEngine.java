@@ -25,7 +25,6 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
     /** Above this much available memory the force-stop of chat apps buys nothing. */
     private static final long CLEAN_SKIP_AVAILABLE_KB = 3000000L;
     private static final long DEPLOY_TIMEOUT_MS = 8000L;
-    private static final long DEPLOY_TIMEOUT_MS = 8000L;
     private static final Pattern RUNNING_PAYLOAD = Pattern.compile("uaf_plant_replay");
     private static final String RUN_MARKER = "/data/local/tmp/.lhasa_run";
     private static final String FAILED_MARKER = "/data/local/tmp/.lhasa_failed_boot";
@@ -229,19 +228,18 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
 
         step(1);
         status("等待系统空闲");
-        final java.util.concurrent.atomic.AtomicReference<Exception> deployError =
-                new java.util.concurrent.atomic.AtomicReference<>();
+        final DeployGate deployGate = new DeployGate(DEPLOY_TIMEOUT_MS);
         Thread deploy = new Thread(() -> {
             try {
                 deployer.stageAll();
-            } catch (Exception error) {
-                deployError.set(error);
+                deployGate.markCompleted();
+            } catch (Throwable error) {
+                deployGate.fail(error);
             }
         }, "lhasa-deploy");
         deploy.start();
         waitForIdle();
-        DeployGate.Result deployResult = new DeployGate(DEPLOY_TIMEOUT_MS)
-                .await(deploy, deployError);
+        DeployGate.Result deployResult = deployGate.await(deploy);
         if (deployResult != DeployGate.Result.READY) {
             recordFailedBoot(boot);
             throw new IllegalStateException("部署未完成（" + deployResult + "）· 请重启后重试");
