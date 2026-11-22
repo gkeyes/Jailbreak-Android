@@ -25,6 +25,7 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
     /** Above this much available memory the force-stop of chat apps buys nothing. */
     private static final long CLEAN_SKIP_AVAILABLE_KB = 3000000L;
     private static final long DEPLOY_TIMEOUT_MS = 8000L;
+    private static final long DEPLOY_TIMEOUT_MS = 8000L;
     private static final Pattern RUNNING_PAYLOAD = Pattern.compile("uaf_plant_replay");
     private static final String RUN_MARKER = "/data/local/tmp/.lhasa_run";
     private static final String FAILED_MARKER = "/data/local/tmp/.lhasa_failed_boot";
@@ -516,7 +517,7 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
     private void cleanupBinaries(boolean keepRootClient) {
         try {
             if (!keepRootClient) {
-                run("pkill -f uaf_plant_replay 2>/dev/null; true", true);
+                run(BootGuard.killCommand(), true);
             }
             String targets = EXPLOIT_BINARIES + (keepRootClient ? "" : " pc98260-su pc98260-root.sock");
             run("cd /data/local/tmp 2>/dev/null; rm -f " + targets + "; true", true);
