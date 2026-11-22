@@ -1,12 +1,13 @@
 name: plant
 
-# plant/ 下的自有 C 源码：交叉编译 + 与原件基线的等价性验证。
+# plant/ 下的自有 C 源码：交叉编译 + 与原件基线的等价性验证 + 产物分发。
 #
-# 默认只读。唯一会写仓库的是 publish job：提交信息里带 [publish] 才会跑。
-#
-# 基线语义（重要）：
-#   plant/equiv/<名字>.json 记录的是「首次替换前**原件**」的指纹，一经归档不再覆盖。
-#   所以 publish 会先用 git 把原件从历史恢复出来 → 归档基线 → 才用新产物覆盖 assets。
+# 默认只读。唯一会写仓库的是 publish job（提交信息含 [publish]）：
+#   1. 从历史取回原件 → 归档基线（plant/equiv/，只归档一次）
+#   2. 用新产物覆盖 app/src/main/assets/
+#   3. 同步台账
+#   4. 把产物写成 plant/out/<名字>.b64（单行 base64），供人在设备上直接解码运行，
+#      不必每次都打 APK
 
 on:
   push:
@@ -138,23 +139,25 @@ jobs:
       - name: 编译
         run: |
           set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/out"
+          mkdir -p "$RUNNER_TEMP/out" plant/out
           CFLAGS=(-target aarch64-linux-musl -O2 -static -s
                   -ffunction-sections -fdata-sections -Wl,--gc-sections
                   -fno-asynchronous-unwind-tables -fno-unwind-tables -pthread)
           for name in reach_probe slide_probe perf_slide pc98260-su; do
             zig cc "${CFLAGS[@]}" "plant/$name.c" -o "$RUNNER_TEMP/out/$name"
             ls -l "$RUNNER_TEMP/out/$name"
+            # 单行 base64，供设备上直接解码运行（不经过 APK）
+            base64 -w0 "$RUNNER_TEMP/out/$name" > "plant/out/$name.b64"
           done
+          ls -l plant/out
 
       - name: 恢复原件（用于归档基线）
         run: |
           set -e
-          # 8c7de444 是首次把自有产物写进 assets 的提交；它的父提交里是原件
           for name in reach_probe slide_probe perf_slide pc98260-su; do
             git show "8c7de4445ed5525c5742c0b3cb35b6b4472b1b4a^:app/src/main/assets/$name" \
               > "app/src/main/assets/$name"
-            echo "restored $name from history ($(wc -c < "app/src/main/assets/$name") bytes)"
+            echo "restored $name from history"
           done
 
       - name: 归档原件基线（已存在则跳过）
@@ -211,12 +214,12 @@ jobs:
           set -e
           git config user.name "lhasa-ci"
           git config user.email "lhasa-ci@users.noreply.github.com"
-          git add -A app/src/main/assets plant/equiv tools/assets-ledger.json
+          git add -A app/src/main/assets plant/equiv plant/out tools/assets-ledger.json
           if git diff --cached --quiet; then
             echo "没有变化，跳过提交"
             exit 0
           fi
-          git commit -m "feat(assets): 探针产物与原件基线归档"
+          git commit -m "feat(assets): 探针产物、基线与 base64 分发"
           git push
 
       - name: 失败时把日志写进 issue
@@ -248,7 +251,7 @@ jobs:
       - name: 扫描内核立即数
         run: |
           python3 - <<'PY'
-          import collections, pathlib, re, os
+          import os, pathlib, re
 
           LO, HI = 0xffffff8000000000, 0xffffffff00000000
           BASE = pathlib.Path("app/src/main/assets")
@@ -263,23 +266,20 @@ jobs:
                   out += ["## " + name, "", "资产不存在。", ""]
                   continue
               data = path.read_bytes()
-              hits = collections.OrderedDict()
+              hits = {}
               for off in range(0, len(data) - 8, 4):
                   value = int.from_bytes(data[off:off + 8], "little")
                   if LO <= value < HI:
-                      if value in hits:
-                          hits[value][1] += 1
-                      else:
-                          hits[value] = [off, 1]
-              rows = sorted(hits.items(), key=lambda kv: -kv[1][1])
+                      hits[value] = hits.get(value, 0) + 1
+              rows = sorted(hits.items(), key=lambda kv: -kv[1])[:40]
               out += ["## " + name, "", "`" + str(len(data)) + "` bytes，立即数 " + str(len(hits)) + " 个。", ""]
-              for value, (off, count) in rows[:80]:
-                  out.append("| `0x" + format(value, "016x") + "` | `0x" + format(off, "x") + "` | " + str(count) + " |")
+              for value, count in rows:
+                  out.append("| `0x" + format(value, "016x") + "` | " + str(count) + " |")
               out.append("")
               strings = [s.decode("ascii", "replace") for s in re.findall(rb"[ -~]{6,}", data)]
               marks = [s for s in strings if any(k in s.lower() for k in KEYWORDS)]
               if marks:
-                  out += ["```text", *marks[:60], "```", ""]
+                  out += ["```text", *marks[:40], "```", ""]
 
           dest = pathlib.Path(os.environ["RUNNER_TEMP"]) / "analysis-report.md"
           dest.write_text("\n".join(out) + "\n")
