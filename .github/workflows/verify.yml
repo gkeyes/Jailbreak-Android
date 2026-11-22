@@ -1,15 +1,19 @@
-name: build
+name: verify
 
-# 只读校验：跑单测 + 打包 debug APK，产物上传为运行附件。
-# 不再往分支回写任何东西（除最后一份验收报告），也不再打滚动 tag。
+# 只读校验：资产台账 + 单测 + 组装 debug APK，产物作为运行附件上传。
+# 本工作流对仓库没有任何写权限（contents: read），验收结果与本次 SHA 一一对应。
 
 on:
   push:
-    branches: [ fix/p0-clean-boot-retry ]
+    branches: [ fix/p0-clean-boot-retry, chore/assets-ledger ]
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: verify-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
@@ -20,7 +24,7 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
-      - name: Test, wire and assemble
+      - name: Assets ledger, tests and assemble
         run: bash tools/ci_verify.sh
       - name: Upload APK
         if: always()
@@ -35,8 +39,8 @@ jobs:
         with:
           name: lhasa26-build-logs
           path: |
-            test.log
-            build.log
-            wire.log
-            plant/verify-report.md
+            ${{ runner.temp }}/verify-report.md
+            ${{ runner.temp }}/test.log
+            ${{ runner.temp }}/build.log
+            ${{ runner.temp }}/assets.log
           if-no-files-found: warn

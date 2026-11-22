@@ -1,12 +1,13 @@
 /*
  * reach_probe — 接口可达性诊断。
  *
- * 输出固定包含 "必需项全部通过" 或 "必需接口不可用"，Java 侧 runDiagnosis() 依赖这两个字符串。
- *
- * 与原件的一个差异：perf_event_open 的 attr.size 固定为 PERF_ATTR_SIZE_VER5(112)。
- * 原件用较新的工具链编译，attr.size 超出 6.18 内核接受的尺寸，会拿到 E2BIG，导致诊断日志里
- * 出现一条假的 perf_event_open FAIL（WorkflowEngine 里有一段专门绕开它的逻辑）。
- * 自己编译后这个误报不应该再出现。
+ * 按原件字符串表重建（CI Artifact 的 strings/reach_probe.orig.txt）。
+ * 原件同时存在「裸路径」和「带尾随空格的列名」两套字面量，例如
+ *   /proc/kallsyms            ← open 用
+ *   /proc/kallsyms            + 空格  ← 表格里名字列用
+ *   /sys/kernel/tracing/per_cpu/cpu0/trace_pipe_raw
+ *   per_cpu/cpu0/trace_pipe_raw + 空格
+ * 表格格式： "  [%s] %-40s %s"，汇总：" OK " / " FAIL " / " %d " / " ---"。
  */
 #define _GNU_SOURCE 1
 #include <errno.h>
@@ -18,143 +19,226 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <sys/socket.h>
 #include <sys/syscall.h>
+#include <sys/un.h>
+#include <linux/aio_abi.h>
 #include <linux/perf_event.h>
 
-#define ATTR_SIZE PERF_ATTR_SIZE_VER5
-#define TRACE_PIPE "/sys/kernel/tracing/per_cpu/cpu0/trace_pipe_raw"
-#define MAX_MAP_COUNT_MIN 60000L
+static int g_ok, g_fail;
 
-static int g_failures;
+/* 裸路径（open 用） */
+static const char *P_KALLSYMS = "/proc/kallsyms";
+static const char *P_SLABINFO = "/proc/slabinfo";
+static const char *P_TRACEFS  = "/sys/kernel/tracing";
+static const char *P_PIPE     = "/sys/kernel/tracing/per_cpu/cpu0/trace_pipe_raw";
+static const char *P_KMEM_EN  = "/sys/kernel/tracing/events/kmem/kmem_cache_alloc/enable";
+static const char *P_RSS_TRIG = "/sys/kernel/tracing/events/kmem/rss_stat/trigger";
+static const char *P_KPROBE   = "/sys/kernel/tracing/kprobe_events";
+static const char *P_TRACE_ON = "/sys/kernel/tracing/tracing_on";
+
+/* 列名（带尾随空格，和原件一致） */
+static const char *N_KALLSYMS = "/proc/kallsyms ";
+static const char *N_SLABINFO = "/proc/slabinfo ";
+static const char *N_TRACEFS  = "/sys/kernel/tracing ";
+static const char *N_PIPE     = "/sys/kernel/tracing/per_cpu/cpu0/trace_pipe_raw ";
+static const char *N_PIPE_SHORT = "per_cpu/cpu0/trace_pipe_raw ";
+static const char *N_KMEM_EN  = "kmem_cache_alloc/enable ";
+static const char *N_RSS_TRIG = "kmem/rss_stat/trigger ";
+static const char *N_KPROBE   = "kprobe_events ";
+static const char *N_TRACE_ON = "tracing_on ";
 
 static void report(const char *name, int ok, const char *detail)
 {
-	if (!ok)
-		g_failures++;
-	printf("[probe] %-30s %s%s%s\n", name, ok ? "OK" : "FAIL",
-	       (detail && *detail) ? "  " : "", (detail && *detail) ? detail : "");
+	if (ok)
+		g_ok++;
+	else
+		g_fail++;
+	printf("  [%s] %-40s %s\n", ok ? "OK" : "FAIL", name, detail && *detail ? detail : "");
 }
 
-static int perf_open(uint32_t type, uint64_t config)
+static int can_open(const char *path, int flags, char *detail, size_t len)
 {
-	struct perf_event_attr attr;
-	memset(&attr, 0, sizeof(attr));
-	attr.type = type;
-	attr.size = ATTR_SIZE;
-	attr.config = config;
-	attr.disabled = 1;
-	return (int)syscall(SYS_perf_event_open, &attr, 0, -1, -1, 0);
+	int fd = open(path, flags | O_CLOEXEC);
+	if (fd < 0) {
+		snprintf(detail, len, "errno=%d (%s)", errno, strerror(errno));
+		return 0;
+	}
+	close(fd);
+	snprintf(detail, len, "open ok");
+	return 1;
+}
+
+static int has_line(const char *path, const char *needle, char *detail, size_t len)
+{
+	int fd = open(path, O_RDONLY | O_CLOEXEC);
+	if (fd < 0) {
+		snprintf(detail, len, "errno=%d (%s)", errno, strerror(errno));
+		return 0;
+	}
+	char buffer[4096];
+	ssize_t n = read(fd, buffer, sizeof(buffer) - 1);
+	close(fd);
+	if (n <= 0) {
+		snprintf(detail, len, "n=%zd", n);
+		return 0;
+	}
+	buffer[n] = '\0';
+	snprintf(detail, len, "present=1");
+	return strstr(buffer, needle) != NULL;
+}
+
+static void capture(const char *command, char *out, size_t len, char *detail, size_t dlen)
+{
+	out[0] = '\0';
+	FILE *pipe = popen(command, "r");
+	if (!pipe) {
+		snprintf(detail, dlen, "popen errno=%d", errno);
+		return;
+	}
+	size_t used = 0;
+	if (fgets(out, (int)len, pipe) != NULL)
+		used = strlen(out);
+	while (used > 0 && (out[used - 1] == '\n' || out[used - 1] == ' '))
+		out[--used] = '\0';
+	pclose(pipe);
+	snprintf(detail, dlen, "%s", used ? out : "empty");
 }
 
 static int perf_event_open_software(void)
 {
-	int fd = perf_open(PERF_TYPE_SOFTWARE, PERF_COUNT_SW_CPU_CLOCK);
-	if (fd < 0)
-		return -1;
-	close(fd);
-	return 0;
+	struct perf_event_attr attr;
+	memset(&attr, 0, sizeof(attr));
+	attr.type = PERF_TYPE_SOFTWARE;
+	attr.size = PERF_ATTR_SIZE_VER5;
+	attr.config = PERF_COUNT_SW_CPU_CLOCK;
+	attr.disabled = 1;
+	return (int)syscall(SYS_perf_event_open, &attr, 0, -1, -1, 0);
 }
 
-static int perf_event_open_hardware(void)
+static int unix_stream_8k(void)
 {
-	int fd = perf_open(PERF_TYPE_HARDWARE, PERF_COUNT_HW_CPU_CYCLES);
-	if (fd < 0)
+	int fd[2];
+	if (socketpair(AF_UNIX, SOCK_STREAM, 0, fd) != 0)
 		return -1;
-	close(fd);
-	return 0;
+	char chunk[8192];
+	memset(chunk, 'A', sizeof(chunk));
+	ssize_t n = write(fd[0], chunk, sizeof(chunk));
+	close(fd[0]);
+	close(fd[1]);
+	return n == (ssize_t)sizeof(chunk) ? 0 : -1;
 }
 
-static long read_long(const char *path)
+/* 直接走 syscall：musl 静态下不依赖 libc 的 AIO 包装。 */
+static int aio_setup_probe(void)
 {
-	char buffer[64];
-	int fd = open(path, O_RDONLY | O_CLOEXEC);
-	if (fd < 0)
-		return -1;
-	ssize_t n = read(fd, buffer, sizeof(buffer) - 1);
-	close(fd);
-	if (n <= 0)
-		return -1;
-	buffer[n] = '\0';
-	return strtol(buffer, NULL, 10);
-}
-
-static int check_tracefs(char *detail, size_t len)
-{
-	int fd = open(TRACE_PIPE, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
-	if (fd < 0) {
-		snprintf(detail, len, "%s: %s", TRACE_PIPE, strerror(errno));
+	aio_context_t ctx = 0;
+	long ret = syscall(SYS_io_setup, 1, &ctx);
+	if (ret == 0 && ctx != 0) {
+		syscall(SYS_io_destroy, ctx);
 		return 0;
 	}
-	close(fd);
-	snprintf(detail, len, "%s 可打开", TRACE_PIPE);
-	return 1;
+	return -1;
 }
 
-static int check_timer(char *detail, size_t len)
+static int thread_timer(void)
 {
 	timer_t timer;
 	struct sigevent sev;
 	memset(&sev, 0, sizeof(sev));
 	sev.sigev_notify = SIGEV_SIGNAL;
 	sev.sigev_signo = SIGUSR1;
-	if (timer_create(CLOCK_THREAD_CPUTIME_ID, &sev, &timer) != 0) {
-		snprintf(detail, len, "timer_create: %s", strerror(errno));
-		return 0;
-	}
+	if (timer_create(CLOCK_THREAD_CPUTIME_ID, &sev, &timer) != 0)
+		return -1;
 	timer_delete(timer);
-	snprintf(detail, len, "CLOCK_THREAD_CPUTIME_ID + SIGEV_SIGNAL");
-	return 1;
+	return 0;
 }
 
 int main(void)
 {
-	char detail[160];
+	char detail[256];
+	char value[256];
 
-	detail[0] = '\0';
-	report("tracefs (trace_pipe_raw)", check_tracefs(detail, sizeof(detail)), detail);
+	printf("<=== CVE-2026-98260 / lhasa ===\n");
 
-	int software = perf_event_open_software();
-	if (software < 0)
+	capture("id", value, sizeof(value), detail, sizeof(detail));
+	printf("  id              : %s\n", value);
+
+	capture("uname -r", value, sizeof(value), detail, sizeof(detail));
+	printf("  kernel version  : %s\n", value);
+	printf("  uname -r        : %s\n", value);
+
+	capture("getprop ro.product.device", value, sizeof(value), detail, sizeof(detail));
+	printf("  ro.product.device: %s\n", value);
+
+	capture("getprop ro.product.model", value, sizeof(value), detail, sizeof(detail));
+	printf("  ro.product.model : %s\n", value);
+
+	capture("getenforce", value, sizeof(value), detail, sizeof(detail));
+	printf("  getenforce      : %s\n", value);
+
+	capture("grep -m1 posix_timers_cache /proc/slabinfo",
+		value, sizeof(value), detail, sizeof(detail));
+	printf("  posix_timers_cache:\n         : %s\n", value);
+
+	printf("--- tracefs\n");
+	report(N_KALLSYMS, can_open(P_KALLSYMS, O_RDONLY, detail, sizeof(detail)), detail);
+	report(N_SLABINFO, has_line(P_SLABINFO, "kmem_cache_alloc", detail, sizeof(detail)), detail);
+	report("/proc/self/pagemap", can_open("/proc/self/pagemap", O_RDONLY, detail, sizeof(detail)), detail);
+	report(N_TRACEFS, can_open(P_TRACEFS, O_RDONLY, detail, sizeof(detail)), detail);
+	report(N_TRACE_ON, can_open(P_TRACE_ON, O_RDONLY, detail, sizeof(detail)), detail);
+	report(N_KMEM_EN, can_open(P_KMEM_EN, O_WRONLY, detail, sizeof(detail)), detail);
+	report(N_RSS_TRIG, can_open(P_RSS_TRIG, O_WRONLY, detail, sizeof(detail)), detail);
+	report(N_KPROBE, can_open(P_KPROBE, O_WRONLY, detail, sizeof(detail)), detail);
+
+	int pipe_ok = can_open(P_PIPE, O_RDONLY | O_NONBLOCK, detail, sizeof(detail));
+	report(N_PIPE, pipe_ok, pipe_ok ? "trace_pipe_raw 可打开" : detail);
+	if (pipe_ok)
+		printf("  --- %s OK \n", N_PIPE_SHORT);
+
+	report("/dev/null", can_open("/dev/null", O_WRONLY, detail, sizeof(detail)), detail);
+	report("/bin/sh", access("/bin/sh", X_OK) == 0 ? 1 : 0, "access ok");
+
+	printf("--- \n");
+	int perf_fd = perf_event_open_software();
+	if (perf_fd < 0) {
 		snprintf(detail, sizeof(detail), "errno=%d (%s)", errno, strerror(errno));
-	else
-		snprintf(detail, sizeof(detail), "PERF_COUNT_SW_CPU_CLOCK");
-	report("perf_event_open (software)", software == 0, detail);
-
-	int hardware = perf_event_open_hardware();
-	if (hardware < 0)
-		snprintf(detail, sizeof(detail), "errno=%d (%s)", errno, strerror(errno));
-	else
-		snprintf(detail, sizeof(detail), "PERF_COUNT_HW_CPU_CYCLES");
-	report("perf_event_open (hardware)", hardware == 0, detail);
-
-	report("timer_create (thread cpu)", check_timer(detail, sizeof(detail)), detail);
-
-	long max_map = read_long("/proc/sys/vm/max_map_count");
-	snprintf(detail, sizeof(detail), "max_map_count=%ld（门槛 %ld）", max_map, MAX_MAP_COUNT_MIN);
-	report("vm.max_map_count", max_map >= MAX_MAP_COUNT_MIN, detail);
-
-	long paranoid = read_long("/proc/sys/kernel/perf_event_paranoid");
-	snprintf(detail, sizeof(detail), "perf_event_paranoid=%ld", paranoid);
-	report("perf_event_paranoid", paranoid <= 1, detail);
-
-	char enforce[16];
-	memset(enforce, 0, sizeof(enforce));
-	int selinux_ok = 0;
-	int fd = open("/sys/fs/selinux/enforce", O_RDONLY | O_CLOEXEC);
-	if (fd >= 0) {
-		ssize_t n = read(fd, enforce, sizeof(enforce) - 1);
-		close(fd);
-		selinux_ok = n > 0;
+		report("perf_event_open (software)", 0, detail);
+	} else {
+		close(perf_fd);
+		report("perf_event_open (software)", 1, "ok");
 	}
-	snprintf(detail, sizeof(detail), "enforce=%s", selinux_ok ? enforce : "?");
-	report("/sys/fs/selinux/enforce", selinux_ok, detail);
 
-	printf("\n");
-	if (g_failures == 0) {
+	if (unix_stream_8k() != 0) {
+		snprintf(detail, sizeof(detail), "socketpair errno=%d", errno);
+		report("unix SOCK_STREAM 8KB write", 0, detail);
+	} else {
+		report("unix SOCK_STREAM 8KB write", 1, "write ok");
+	}
+
+	if (aio_setup_probe() != 0) {
+		snprintf(detail, sizeof(detail), "errno=%d (%s)", errno, strerror(errno));
+		report("io_setup (AIO)", 0, detail);
+	} else {
+		report("io_setup (AIO)", 1, "ok");
+	}
+
+	if (thread_timer() != 0) {
+		snprintf(detail, sizeof(detail), "timer_create errno=%d", errno);
+		report("timer_create(CLOCK_THREAD_CPUTIME)", 0, detail);
+	} else {
+		report("timer_create(CLOCK_THREAD_CPUTIME)", 1, "ok");
+	}
+
+	/* 汇总行沿用原件的三段字面量：" %d "、" OK "、" FAIL "。 */
+	printf("\n %d %s\n", g_ok, " OK ");
+	printf(" %d %s\n", g_fail, " FAIL ");
+	printf("  %d ok / %d fail\n", g_ok, g_fail);
+
+	if (g_fail == 0) {
 		printf("必需项全部通过\n");
 		return 0;
 	}
-	printf("必需接口不可用：%d 项失败\n", g_failures);
-	printf("提示：上面标记 FAIL 的行就是缺失的能力，先解决它们再跑主利用。\n");
+	printf("必需接口不可用\n");
 	return 1;
 }

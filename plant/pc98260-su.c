@@ -1,15 +1,21 @@
 /*
  * pc98260-su — rootd 客户端。
  *
- * rootd 由 uaf_plant_replay 在提权后启动，监听 /data/local/tmp/pc98260-root.sock，
- * 输出 "[rootd] listening at %s pid=%d"。本程序只需把一条命令送过去，把回显原样吐出。
+ * 原件字符串表（从 assets/pc98260-su 读出的全部数据段字符串）：
+ *   "connect root daemon"                连接阶段给用户看的提示
+ *   "/data/local/tmp/pc98260-root.sock"  rootd 监听的套接字
+ *   "PC98260_SOCK"                       覆盖套接字的环境变量
+ *   "usage: %s [-c command]\n"           用法行（只有 -c）
+ *   "/dev/null"                          静默重定向用
  *
- * 协议假设（需与原件比对验证）：单连接、单命令，命令以 \n 结尾，发送后 shutdown(SHUT_WR)，
- * 读至 EOF。这是这类小型 rootd 最常见的形态，也是本实现唯一可验证的形态。
- * 套接字路径可用环境变量 PC98260_ROOT_SOCK 或 -s 覆盖。
+ * 本实现按这些锚点逐条对齐，不再自己发明选项：没有 -s，环境变量是 PC98260_SOCK
+ * 而不是 PC98260_ROOT_SOCK，用法行也必须是原件那一条。
+ *
+ * 协议（与 rootd 侧对应）：单连接、单命令，命令以 \n 结尾，shutdown(SHUT_WR) 后读至 EOF。
  */
 #define _GNU_SOURCE 1
 #include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -22,11 +28,7 @@
 
 static void usage(const char *argv0)
 {
-	fprintf(stderr,
-		"用法: %s [-s socket] -c command\n"
-		"  -s socket   rootd 套接字路径（默认 %s）\n"
-		"  -c command  在 rootd 侧执行的命令\n",
-		argv0, DEFAULT_SOCKET);
+	fprintf(stderr, "usage: %s [-c command]\n", argv0);
 }
 
 static int write_all(int fd, const char *buf, size_t len)
@@ -46,18 +48,15 @@ static int write_all(int fd, const char *buf, size_t len)
 
 int main(int argc, char **argv)
 {
-	const char *socket_path = getenv("PC98260_ROOT_SOCK");
+	const char *socket_path = getenv("PC98260_SOCK");
 	const char *command = NULL;
 	int opt;
 
 	if (!socket_path || !*socket_path)
 		socket_path = DEFAULT_SOCKET;
 
-	while ((opt = getopt(argc, argv, "s:c:h")) != -1) {
+	while ((opt = getopt(argc, argv, "c:h")) != -1) {
 		switch (opt) {
-		case 's':
-			socket_path = optarg;
-			break;
 		case 'c':
 			command = optarg;
 			break;
@@ -74,7 +73,6 @@ int main(int argc, char **argv)
 
 	int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
 	if (fd < 0) {
-		fprintf(stderr, "pc98260-su: socket: %s\n", strerror(errno));
 		return 1;
 	}
 
@@ -82,18 +80,25 @@ int main(int argc, char **argv)
 	memset(&addr, 0, sizeof(addr));
 	addr.sun_family = AF_UNIX;
 	if (strlen(socket_path) >= sizeof(addr.sun_path)) {
-		fprintf(stderr, "pc98260-su: 套接字路径过长\n");
 		return 1;
 	}
 	strcpy(addr.sun_path, socket_path);
 
+	/* 原件数据段里带 /dev/null：连接前把 stderr 静音，rootd 侧噪音不外泄。 */
+	int nullfd = open("/dev/null", O_WRONLY | O_CLOEXEC);
+	if (nullfd >= 0) {
+		dup2(nullfd, STDERR_FILENO);
+		close(nullfd);
+	}
+
+	/* 这条提示要在静音之前输出，用户才看得见。 */
+	write(STDERR_FILENO, "connect root daemon\n", 20);
+
 	if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-		fprintf(stderr, "pc98260-su: connect %s: %s\n", socket_path, strerror(errno));
 		return 1;
 	}
 
 	if (write_all(fd, command, strlen(command)) < 0 || write_all(fd, "\n", 1) < 0) {
-		fprintf(stderr, "pc98260-su: write: %s\n", strerror(errno));
 		return 1;
 	}
 	shutdown(fd, SHUT_WR);
@@ -104,7 +109,6 @@ int main(int argc, char **argv)
 		if (n < 0) {
 			if (errno == EINTR)
 				continue;
-			fprintf(stderr, "pc98260-su: read: %s\n", strerror(errno));
 			return 1;
 		}
 		if (n == 0)
@@ -113,5 +117,6 @@ int main(int argc, char **argv)
 			break;
 	}
 	fflush(stdout);
+	close(fd);
 	return 0;
 }

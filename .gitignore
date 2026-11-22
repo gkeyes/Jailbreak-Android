@@ -11,4 +11,8 @@ captures/
 *.aab
 *.keystore
 *.jks
-tools/
+# 本地构建与校验产物
+.ksud-cache/
+*.part
+plant/*.log
+plant/verify-report.md

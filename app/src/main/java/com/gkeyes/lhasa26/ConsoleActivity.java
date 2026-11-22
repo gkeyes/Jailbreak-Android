@@ -12,6 +12,7 @@ import android.provider.MediaStore;
 import androidx.activity.ComponentActivity;
 
 import com.gkeyes.lhasa26.core.DeviceSnapshot;
+import com.gkeyes.lhasa26.core.LogRedactor;
 import com.gkeyes.lhasa26.core.ShizukuExecutor;
 import com.gkeyes.lhasa26.core.WorkflowCallbacks;
 import com.gkeyes.lhasa26.core.WorkflowEngine;
@@ -45,6 +46,17 @@ public final class ConsoleActivity extends ComponentActivity
 
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final StringBuilder sessionLog = new StringBuilder();
+
+    /**
+     * 监听力必须持有引用才能注销。方法引用每次求值都是新对象，
+     * removeXxxListener 拿它比对必然失败——这是之前注销不掉的根本原因。
+     */
+    private final Shizuku.OnBinderReceivedListener binderReceivedListener =
+            () -> refreshAuthorization();
+    private final Shizuku.OnBinderDeadListener binderDeadListener =
+            () -> refreshAuthorization();
+    private final Shizuku.OnRequestPermissionResultListener permissionResultListener =
+            (code, result) -> refreshAuthorization();
 
     private String status = "准备就绪";
     private String privilege = "未知";
@@ -87,9 +99,9 @@ public final class ConsoleActivity extends ComponentActivity
         console.attachListener(this);
         setContentView(console);
 
-        Shizuku.addBinderReceivedListenerSticky(this::refreshAuthorization);
-        Shizuku.addBinderDeadListener(this::refreshAuthorization);
-        Shizuku.addRequestPermissionResultListener((code, result) -> refreshAuthorization());
+        Shizuku.addBinderReceivedListenerSticky(binderReceivedListener);
+        Shizuku.addBinderDeadListener(binderDeadListener);
+        Shizuku.addRequestPermissionResultListener(permissionResultListener);
 
         keepScreenOn = getPreferences(MODE_PRIVATE).getBoolean("keep_on", true);
         applyKeepScreenOn();
@@ -107,7 +119,16 @@ public final class ConsoleActivity extends ComponentActivity
     @Override
     protected void onDestroy() {
         handler.removeCallbacksAndMessages(null);
-        engine.stop();
+        // 三个监听取下来，否则 Activity 重建后会叠加上一实例的回调。
+        Shizuku.removeBinderReceivedListener(binderReceivedListener);
+        Shizuku.removeBinderDeadListener(binderDeadListener);
+        Shizuku.removeRequestPermissionResultListener(permissionResultListener);
+        if (console != null) {
+            console.attachListener(null);
+        }
+        if (engine != null) {
+            engine.stop();
+        }
         super.onDestroy();
     }
 
@@ -291,29 +312,44 @@ public final class ConsoleActivity extends ComponentActivity
                 .show();
     }
 
+    /**
+     * 导出前统一脱敏；写入失败时把已经插进 MediaStore 的空条目删掉，
+     * 否则 Download/lhasa26 下会积累 0 字节的残留文件。
+     */
     private void exportLog() {
-        String payload = "app=" + versionName() + "\npackage=" + getPackageName()
+        String header = "app=" + versionName() + "\npackage=" + getPackageName()
                 + "\ndevice=" + device + " / " + build + "\nkernel=" + kernel
                 + "\nexport=" + new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(new Date())
-                + "\n\n" + sessionLog;
+                + "\n\n";
+        String payload = LogRedactor.redact(header + sessionLog);
         String name = "lhasa26-" + new SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(new Date()) + ".log";
+
+        Uri uri = null;
         try {
             ContentValues values = new ContentValues();
             values.put(MediaStore.Downloads.DISPLAY_NAME, name);
             values.put(MediaStore.Downloads.MIME_TYPE, "text/plain");
             values.put(MediaStore.Downloads.RELATIVE_PATH, "Download/lhasa26");
-            Uri uri = getContentResolver().insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values);
+            uri = getContentResolver().insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values);
             if (uri == null) {
                 toast("导出失败");
                 return;
             }
             try (OutputStream out = getContentResolver().openOutputStream(uri)) {
-                if (out != null) {
-                    out.write(payload.getBytes(StandardCharsets.UTF_8));
+                if (out == null) {
+                    throw new IllegalStateException("openOutputStream 返回空");
                 }
+                out.write(payload.getBytes(StandardCharsets.UTF_8));
             }
             toast("日志已导出到 Download/lhasa26/" + name);
         } catch (Exception error) {
+            if (uri != null) {
+                try {
+                    getContentResolver().delete(uri, null, null);
+                } catch (Exception ignored) {
+                    // 清理失败不影响给用户的错误提示
+                }
+            }
             toast("导出失败：" + error.getMessage());
         }
     }

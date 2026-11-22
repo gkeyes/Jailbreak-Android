@@ -1,0 +1,120 @@
+{
+  "schemaVersion": 1,
+  "updatedAt": "2026-11-22",
+  "project": "Lhasa26-Android",
+  "scope": "app/src/main/assets/",
+  "rule": "凡是会被打进 APK 的文件都必须在此登记。未登记文件由 tools/check_assets.py 报警（--strict 下为失败）。",
+  "identifiers": {
+    "blobSha1": "git 对象内容的 SHA-1（等价于 `git hash-object <file>`），与文件内容一一对应",
+    "sha256": "为 null 表示尚未在本机算出；在 CI 跑 `python3 tools/check_assets.py --update` 一次性回填"
+  },
+  "assets": [
+    {
+      "name": "ksud",
+      "path": "app/src/main/assets/ksud",
+      "size": 4990848,
+      "gitBlobSha1": "5b3b8d4a0bf749d23306995666c66fc159195d31",
+      "sha256": "4f7d5fd65631915ea579ff406bd9cbe58217f2c91dac6527f5b2f28ad4508171",
+      "origin": "upstream-prebuilt",
+      "upstream": {
+        "repo": "tiann/KernelSU",
+        "tag": "v3.3.1",
+        "apk": "KernelSU_v3.3.1_32680-release.apk",
+        "apkSha256": "b4a059ace71de2fa65cc7f12b1c58d55fc23ab25e057ee4230ce779742abe450",
+        "entry": "lib/arm64-v8a/libksud.so",
+        "note": "上游另有独立发布的 ksud-aarch64-linux-android（6,402,736 字节，sha256 049491e2…bfb1b），与本文件不是同一产物，不可混用"
+      },
+      "license": "GPL-3.0",
+      "inApk": true,
+      "usedBy": "core/WorkflowEngine.java — KernelSU 接管步骤按需投放，不在 AssetDeployer.RUNTIME_ASSETS 预置清单里",
+      "status": "pinned",
+      "action": "保持；由 tools/fetch_ksud.sh 按 tools/ksud.lock.properties 从上游重建，仓库不再是唯一副本"
+    },
+    {
+      "name": "uaf_plant_replay",
+      "path": "app/src/main/assets/uaf_plant_replay",
+      "size": 88488,
+      "gitBlobSha1": "4e8fa96f280c832dc185818c9dda6bf15f280165",
+      "sha256": null,
+      "origin": "prebuilt-source-lost",
+      "sourceDraft": null,
+      "inApk": true,
+      "usedBy": "core/AssetDeployer.RUNTIME_ASSETS（主利用：page-cache 流式喷 + UAF 抓页 + cred/selinux 修复 + rootd）",
+      "status": "unrecoverable-source",
+      "decision": "2026-11-22：原始源码目录（lhasa_port/plant）在本机已不存在。字符串可还原日志契约与 CLI（--slide/--site/--timer），但 UAF 窗口、页回收顺序、cred 偏移这些时序型原语无法从字符串复原；写一个只对得上字符串的空壳会让等价性门禁变成假阳性，因此不做。",
+      "action": "维持预编译件，接受「不可重建」这一事实；台账与 README 明确标注。若要闭环，只有两条路：找回原始 .c，或从反汇编重做（按周计）。",
+      "contract": {
+        "cli": ["--slide", "--site", "--timer"],
+        "logFile": "/data/local/tmp/uaf_replay.log",
+        "socket": "/data/local/tmp/pc98260-root.sock",
+        "profile": "/data/local/tmp/lhasa_profile.txt",
+        "stages": ["stream", "uaf", "cred", "selinux", "rootd"]
+      }
+    },
+    {
+      "name": "reach_probe",
+      "path": "app/src/main/assets/reach_probe",
+      "size": 51368,
+      "gitBlobSha1": "673fd33c7a4dfa749742e56b944dc857fd40eb6b",
+      "sha256": null,
+      "origin": "prebuilt-with-source",
+      "sourceDraft": "plant/reach_probe.c",
+      "inApk": true,
+      "usedBy": "core/AssetDeployer.RUNTIME_ASSETS（接口可达性诊断）",
+      "status": "source-equivalent-static",
+      "action": "静态锚点已全部通过（表格格式 + 接口清单 + OK/FAIL 汇总段）；待设备侧跑一次比对输出后替换"
+    },
+    {
+      "name": "slide_probe",
+      "path": "app/src/main/assets/slide_probe",
+      "size": 44776,
+      "gitBlobSha1": "022326460fb7ab31f6c0af7ccd34cccf37b276eb",
+      "sha256": null,
+      "origin": "prebuilt-with-source",
+      "sourceDraft": "plant/slide_probe.c",
+      "inApk": true,
+      "usedBy": "core/AssetDeployer.RUNTIME_ASSETS（tracefs 触发器测 KASLR 位移）",
+      "status": "source-equivalent-static",
+      "action": "3 个日志锚点全中；待设备侧比对 trace 输出后替换"
+    },
+    {
+      "name": "perf_slide",
+      "path": "app/src/main/assets/perf_slide",
+      "size": 31840,
+      "gitBlobSha1": "9aec90ed6e3fb91af5ea4800ab1895b9f87d9072",
+      "sha256": null,
+      "origin": "prebuilt-with-source",
+      "sourceDraft": "plant/perf_slide.c",
+      "inApk": true,
+      "usedBy": "core/AssetDeployer.RUNTIME_ASSETS（硬件 PMU 采样投票）",
+      "status": "source-equivalent-static",
+      "action": "5 个日志锚点全中；待设备侧比对采样输出后替换"
+    },
+    {
+      "name": "pc98260-su",
+      "path": "app/src/main/assets/pc98260-su",
+      "size": 28416,
+      "gitBlobSha1": "4c37dd5341b15daf1f9f159da7ccbeb853b6b7d1",
+      "sha256": null,
+      "origin": "prebuilt-with-source",
+      "sourceDraft": "plant/pc98260-su.c",
+      "inApk": true,
+      "usedBy": "core/AssetDeployer.RUNTIME_ASSETS（连 rootd 执行命令）",
+      "status": "source-equivalent-static",
+      "action": "字符串表已逐条对齐（PC98260_SOCK / usage / connect root daemon / /dev/null）；建议第一个做设备侧替换"
+    },
+    {
+      "name": "lhasa_profile.txt",
+      "path": "app/src/main/assets/lhasa_profile.txt",
+      "size": 2046,
+      "gitBlobSha1": "343cec0c23fea175237a5b9ceabc134baeccf229",
+      "sha256": null,
+      "origin": "in-repo-data",
+      "sourceDraft": null,
+      "inApk": true,
+      "usedBy": "core/AssetDeployer.RUNTIME_ASSETS（内核特征数据）",
+      "status": "data",
+      "action": "保持；导出日志已由 LogRedactor 脱敏"
+    }
+  ]
+}
