@@ -6,7 +6,7 @@
   "rule": "凡是会被打进 APK 的文件都必须在此登记。未登记文件由 tools/check_assets.py 报警（--strict 下为失败）。",
   "identifiers": {
     "blobSha1": "git 对象内容的 SHA-1（等价于 `git hash-object <file>`），与文件内容一一对应",
-    "sha256": "为 null 表示尚未在本机算出；在 CI 跑 `python3 tools/check_assets.py --update` 一次性回填"
+    "sha256": "文件内容的 SHA-256；由 CI 的 check_assets.py --update 或手工回填"
   },
   "assets": [
     {
@@ -35,7 +35,7 @@
       "path": "app/src/main/assets/uaf_plant_replay",
       "size": 88488,
       "gitBlobSha1": "4e8fa96f280c832dc185818c9dda6bf15f280165",
-      "sha256": null,
+      "sha256": "e7ddb4723c2698ab022843e5597f0599f35c1c49ade80014c73a632daa2eb74b",
       "origin": "prebuilt-source-lost",
       "sourceDraft": null,
       "inApk": true,
@@ -85,7 +85,7 @@
       "inApk": true,
       "usedBy": "core/AssetDeployer.RUNTIME_ASSETS（tracefs 触发器测 KASLR 位移）",
       "status": "rebuilt",
-      "action": "2026-11-22 由 plant/slide_probe.c 交叉编译后替换"
+      "action": "2026-11-22 由 plant/slide_probe.c 交叉编译后替换（事件顺序已修正）"
     },
     {
       "name": "perf_slide",
@@ -96,9 +96,9 @@
       "origin": "rebuilt-from-source",
       "sourceDraft": "plant/perf_slide.c",
       "inApk": true,
-      "usedBy": "core/AssetDeployer.RUNTIME_ASSETS（硬件 PMU 采样投票）",
+      "usedBy": "core/AssetDeployer.RUNTIME_ASSETS（软件/硬件 perf 采样 + profile 投票求 slide）",
       "status": "rebuilt",
-      "action": "2026-11-22 由 plant/perf_slide.c 交叉编译后替换"
+      "action": "2026-11-22 由 plant/perf_slide.c 交叉编译后替换（软件事件回退、--duration 按秒）"
     },
     {
       "name": "pc98260-su",
@@ -118,11 +118,11 @@
       "path": "app/src/main/assets/lhasa_profile.txt",
       "size": 2046,
       "gitBlobSha1": "343cec0c23fea175237a5b9ceabc134baeccf229",
-      "sha256": null,
+      "sha256": "2923e4de00e23c35e17da2f901798e39d7e564b826e2ce2b8b06d535f3b8d429",
       "origin": "in-repo-data",
       "sourceDraft": null,
       "inApk": true,
-      "usedBy": "core/AssetDeployer.RUNTIME_ASSETS（内核特征数据）",
+      "usedBy": "core/AssetDeployer.RUNTIME_ASSETS（内核特征数据，perf_slide 也读它做 profile 匹配）",
       "status": "data",
       "action": "保持；导出日志已由 LogRedactor 脱敏"
     }
