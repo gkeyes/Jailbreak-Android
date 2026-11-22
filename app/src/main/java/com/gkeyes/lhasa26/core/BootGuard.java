@@ -14,6 +14,9 @@ package com.gkeyes.lhasa26.core;
  *
  * Treating both as "retry" is why a failed boot can end in a panic. Everything here is pure logic
  * plus the exact shell strings the workflow needs, so it can be exercised without a device.
+ *
+ * A kernel that has no profile line is <b>not</b> blocked: the run continues with a warning, because
+ * a mismatched build sometimes still lands and the user may prefer one attempt over none.
  */
 public final class BootGuard {
 
@@ -84,15 +87,18 @@ public final class BootGuard {
         return Outcome.CONTINUE;
     }
 
+    /** True when the running kernel string has a line in lhasa_profile.txt. */
+    public static boolean isSupportedKernel(String kernel) {
+        return KernelSupport.isSupported(kernel);
+    }
+
     /**
-     * Refuses to run on a kernel that has no profile line. Using the offsets of a different build
-     * turns the rbtree write into a fault, which costs a whole boot opportunity.
+     * Warning shown when the kernel has no profile line. The run still proceeds: offsets from another
+     * build only sometimes fault, and an explicit attempt is often worth more than a refusal.
      */
-    public static void requireSupportedKernel(String kernel) {
-        if (!KernelSupport.isSupported(kernel)) {
-            throw new IllegalStateException("内核不在已验证 profile 表：" + kernel
-                    + " · 请先补 lhasa_profile.txt / gen_profile.py 后重试");
-        }
+    public static String kernelWarning(String kernel) {
+        return "（警告）内核不在已验证 profile 表：" + kernel
+                + " · 将按现有 offsets 继续尝试；若失败或内核异常，请重启后再试，不要在本次开机重复点击";
     }
 
     /**

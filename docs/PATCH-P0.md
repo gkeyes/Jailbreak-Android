@@ -34,9 +34,15 @@ return tail.contains("holding zombie")     // 节点已挂树，悬空节点存�
 
 `/proc` 是 `hidepid=invisible`，`pkill -f` / `killall` 的非 root 扫描看不到 payload，旧实例可能存活并与新实例抢 `mmap_lock`。改为启动时记录 `$$`（`setsid` 下即 pgid），停止时 `kill -TERM/-KILL -pgid`，顺带给 `payloadProcessCount()` 一个不依赖 `ps` 的探针。
 
-### 3. 未匹配内核直接阻断
+### 3. 内核不匹配：警告并继续尝试
 
-原实现只打一句「风险自负」就继续。带错 offsets 执行 `rb_erase` 的后果是 panic，会白白烧掉一次开机机会。现在 `recordFailedBoot()` 后抛出。
+原实现是一句「风险自负」就往下跑，没有任何提示差异；硬阻断又会把「可能能跑」的情况直接排除。现在统一成一条明确的警告：
+
+```
+（警告）内核不在已验证 profile 表：<uname -r> · 将按现有 offsets 继续尝试；若失败或内核异常，请重启后再试，不要在本次开机重复点击
+```
+
+仍然会跑，但失败时的归因清楚——先怀疑 profile，而不是先怀疑 payload。offsets 不匹配导致的通常是内核 oops / 自动重启，因为没动任何分区，重启即可恢复。
 
 ## 附带改动
 
