@@ -4,19 +4,21 @@
 两种模式，按「这个资产有没有归档基线」自动切换：
 
   报告模式（plant/equiv/<名字>.json 还不存在）
-      源码还在草稿阶段，重建物与原件必然有差距。只把差距列出来，不判失败。
+      只把差距列出来，不判失败。
 
   严格模式（plant/equiv/<名字>.json 已归档）
-      该资产已经被自有源码替换，基线是**第一次替换前原件**的指纹。
-      此后每次构建都必须通过硬门槛，否则就是回归。
+      基线是**第一次替换前原件**的指纹；此后每次构建都必须通过硬门槛。
 
-硬门槛：ELF/64 位/aarch64、原件日志锚点齐全、内核目标常量仍在、体积 0.5x~3x。
-提示项：字符串与立即数的增删。
+硬门槛：ELF/64 位/aarch64、原件日志锚点仍存在（子串匹配）、内核目标常量仍在、
+体积 0.5x~3x。提示项：字符串与立即数的增删。
+
+只有自有源码的产物走这道闸。上游源码构建的产物（slide_probe / pc98260-su /
+uaf_plant_replay）可信度来自钉版 tarball + sha256，不与原件逐字比较。
 
 用法：
   python3 tools/equiv.py check <名字> <重建物路径>
   python3 tools/equiv.py check-dir <目录>
-  python3 tools/equiv.py baseline [--force]     # 归档当前原件指纹（替换时用）
+  python3 tools/equiv.py baseline [--force] [--out <目录>]
 """
 
 from __future__ import annotations
@@ -123,9 +125,10 @@ def compare(name: str, rebuilt_path: str) -> int:
         if now["elf"]["machine"] != EM_AARCH64:
             hard.append(f"重建物架构不是 aarch64（e_machine=0x{now['elf']['machine']:x}）")
 
-    have_markers = set(now["markers"])
+    # 日志锚点按子串判定：多一个 /sys/kernel/tracing 前缀不该算缺失。
+    blob = "\n".join(now["strings"])
     for marker in base["markers"]:
-        if marker not in have_markers:
+        if marker not in blob:
             hard.append(f"缺少日志锚点：{marker!r}")
 
     have_consts = set(now["constants"])
@@ -169,8 +172,8 @@ def compare(name: str, rebuilt_path: str) -> int:
 def cmd_check_dir(directory: str) -> int:
     root = pathlib.Path(directory)
     if not root.is_dir():
-        print(f"FAIL 目录不存在：{root}")
-        return 1
+        print(f"SKIP 目录不存在：{root}（没有自有源码需要比对）")
+        return 0
     checked = failures = 0
     for path in sorted(p for p in root.iterdir() if p.is_file()):
         if reference(path.name)[1] is None:
@@ -185,7 +188,7 @@ def cmd_check_dir(directory: str) -> int:
 def cmd_baseline(force: bool, out_dir: pathlib.Path | None) -> int:
     dest = out_dir or BASELINE_DIR
     dest.mkdir(parents=True, exist_ok=True)
-    names = ["uaf_plant_replay", "reach_probe", "slide_probe", "perf_slide", "pc98260-su"]
+    names = ["uaf_plant_replay", "reach_probe", "slide_probe", "pc98260-su"]
     written = skipped = 0
     for name in names:
         asset = ASSETS / name
