@@ -2,7 +2,8 @@ name: plant-build
 
 # 无黑盒的守护任务：
 # 1) 把 plant/*.c 交叉编译到 aarch64-linux-musl；
-# 2) 列出 assets 里尚未有对应源码的 ELF（现在应为 5 个，直到被替换为止）。
+# 2) 列出 assets 里尚未有对应源码的 ELF；
+# 3) 把结果写成 plant/build-status.md 提交回分支，方便不登 Actions 也能看。
 on:
   push:
     branches: [ fix/p0-clean-boot-retry ]
@@ -11,6 +12,9 @@ on:
       - 'app/src/main/assets/**'
       - '.github/workflows/plant-build.yml'
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -28,29 +32,25 @@ jobs:
 
       - name: Audit assets for sourceless ELF
         run: |
-          python3 - <<'PY'
+          python3 - <<'PY' | tee plant/audit.log
           import pathlib
           assets = pathlib.Path("app/src/main/assets")
-          sources = {p.stem for p in pathlib.Path("plant").glob("*.c")}
+          sources = {p.name[:-2] for p in pathlib.Path("plant").glob("*.c")}
           missing = []
+          print(f"{'status':8} {'asset':22} {'size':>10}  source")
           for path in sorted(assets.iterdir()):
               if not path.is_file():
                   continue
-              head = path.open("rb").read(4)
-              if head != b"\x7fELF":
+              if path.open("rb").read(4) != b"\x7fELF":
                   continue
-              status = "OK" if path.stem in sources else "MISSING"
-              if status == "MISSING":
+              has = path.name in sources
+              if not has:
                   missing.append(path.name)
-              print(f"{status:8} {path.name:20} {path.stat().st_size:>9} bytes")
-          lines = ["### 资产源码审计", "", "```text"]
-          lines.append("\n".join(["see job log for table"]))
-          lines.append("```")
+              source = path.name + ".c" if has else "-"
+              print(f"{'OK' if has else 'MISSING':8} {path.name:22} {path.stat().st_size:>10}  {source}")
+          print(f"\n合计 {len(missing)} 个资产尚无源码")
           if missing:
               print(f"::warning::{len(missing)} ELF 资产尚无源码: {', '.join(missing)}")
-          with open("/tmp/assets-audit.md", "w") as fh:
-              fh.write(f"尚无源码的 ELF 资产：{len(missing)} 个\n\n")
-              fh.write("\n".join(f"- `{m}`" for m in missing) + "\n")
           PY
 
       - name: Compile plant sources
@@ -59,15 +59,20 @@ jobs:
           shopt -s nullglob
           files=(plant/*.c)
           if [ ${#files[@]} -eq 0 ]; then
-            echo "plant/ 下还没有任何源码，跳过编译。" | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "plant/ 下还没有任何源码，跳过编译。" | tee plant/build.log
             exit 0
           fi
           mkdir -p plant/out
+          : > plant/build.log
           for src in "${files[@]}"; do
             out="plant/out/$(basename "${src%.c}")"
-            echo "zig cc -target aarch64-linux-musl -O2 $src -> $out"
-            zig cc -target aarch64-linux-musl -O2 -static -pthread "$src" -o "$out"
-            file "$out"
+            echo "== zig cc $src -> $out" | tee -a plant/build.log
+            if zig cc -target aarch64-linux-musl -O2 -static -pthread "$src" -o "$out" 2>&1 | tee -a plant/build.log; then
+              file "$out" | tee -a plant/build.log
+            else
+              echo "::error::编译失败 $src"
+              exit 1
+            fi
           done
 
       - name: Upload plant binaries
@@ -77,3 +82,43 @@ jobs:
           name: plant-binaries
           path: plant/out/*
           if-no-files-found: ignore
+
+      - name: Record result
+        if: always()
+        env:
+          RESULT: ${{ job.status }}
+        run: |
+          set +e
+          {
+            echo "# plant 构建状态"
+            echo
+            echo "- 结果：**${RESULT}**"
+            echo "- commit：\`${GITHUB_SHA:0:8}\`"
+            echo
+            echo "## 产物"
+            echo
+            echo '```text'
+            ls -l plant/out 2>/dev/null || echo "无产物（编译未开始或失败）"
+            echo '```'
+            echo
+            echo "## 资产审计"
+            echo
+            echo '```text'
+            tail -n 40 plant/audit.log 2>/dev/null
+            echo '```'
+            echo
+            echo "## 编译日志尾部"
+            echo
+            echo '```text'
+            tail -n 60 plant/build.log 2>/dev/null
+            echo '```'
+          } > plant/build-status.md
+          git config user.name "lhasa-ci"
+          git config user.email "lhasa-ci@users.noreply.github.com"
+          git add plant/build-status.md plant/build.log plant/audit.log 2>/dev/null
+          if git diff --cached --quiet; then
+            echo "status unchanged"
+          else
+            git commit -m "ci: plant 构建结果 ${RESULT} [ci-status]"
+            git push
+          fi
