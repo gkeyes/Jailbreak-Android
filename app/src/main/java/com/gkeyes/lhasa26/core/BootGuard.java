@@ -3,20 +3,20 @@ package com.gkeyes.lhasa26.core;
 /**
  * Boot-scoped retry policy for the lhasa26 temporary-root workflow.
  *
- * The payload can fail in two structurally different ways and the difference decides whether the
+ * The payload can fail in three structurally different ways and the difference decides whether the
  * same boot may be retried at all:
  *
- *  - a leak-stage failure, where nothing was planted and the heap is still clean, so restarting the
- *    payload immediately is safe;
+ *  - a clean leak failure, where nothing was planted and the heap is still untouched;
  *  - a planted-node failure ("holding zombie"), where the timerqueue node stays linked in the live
  *    task's posix_cputimers rbtree. Running the payload again makes release_task() erase the same
- *    freed node a second time, which faults the kernel instead of returning an error.
+ *    freed node a second time, which faults the kernel instead of returning an error. This must be
+ *    blocked for the rest of the boot, regardless of the current SELinux mode;
+ *  - a SELinux-only failure, where the first phase landed but the cred phase did not.
  *
- * Treating both as "retry" is why a failed boot can end in a panic. Everything here is pure logic
- * plus the exact shell strings the workflow needs, so it can be exercised without a device.
+ * Treating them all as "retry" is why a failed boot can end in a panic.
  *
- * A kernel that has no profile line is <b>not</b> blocked: the run continues with a warning, because
- * a mismatched build sometimes still lands and the user may prefer one attempt over none.
+ * Everything here is pure logic plus the exact shell strings the workflow needs, so it can be
+ * exercised without a device.
  */
 public final class BootGuard {
 
@@ -28,29 +28,35 @@ public final class BootGuard {
         CONTINUE
     }
 
+    /** What the recorded failure of this boot allows. */
+    public enum Retry {
+        /** No failure recorded for the running boot. */
+        ALLOWED,
+        /** SELinux already went Permissive, so only the cred stage has to be retried. */
+        PERMISSIVE_RETRY,
+        /** A node was left linked, or the kernel already faulted: never retry in this boot. */
+        BLOCKED
+    }
+
     /**
-     * Written by the launch wrapper as `&lt;pgid&gt;:&lt;boot_id&gt;`. Under setsid the recorded shell id doubles
-     * as the process group id, which is what makes a whole-tree kill possible without scanning /proc.
+     * Written by the launch wrapper as `&lt;pgid&gt;:&lt;boot_id&gt;`.
      *
      * The boot id is essential: /data/local/tmp survives reboots, and a stale pgid can be reused by
-     * an unrelated shell-uid process (shizuku_server, an adbd child). Without the guard the workflow
-     * would either refuse to start or kill that innocent group.
+     * an unrelated shell-uid process. Note that a payload which already elevated itself runs as
+     * uid=0, which a uid=2000 shell cannot signal — kill/alive are best-effort evidence only.
      */
     public static final String PID_FILE = "/data/local/tmp/.lhasa_pid";
 
-    /**
-     * 阶段面包屑：每个会碰内核的动作开跑前写一次，成功后清空。
-     * 下次启动时若这行还在，就说明上一次运行停在了那个阶段——重启之后再也不用猜是谁弄的。
-     */
+    /** 阶段面包屑：每个会碰内核的动作开跑前写一次，成功后清空。 */
     public static final String STAGE_FILE = "/data/local/tmp/.lhasa_stage";
 
-    /** timeout(1) 被触发时的退出码，用来把"卡死"和"程序自己返回失败"区分开。 */
+    /** 本次开机的失败记录：`<boot_id> <abort|permissive|enforcing>`。 */
+    public static final String FAILED_FILE = "/data/local/tmp/.lhasa_failed_boot";
+
+    /** timeout(1) 被触发时的退出码。 */
     public static final int TIMEOUT_EXIT = 124;
 
-    /** 运行态文件里的 boot id 分隔符；pgid 是数字，boot id 是 uuid，冒号不会歧义。 */
     private static final char BOOT_SEP = ':';
-
-    /** 读当前开机 id 的 shell 片段（toybox cat，无需 root）。 */
     private static final String BOOT_ID_READ = "$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)";
 
     /**
@@ -65,31 +71,28 @@ public final class BootGuard {
             "Internal error"
     };
 
-    /**
-     * Markers that are only emitted once the cred stage actually landed. Deliberately excludes
-     * "holding pages" and "[selinux] already permissive": the first is an intermediate plant state,
-     * the second only says the SELinux phase is done while uid is still 2000.
-     */
+    /** Markers that are only emitted once the cred stage actually landed. */
     private static final String[] SUCCESS_MARKERS = {
             "[child-cred] uid=0",
             "[cred] rooted"
     };
 
-    /** Failures that leave nothing planted, so the same boot can run the payload again. */
+    /**
+     * Failures that leave nothing planted, so the same boot can run the payload again.
+     *
+     * Deliberately does NOT contain "[selinux] attempt ": that line is emitted while the chain is
+     * still progressing normally (attempt 1/6 happens right at the start), and treating it as a retry
+     * signal killed a healthy run and restarted it.
+     */
     private static final String[] RETRY_MARKERS = {
             "leak failed",
-            "[selinux] attempt "
+            "unsupported kernel",
+            "slide_probe failed"
     };
 
     private BootGuard() {
     }
 
-    /**
-     * Classifies a payload log tail.
-     *
-     * Abort markers win over success markers on purpose: a tail that reports a planted node and later
-     * a success line still leaves the dangling node queued, and the next run must not reuse it.
-     */
     public static Outcome classify(String tail) {
         if (tail == null || tail.isEmpty()) {
             return Outcome.CONTINUE;
@@ -111,39 +114,67 @@ public final class BootGuard {
         return KernelSupport.isSupported(kernel);
     }
 
-    /**
-     * Warning shown when the kernel has no profile line. The run still proceeds: offsets from another
-     * build only sometimes fault, and an explicit attempt is often worth more than a refusal.
-     */
     public static String kernelWarning(String kernel) {
         return "（警告）内核不在已验证 profile 表：" + kernel
                 + " · 将按现有 offsets 继续尝试；若失败或内核异常，请重启后再试，不要在本次开机重复点击";
     }
 
-    /**
-     * 给单次探测命令套上硬超时。
-     *
-     * 采样器和 tracefs 探测在异常内核上可能永远不返回；没有 timeout 时它们会以 root 身份常驻，
-     * 把设备拖进 soft lockup，最后表现成"用一次就重启一次"。
-     * `-k 2` 是第二道保险：SIGTERM 后 2 秒仍不退就 SIGKILL。
-     */
+    /** 单次探测命令加硬超时；`-k 2` 是第二道保险：SIGTERM 后 2 秒仍不退就 SIGKILL。 */
     public static String withTimeout(int seconds, String command) {
         return "timeout -k 2 " + seconds + " " + command;
     }
 
-    /** 记下"接下来要碰内核了"；失败或重启后靠它定位。 */
     public static String markCommand(String stage) {
         return "echo '" + sanitize(stage) + " " + System.currentTimeMillis() + "' > " + STAGE_FILE;
     }
 
-    /** 成功走完后清掉面包屑。 */
     public static String clearStageCommand() {
         return "rm -f " + STAGE_FILE;
     }
 
     /**
-     * 把上一次残留的阶段读成一句人话；没有残留就返回空串。
+     * 记录本次开机的失败。abort=true 表示节点已经挂进 rbtree（或内核已报错），
+     * 这种情况**无论 SELinux 状态如何都不允许重跑**。
      */
+    public static String recordFailureCommand(String bootId, boolean abort, boolean permissive) {
+        if (bootId == null || bootId.isEmpty()) {
+            return "true";
+        }
+        String kind = abort ? "abort" : (permissive ? "permissive" : "enforcing");
+        return "echo '" + sanitize(bootId) + " " + kind + "' > " + FAILED_FILE;
+    }
+
+    public static String clearFailureCommand() {
+        return "rm -f " + FAILED_FILE;
+    }
+
+    /**
+     * 解析失败记录并给出本次开机是否还能重试。
+     *
+     * 兼容旧格式（`<boot_id> 0|1`）：0 视作 permissive、1 视作 enforcing。
+     */
+    public static Retry parseFailure(String content, String currentBootId) {
+        if (content == null || content.trim().isEmpty()) {
+            return Retry.ALLOWED;
+        }
+        String[] parts = content.trim().split("\\s+");
+        if (parts.length < 2) {
+            return Retry.BLOCKED;
+        }
+        if (currentBootId != null && !currentBootId.isEmpty() && !currentBootId.equals(parts[0])) {
+            // 记录属于上一次开机，与本次无关
+            return Retry.ALLOWED;
+        }
+        String kind = parts[1];
+        if ("abort".equals(kind)) {
+            return Retry.BLOCKED;
+        }
+        if ("permissive".equals(kind) || "0".equals(kind)) {
+            return Retry.PERMISSIVE_RETRY;
+        }
+        return Retry.BLOCKED;
+    }
+
     public static String leftoverStageHint(String stageFileContent) {
         if (stageFileContent == null || stageFileContent.trim().isEmpty()) {
             return "";
@@ -171,11 +202,11 @@ public final class BootGuard {
         return "上次运行停在「" + label + "」阶段，没有正常结束——如果是重启造成的，那就是这个阶段把设备带走的。";
     }
 
-    private static String sanitize(String stage) {
-        if (stage == null) {
+    private static String sanitize(String value) {
+        if (value == null) {
             return "unknown";
         }
-        return stage.replaceAll("[^A-Za-z0-9_.-]", "_");
+        return value.replaceAll("[^A-Za-z0-9_.-]", "_");
     }
 
     /**
@@ -191,9 +222,8 @@ public final class BootGuard {
 
     /**
      * Signals the recorded process group — but only when the record belongs to the running boot.
-     *
-     * pkill and killall cannot be used here: /proc is mounted hidepid=invisible on this device, so an
-     * unprivileged scan never sees the payload and the old process keeps running next to the new one.
+     * A payload that already elevated itself runs as uid=0, which this uid=2000 shell cannot signal;
+     * the call is therefore best-effort and its failure must not be treated as "nothing running".
      */
     public static String killCommand() {
         return "if [ -s " + PID_FILE + " ]; then "
@@ -205,13 +235,18 @@ public final class BootGuard {
                 + "fi; rm -f " + PID_FILE + "; fi; true";
     }
 
-    /** Prints 1 when the recorded process group still exists <b>in this boot</b>, 0 otherwise. */
+    /**
+     * Prints 1 when the recorded process group still exists in this boot, 0 otherwise.
+     * EPERM (the payload已升权) is reported as 1: still alive, just unsignalable.
+     */
     public static String aliveCommand() {
         return "if [ -s " + PID_FILE + " ]; then "
                 + "rec=$(cat " + PID_FILE + " 2>/dev/null); "
                 + "p=${rec%%" + BOOT_SEP + "*}; b=${rec##*" + BOOT_SEP + "}; "
                 + "now=" + BOOT_ID_READ + "; "
-                + "if [ -n \"$now\" ] && [ \"$b\" = \"$now\" ] && kill -0 -$p 2>/dev/null; then echo 1; "
+                + "if [ -n \"$now\" ] && [ \"$b\" = \"$now\" ]; then "
+                + "kill -0 -$p 2>/dev/null && echo 1 || { "
+                + "  kill -KILL -$p 2>/dev/null; echo 1; }; "
                 + "else rm -f " + PID_FILE + "; echo 0; fi; "
                 + "else echo 0; fi";
     }
