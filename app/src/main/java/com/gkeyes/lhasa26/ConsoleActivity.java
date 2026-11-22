@@ -160,7 +160,7 @@ public final class ConsoleActivity extends ComponentActivity
     private void refreshActionLabel() {
         WorkflowEngine.State state = engine == null ? WorkflowEngine.State.IDLE : engine.getState();
         if (state == WorkflowEngine.State.ROOTED || state == WorkflowEngine.State.KSU_PENDING) {
-            actionLabel = "重试 KernelSU 接管";
+            actionLabel = "加载 KernelSU";
             return;
         }
         if (state == WorkflowEngine.State.COMPLETE) {
@@ -234,9 +234,16 @@ public final class ConsoleActivity extends ComponentActivity
                 }
                 WorkflowEngine.State state = engine.getState();
                 if (state == WorkflowEngine.State.ROOTED || state == WorkflowEngine.State.KSU_PENDING) {
-                    if (engine.retryKernelSu()) {
-                        beginRun();
-                    }
+                    // KernelSU 接管会 late-load 内核模块，是整条链里最容易触发重启的一步，
+                    // 所以改成显式确认，不再跟着"拿完 ROOT"一起自动跑。
+                    confirm("加载 KernelSU",
+                            "会 late-load 加载内核模块，这是整条链里最容易导致重启的一步。\n"
+                                    + "建议先把当前日志导出。确认现在加载？",
+                            () -> {
+                                if (engine.retryKernelSu()) {
+                                    beginRun();
+                                }
+                            });
                 } else if (engine.startRoot()) {
                     beginRun();
                 }
@@ -254,7 +261,7 @@ public final class ConsoleActivity extends ComponentActivity
                 exportLog();
                 break;
             case CLEAN:
-                maintenance("cd /data/local/tmp 2>/dev/null; for f in uaf_replay.log diag.log ksu_try.log .lhasa_failed_boot; "
+                maintenance("cd /data/local/tmp 2>/dev/null; for f in uaf_replay.log diag.log ksu_try.log .lhasa_failed_boot .lhasa_stage; "
                         + "do [ -e \"$f\" ] && rm -f \"$f\"; done; true", "临时文件已清理");
                 break;
             case SOFT_REBOOT:
@@ -268,7 +275,11 @@ public final class ConsoleActivity extends ComponentActivity
             case HELP:
                 new AlertDialog.Builder(this)
                         .setTitle("使用帮助")
-                        .setMessage("1. 点击主按钮：自动打开 Shizuku 并请求授权\n2. 接口诊断确认环境\n3. 一键临时 ROOT\n4. 成功后 KernelSU 接管，重启后需重新执行")
+                        .setMessage("1. 点击主按钮：自动打开 Shizuku 并请求授权\n"
+                                + "2. 接口诊断确认环境\n"
+                                + "3. 一键临时 ROOT（这一步跑完就停，不会自动加载 KernelSU）\n"
+                                + "4. 需要常驻再点一次主按钮，会有二次确认\n"
+                                + "5. 重启后临时 ROOT 失效，需要重新执行")
                         .setPositiveButton("知道了", null)
                         .show();
                 break;
