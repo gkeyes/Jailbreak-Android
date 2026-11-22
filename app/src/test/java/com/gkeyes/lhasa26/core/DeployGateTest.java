@@ -5,30 +5,33 @@ import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 
-import java.util.concurrent.atomic.AtomicReference;
-
 import org.junit.Test;
 
 /**
- * Acceptance for the staging gate, driven through simulated staging tasks only.
+ * Acceptance for the staging gate, driven through simulated staging tasks.
  *
- * The three cases the flow must survive without ever announcing 程序已就位:
- *   timeout, cancellation, and a worker that succeeds after the deadline.
+ * A task is READY only when it explicitly reports completion. Everything else - an Error that escapes,
+ * a task that simply returns, a task that ignores interrupts - must stay not-ready and must say
+ * whether the worker is still alive.
  */
 public class DeployGateTest {
 
-    private static Thread staging(AtomicReference<Exception> error, long sleepMs, Runnable body) {
+    /** Starts a task that behaves like the real staging worker. */
+    private static Thread task(DeployGate gate, long sleepMs, boolean complete, Runnable extra) {
         Thread worker = new Thread(() -> {
             try {
-                if (body != null) {
-                    body.run();
+                if (extra != null) {
+                    extra.run();
                 }
-                Thread.sleep(sleepMs);
+                if (sleepMs > 0) {
+                    Thread.sleep(sleepMs);
+                }
+                if (complete) {
+                    gate.markCompleted();
+                }
             } catch (InterruptedException interrupted) {
                 Thread.currentThread().interrupt();
-                error.set(interrupted);
-            } catch (Exception failure) {
-                error.set(failure);
+                gate.fail(interrupted);
             }
         }, "staging-sim");
         worker.setDaemon(true);
@@ -37,66 +40,89 @@ public class DeployGateTest {
     }
 
     @Test
-    public void completesBeforeDeadlineIsReady() throws Exception {
-        AtomicReference<Exception> error = new AtomicReference<>();
-        Thread worker = staging(error, 10L, null);
-
+    public void explicitCompletionIsReady() throws Exception {
         DeployGate gate = new DeployGate(2000L);
-        assertEquals(DeployGate.Result.READY, gate.await(worker, error));
+        Thread worker = task(gate, 10L, true, null);
+
+        assertEquals(DeployGate.Result.READY, gate.await(worker));
         assertTrue(gate.isReady());
+        assertFalse(gate.isWorkerAlive());
     }
 
     @Test
-    public void timeoutIsNotReadyAndTerminatesTheFlow() throws Exception {
-        AtomicReference<Exception> error = new AtomicReference<>();
-        Thread worker = staging(error, 5000L, null);
+    public void errorThatEscapesIsNotReady() throws Exception {
+        DeployGate gate = new DeployGate(2000L);
+        Thread worker = task(gate, 0L, false, () -> {
+            throw new AssertionError("模拟: 拷贝途中断言失败");
+        });
 
+        assertEquals(DeployGate.Result.FAILED, gate.await(worker));
+        assertFalse("Error 跳过 catch 时不得视为就绪", gate.isReady());
+    }
+
+    @Test
+    public void threadThatEndsWithoutReportingIsNotReady() throws Exception {
+        DeployGate gate = new DeployGate(2000L);
+        Thread worker = task(gate, 5L, false, null);
+
+        assertEquals(DeployGate.Result.FAILED, gate.await(worker));
+        assertFalse(gate.isReady());
+    }
+
+    @Test
+    public void timeoutReportsWorkerIsGone() throws Exception {
         DeployGate gate = new DeployGate(120L);
-        assertEquals(DeployGate.Result.TIMEOUT, gate.await(worker, error));
-        assertFalse("超时后不得显示程序已就位", gate.isReady());
+        Thread worker = task(gate, 5000L, false, null);
+
+        assertEquals(DeployGate.Result.TIMEOUT, gate.await(worker));
+        assertFalse(gate.isReady());
+        assertFalse("收到中断后应及时退出", gate.isWorkerAlive());
     }
 
     @Test
-    public void cancelledTaskIsReportedAsCancelled() throws Exception {
-        AtomicReference<Exception> error = new AtomicReference<>();
+    public void workerIgnoringInterruptIsStuckAndSaysSo() throws Exception {
+        DeployGate gate = new DeployGate(80L);
         Thread worker = new Thread(() -> {
-            try {
-                Thread.sleep(5000L);
-            } catch (InterruptedException interrupted) {
-                Thread.currentThread().interrupt();
-                error.set(interrupted);
+            long until = System.currentTimeMillis() + 1500L;
+            boolean interrupted = false;
+            while (System.currentTimeMillis() < until) {
+                try {
+                    Thread.sleep(20L);
+                } catch (InterruptedException ignored) {
+                    interrupted = true;
+                    // Deliberately keep running: this models a write that cannot be interrupted.
+                }
             }
-        }, "staging-cancel");
+            if (interrupted) {
+                Thread.currentThread().interrupt();
+            }
+        }, "staging-stuck");
         worker.setDaemon(true);
         worker.start();
 
-        DeployGate gate = new DeployGate(100L);
-        assertEquals(DeployGate.Result.TIMEOUT, gate.await(worker, error));
+        assertEquals(DeployGate.Result.STUCK, gate.await(worker));
         assertFalse(gate.isReady());
-    }
-
-    @Test
-    public void lateSuccessCannotFlipTheOutcome() throws Exception {
-        AtomicReference<Exception> error = new AtomicReference<>();
-        Thread worker = staging(error, 400L, null);
-
-        DeployGate gate = new DeployGate(80L);
-        assertEquals(DeployGate.Result.TIMEOUT, gate.await(worker, error));
-
-        // Let the worker finish successfully after the gate already settled.
+        assertTrue("必须能说出后台写入还活着", gate.isWorkerAlive());
         worker.join(2000L);
-        assertFalse("迟到成功不得改变结果", worker.isAlive());
-        assertEquals(DeployGate.Result.TIMEOUT, gate.outcome());
+    }
+
+    @Test
+    public void failureReportedByTaskIsFailed() throws Exception {
+        DeployGate gate = new DeployGate(2000L);
+        Thread worker = task(gate, 0L, false, () -> gate.fail(new IllegalStateException("写入失败")));
+
+        assertEquals(DeployGate.Result.FAILED, gate.await(worker));
         assertFalse(gate.isReady());
     }
 
     @Test
-    public void failureIsReportedAsFailed() throws Exception {
-        AtomicReference<Exception> error = new AtomicReference<>();
-        Thread worker = staging(error, 0L, () -> error.set(new IllegalStateException("写入失败")));
+    public void lateCompletionIsRejected() throws Exception {
+        DeployGate gate = new DeployGate(80L);
+        Thread worker = task(gate, 400L, true, null);
 
-        DeployGate gate = new DeployGate(2000L);
-        assertEquals(DeployGate.Result.FAILED, gate.await(worker, error));
+        assertEquals(DeployGate.Result.TIMEOUT, gate.await(worker));
+        worker.join(2000L);
+        assertEquals(DeployGate.Result.TIMEOUT, gate.outcome());
         assertFalse(gate.isReady());
     }
 

@@ -1,71 +1,90 @@
 package com.gkeyes.lhasa26.core;
 
-import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
- * Deployment gate: a step may only be announced as ready when the staging task actually finished.
+ * Deployment gate: staging is announced as ready only when the staging task says so.
  *
- * The previous code did {@code deploy.join(8000L)} and then only checked whether an exception had been
- * recorded. A task that was still copying 5 MB through the Shizuku pipe passed that check, the flow
- * announced 程序已就位, and the exploit then raced the still-running copy for I/O and memory.
+ * Two earlier shapes were wrong and are called out here because they are easy to regress into:
  *
- * This gate settles exactly once. A late success after the timeout cannot turn the outcome back to
- * READY, because READY is only produced on the path where the worker was already dead and no error
- * was recorded.
+ * 1. "No exception recorded and the thread is dead" is NOT success. An {@link Error} (assertion,
+ *    linkage, OOM) escapes a {@code catch (Exception)} block, the thread dies, the error holder stays
+ *    empty, and the gate used to return READY.
+ * 2. A thread that ignores {@link Thread#interrupt()} keeps writing. Returning TIMEOUT without saying
+ *    whether the worker is still alive hides that.
+ *
+ * READY therefore requires an explicit {@link #markCompleted()} from the task, and every non-ready
+ * outcome carries {@link #isWorkerAlive()} so the caller has evidence about the background write.
  */
 public final class DeployGate {
 
     /** Terminal outcome of one staging attempt. */
     public enum Result {
+        /** The task reported completion and the worker is gone. */
         READY,
+        /** The worker ended without reporting completion, or reported a failure. */
+        FAILED,
+        /** The deadline passed, the worker was interrupted and died. */
         TIMEOUT,
-        CANCELLED,
-        FAILED
+        /** The deadline passed and the worker ignored the interrupt; it may still be writing. */
+        STUCK
     }
 
+    private static final long ABORT_GRACE_MS = 500L;
+
     private final long timeoutMs;
+    private final AtomicBoolean completed = new AtomicBoolean(false);
+    private volatile Throwable failure;
     private volatile Result outcome;
+    private volatile boolean workerAlive;
 
     public DeployGate(long timeoutMs) {
         this.timeoutMs = timeoutMs > 0 ? timeoutMs : 8000L;
     }
 
     /**
-     * Waits for the staging task and settles the outcome.
+     * Called by the staging task as its last statement.
      *
-     * A task that is still alive at the deadline is interrupted and reported as TIMEOUT. A task that
-     * fails with InterruptedException is reported as CANCELLED, so the two cases stay distinguishable
-     * in the log.
+     * Returns false when the gate already settled, which tells a late finisher that its work no longer
+     * counts and it must not touch the device further.
      */
-    public Result await(Thread worker, AtomicReference<Exception> error) throws InterruptedException {
-        synchronized (this) {
-            if (outcome != null) {
-                return outcome;
-            }
+    public boolean markCompleted() {
+        if (outcome != null && outcome != Result.READY) {
+            return false;
         }
+        return completed.compareAndSet(false, true);
+    }
 
+    /** Called by the staging task when it fails. Throwable, not Exception: Errors must count too. */
+    public void fail(Throwable error) {
+        failure = error;
+    }
+
+    /** Waits for the worker and settles exactly once. */
+    public Result await(Thread worker) throws InterruptedException {
         long deadline = System.currentTimeMillis() + timeoutMs;
+
         while (worker.isAlive()) {
             long remaining = deadline - System.currentTimeMillis();
             if (remaining <= 0L) {
-                worker.interrupt();
-                worker.join(500L);
-                // The outcome is fixed here. If the worker completes successfully after this point it
-                // must not be able to rewrite it, which is why READY is never set on this path.
-                return settle(Result.TIMEOUT);
+                break;
             }
-            worker.join(Math.min(remaining, 100L));
+            worker.join(Math.min(remaining, 50L));
         }
 
-        Exception failure = error == null ? null : error.get();
-        if (failure == null) {
-            return settle(Result.READY);
+        if (!worker.isAlive()) {
+            workerAlive = false;
+            if (failure != null) {
+                return settle(Result.FAILED);
+            }
+            // Dead without an explicit completion: an Error escaped, or the task forgot to report.
+            return settle(completed.get() ? Result.READY : Result.FAILED);
         }
-        if (failure instanceof InterruptedException
-                || (failure.getCause() instanceof InterruptedException)) {
-            return settle(Result.CANCELLED);
-        }
-        return settle(Result.FAILED);
+
+        worker.interrupt();
+        worker.join(ABORT_GRACE_MS);
+        workerAlive = worker.isAlive();
+        return settle(workerAlive ? Result.STUCK : Result.TIMEOUT);
     }
 
     private synchronized Result settle(Result result) {
@@ -80,8 +99,13 @@ public final class DeployGate {
         return outcome;
     }
 
-    /** True only when staging provably completed before the deadline. */
+    /** True only when the task explicitly reported completion. */
     public boolean isReady() {
         return outcome() == Result.READY;
+    }
+
+    /** Whether the staging worker was still alive when the gate settled. */
+    public boolean isWorkerAlive() {
+        return workerAlive;
     }
 }
