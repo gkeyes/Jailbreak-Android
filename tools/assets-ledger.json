@@ -6,7 +6,7 @@
   "rule": "凡是会被打进 APK 的文件都必须在此登记。未登记文件由 tools/check_assets.py 报警（--strict 下为失败）。",
   "identifiers": {
     "blobSha1": "git 对象内容的 SHA-1（等价于 `git hash-object <file>`），与文件内容一一对应",
-    "sha256": "文件内容的 SHA-256；由 CI 的 check_assets.py --update 或手工回填"
+    "sha256": "文件内容的 SHA-256；由 CI 的 check_assets.py --update 或 publish job 回填"
   },
   "assets": [
     {
@@ -36,13 +36,13 @@
       "size": 88488,
       "gitBlobSha1": "4e8fa96f280c832dc185818c9dda6bf15f280165",
       "sha256": "e7ddb4723c2698ab022843e5597f0599f35c1c49ade80014c73a632daa2eb74b",
-      "origin": "prebuilt-source-lost",
-      "sourceDraft": null,
+      "origin": "upstream-source",
+      "sourceDraft": "Lw5959/xring-cve-2026-98260@8b404774/src/exploit-android-perf.c",
+      "license": "MIT",
       "inApk": true,
-      "usedBy": "core/AssetDeployer.RUNTIME_ASSETS（主利用：page-cache 流式喷 + UAF 抓页 + cred/selinux 修复 + rootd）",
-      "status": "unrecoverable-source",
-      "decision": "2026-11-22：原始源码目录（lhasa_port/plant）在本机已不存在。字符串可还原日志契约与 CLI（--slide/--site/--timer），但 UAF 窗口、页回收顺序、cred 偏移这些时序型原语无法从字符串复原；写一个只对得上字符串的空壳会让等价性门禁变成假阳性，因此不做。",
-      "action": "维持预编译件，接受「不可重建」这一事实；台账与 README 明确标注。若要闭环，只有两条路：找回原始 .c，或从反汇编重做（按周计）。",
+      "usedBy": "core/AssetDeployer.RUNTIME_ASSETS（主利用：POSIX CPU timer UAF → cred 植入 → rootd）",
+      "status": "upstream-built",
+      "action": "由上游 MIT 源码交叉编译后替换（见 tools/xring.lock.properties 与 tools/build_xring.sh）",
       "contract": {
         "cli": [
           "--slide",
@@ -77,43 +77,30 @@
     {
       "name": "slide_probe",
       "path": "app/src/main/assets/slide_probe",
-      "size": 1169368,
-      "gitBlobSha1": "9ce260c0235c1de6f12a6a15f73e81f52be1a309",
-      "sha256": "d720831c064377e8e5149c296a316758b8c26db7b499eb5111e5a2299e46ed15",
+      "size": 35352,
+      "gitBlobSha1": "09742d64ce2a94de40f5199ee3b0deb578abfe32",
+      "sha256": "8b3681cbd2966eefe5a800b8964e58253ff338b37bffe997b4d891933c8c9e3c",
       "origin": "upstream-source",
       "sourceDraft": "Lw5959/xring-cve-2026-98260@8b404774/src/xr98260_slide_probe.c",
+      "license": "MIT",
       "inApk": true,
-      "usedBy": "core/AssetDeployer.RUNTIME_ASSETS（tracefs 触发器测 KASLR 位移）",
+      "usedBy": "core/AssetDeployer.RUNTIME_ASSETS（tracefs 二进制记录扫描求 KASLR slide）",
       "status": "upstream-built",
-      "action": "2026-11-22 由上游 MIT 源码编译后替换（见 tools/xring.lock.properties）",
-      "license": "MIT"
-    },
-    {
-      "name": "perf_slide",
-      "path": "app/src/main/assets/perf_slide",
-      "size": 37376,
-      "gitBlobSha1": "f2055fa09c0d3838dc1a9ad8175fc169fac35dd7",
-      "sha256": "be977d32d3def2fe6673403f4fd92626af8fe68eb1439f7d5fca49f723d89aca",
-      "origin": "rebuilt-from-source",
-      "sourceDraft": "plant/perf_slide.c",
-      "inApk": true,
-      "usedBy": "core/AssetDeployer.RUNTIME_ASSETS（软件/硬件 perf 采样 + profile 投票求 slide）",
-      "status": "rebuilt",
-      "action": "2026-11-22 由 plant/perf_slide.c 交叉编译后替换"
+      "action": "由上游 MIT 源码交叉编译后替换"
     },
     {
       "name": "pc98260-su",
       "path": "app/src/main/assets/pc98260-su",
-      "size": 1017552,
-      "gitBlobSha1": "dfdd30e2472429663437b2030775ae4299a89daf",
-      "sha256": "d43c06eea8f4864da871017bc9733751183d2bd03ceedec99dcddc7c8fd742ae",
+      "size": 26616,
+      "gitBlobSha1": "99f2323ab4af1d6798567c1fb07c86f3b04f9a88",
+      "sha256": "231cf185d2808b66c9fd7cc45c00ab5a0fa4b7fa588f96e06587af8ee390fdd2",
       "origin": "upstream-source",
       "sourceDraft": "Lw5959/xring-cve-2026-98260@8b404774/src/pc98260_su.c",
+      "license": "MIT",
       "inApk": true,
-      "usedBy": "core/AssetDeployer.RUNTIME_ASSETS（连 rootd 执行命令）",
+      "usedBy": "core/AssetDeployer.RUNTIME_ASSETS（连 rootd 执行命令，uint32 长度前缀协议）",
       "status": "upstream-built",
-      "action": "2026-11-22 由上游 MIT 源码编译后替换（见 tools/xring.lock.properties）",
-      "license": "MIT"
+      "action": "由上游 MIT 源码交叉编译后替换"
     },
     {
       "name": "lhasa_profile.txt",
@@ -124,7 +111,7 @@
       "origin": "in-repo-data",
       "sourceDraft": null,
       "inApk": true,
-      "usedBy": "core/AssetDeployer.RUNTIME_ASSETS（内核特征数据，perf_slide 也读它做 profile 匹配）",
+      "usedBy": "core/AssetDeployer.RUNTIME_ASSETS（内核链接期常量表，覆盖 3 个 OTA）",
       "status": "data",
       "action": "保持；导出日志已由 LogRedactor 脱敏"
     }
