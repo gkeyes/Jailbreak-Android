@@ -3,10 +3,10 @@
 #
 # 用法：tools/build_xring.sh <输出目录>
 #
-# 关键：不用上游的 src/xr98260_profiles.c（它只认作者手上那两条内核），
-# 而是先用 tools/gen_xr_profiles.py 从 app/src/main/assets/lhasa_profile.txt
-# 生成本机支持的 profile 表，再和开源码一起编译。这样产物与原件
-# （读同一份 profile 文件）行为一致，OTA 换内核只需改文件里的一行。
+# 关键：不用上游的 src/xr98260_profiles.c（它只认作者手上那两条内核，且匹配不到
+# 就 exit 2），而是先用 tools/gen_xr_profiles.py 从
+# app/src/main/assets/lhasa_profile.txt 生成 profile 表，再和开源码一起编译。
+# 生成的表匹配不到内核时只警告并退回最新一条，不阻止运行。
 #
 # 编译选项与自有产物一致：-s 去符号、--gc-sections 砍死代码、关 unwind 表。
 set -euo pipefail
@@ -54,11 +54,22 @@ if [ ! -d "$SRC" ]; then
 fi
 echo "源码目录 $SRC"
 
-# 生成的 profile 表放到源码目录旁边，头文件按相对路径引用
 GEN="$CACHE/gen-$COMMIT"
 mkdir -p "$GEN"
 cp "$SRC/src/xr98260_profiles.h" "$GEN/"
 python3 "$ROOT/tools/gen_xr_profiles.py" "$PROFILE" "$GEN/xr98260_profiles.c"
+
+# 自检：表里必须至少有当前内核；没有就说明 profile 文件格式变了，别默默编出个次品。
+count=$(grep -c '\.id = "l' "$GEN/xr98260_profiles.c" || true)
+kernel=$(uname -r 2>/dev/null || echo "")
+echo "profile 条数=$count 当前内核=$kernel"
+if [ "${count:-0}" -lt 1 ]; then
+  echo "生成的 profile 表为空" >&2
+  exit 1
+fi
+if [ -n "$kernel" ] && ! grep -q -- "$kernel" "$GEN/xr98260_profiles.c"; then
+  echo "提示：当前内核不在生成表内，产物运行时会退回最新一条并打警告"
+fi
 
 CFLAGS=(-target aarch64-linux-musl -std=gnu11 -O2 -static -s -pthread
         -ffunction-sections -fdata-sections -Wl,--gc-sections
