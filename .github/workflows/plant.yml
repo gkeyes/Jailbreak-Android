@@ -1,9 +1,12 @@
 name: plant
 
-# plant/ 下的自有 C 源码：交叉编译 + 与原件/基线的等价性验证。
+# plant/ 下的自有 C 源码：交叉编译 + 与原件基线的等价性验证。
 #
 # 默认只读。唯一会写仓库的是 publish job：提交信息里带 [publish] 才会跑。
-# publish 自己编译，不依赖 Artifact 存储（配额满时 upload 会静默失败）。
+#
+# 基线语义（重要）：
+#   plant/equiv/<名字>.json 记录的是「首次替换前**原件**」的指纹，一经归档不再覆盖。
+#   所以 publish 会先用 git 把原件从历史恢复出来 → 归档基线 → 才用新产物覆盖 assets。
 
 on:
   push:
@@ -122,6 +125,8 @@ jobs:
       issues: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: 安装 zig
         run: |
@@ -142,13 +147,23 @@ jobs:
             ls -l "$RUNNER_TEMP/out/$name"
           done
 
-      - name: 归档原件基线
+      - name: 恢复原件（用于归档基线）
+        run: |
+          set -e
+          # 8c7de444 是首次把自有产物写进 assets 的提交；它的父提交里是原件
+          for name in reach_probe slide_probe perf_slide pc98260-su; do
+            git show "8c7de4445ed5525c5742c0b3cb35b6b4472b1b4a^:app/src/main/assets/$name" \
+              > "app/src/main/assets/$name"
+            echo "restored $name from history ($(wc -c < "app/src/main/assets/$name") bytes)"
+          done
+
+      - name: 归档原件基线（已存在则跳过）
         run: |
           set -e
           python3 tools/equiv.py baseline
           ls -l plant/equiv/
 
-      - name: 覆盖 assets
+      - name: 覆盖 assets（换成新的自有产物）
         run: |
           set -e
           for name in reach_probe slide_probe perf_slide pc98260-su; do
@@ -201,7 +216,7 @@ jobs:
             echo "没有变化，跳过提交"
             exit 0
           fi
-          git commit -m "feat(assets): 四个探针改为自有源码构建产物 [apk] [release]"
+          git commit -m "feat(assets): 探针产物与原件基线归档"
           git push
 
       - name: 失败时把日志写进 issue
@@ -214,11 +229,9 @@ jobs:
           {
             echo "commit: \`$GITHUB_SHA\`"
             echo
-            echo "publish job 失败。产物目录："
             echo '```text'
             ls -lR "$RUNNER_TEMP/out" 2>/dev/null || echo "（无产物）"
             echo '```'
-            echo "工作树状态："
             echo '```text'
             git status --short 2>/dev/null | head -20 || true
             echo '```'
@@ -237,16 +250,6 @@ jobs:
           python3 - <<'PY'
           import collections, pathlib, re, os
 
-          KNOWN = {
-              0xffffffc08042aa68: "profile timer",
-              0xffffffc08026c02c: "profile cred",
-              0xffffffc082959630: "profile selinux",
-              0xffffffc0826d10d8: "profile userns",
-              0xffffffc0826d1388: "profile rootuser",
-              0xffffffc0826d2a48: "profile groups",
-              0xffffffc0826d2f08: "profile ucounts",
-              0xffffffc0801f2ec8: "profile task_site",
-          }
           LO, HI = 0xffffff8000000000, 0xffffffff00000000
           BASE = pathlib.Path("app/src/main/assets")
           TARGETS = ["uaf_plant_replay", "perf_slide", "slide_probe", "pc98260-su", "reach_probe"]
@@ -270,8 +273,8 @@ jobs:
                           hits[value] = [off, 1]
               rows = sorted(hits.items(), key=lambda kv: -kv[1][1])
               out += ["## " + name, "", "`" + str(len(data)) + "` bytes，立即数 " + str(len(hits)) + " 个。", ""]
-              for value, (off, count) in rows[:120]:
-                  out.append("| `0x" + format(value, "016x") + "` | `0x" + format(off, "x") + "` | " + str(count) + " | " + KNOWN.get(value, "") + " |")
+              for value, (off, count) in rows[:80]:
+                  out.append("| `0x" + format(value, "016x") + "` | `0x" + format(off, "x") + "` | " + str(count) + " |")
               out.append("")
               strings = [s.decode("ascii", "replace") for s in re.findall(rb"[ -~]{6,}", data)]
               marks = [s for s in strings if any(k in s.lower() for k in KEYWORDS)]
