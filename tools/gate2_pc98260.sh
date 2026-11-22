@@ -1,25 +1,24 @@
 #!/system/bin/sh
-# 闸 2（pc98260-su）：只用失败路径做等价性比对，不碰 rootd、不碰内核。
+# 闸 2（pc98260-su）：只比「连接失败」与「参数解析」，不碰 rootd、不碰内核。
 #
 # 背景：rootd 是 uaf_plant_replay 在已经被 UAF 污染的堆上起的临时通道。
 # 去连它发命令 = 复用不稳定的内核状态，实测会让设备 panic 重启（2026-11-22）。
-# 所以这个客户端只比「连接失败」与「参数解析」两条路径：
+#
+# 现在 pc98260-su 由上游 MIT 源码构建（tools/build_xring.sh），这条闸的意义
+# 变成「协议是否与原件一致」：长度前缀那段就是在这种比对里发现漏掉的。
 #
 #   用例 1  PC98260_SOCK 指向不存在的 socket + -c id
-#   用例 2  不带参数            → usage 行
-#   用例 3  -h                  → usage 行
+#   用例 2  不带参数 → usage
+#   用例 3  -h        → usage
 #
-# 全程只写 $WORK（默认 /data/local/tmp/gate2），不需要 root、不起监听、不读 tracefs。
-#
-# 用法：gate2_pc98260.sh [原件路径] [重建件路径]
-#   默认 /data/local/tmp/plant/orig/pc98260-su 与 .../new/pc98260-su
-#
-# 注意：它只验证参数解析与连接失败路径；真正跑通还要走 App 的真实入口。
+# 用法：gate2_pc98260.sh [原件路径] [新件路径]
+#   默认 原件 /data/local/tmp/plant/orig/pc98260-su
+#        新件 /data/local/tmp/pc98260-su（App 部署的那份）
 
 set -u
 
 ORIG="${1:-/data/local/tmp/plant/orig/pc98260-su}"
-NEW="${2:-/data/local/tmp/plant/new/pc98260-su}"
+NEW="${2:-/data/local/tmp/pc98260-su}"
 WORK="${WORK:-/data/local/tmp/gate2}"
 OUT="$WORK/logs"
 
@@ -91,7 +90,7 @@ run_case usage-help "$ORIG" "$NEW" -h || fail=1
 echo
 echo "日志目录：$OUT"
 if [ "$fail" -eq 0 ]; then
-	echo "闸 2（pc98260-su 失败路径）全部通过"
+	echo "闸 2（pc98260-su 协议）全部通过"
 else
 	echo "闸 2 有差异，先看 .diff"
 fi
