@@ -36,12 +36,20 @@
       "size": 88488,
       "gitBlobSha1": "4e8fa96f280c832dc185818c9dda6bf15f280165",
       "sha256": null,
-      "origin": "prebuilt-no-source",
+      "origin": "prebuilt-source-lost",
       "sourceDraft": null,
       "inApk": true,
-      "usedBy": "core/AssetDeployer.RUNTIME_ASSETS（主利用）",
-      "status": "black-box",
-      "action": "plant/ 下没有对应源码。要么补 .c 并交叉编译 + 等价性验证，要么明确标注为不可重建产物"
+      "usedBy": "core/AssetDeployer.RUNTIME_ASSETS（主利用：page-cache 流式喷 + UAF 抓页 + cred/selinux 修复 + rootd）",
+      "status": "unrecoverable-source",
+      "decision": "2026-11-22：原始源码目录（lhasa_port/plant）在本机已不存在。字符串可还原日志契约与 CLI（--slide/--site/--timer），但 UAF 窗口、页回收顺序、cred 偏移这些时序型原语无法从字符串复原；写一个只对得上字符串的空壳会让等价性门禁变成假阳性，因此不做。",
+      "action": "维持预编译件，接受「不可重建」这一事实；台账与 README 明确标注。若要闭环，只有两条路：找回原始 .c，或从反汇编重做（按周计）。",
+      "contract": {
+        "cli": ["--slide", "--site", "--timer"],
+        "logFile": "/data/local/tmp/uaf_replay.log",
+        "socket": "/data/local/tmp/pc98260-root.sock",
+        "profile": "/data/local/tmp/lhasa_profile.txt",
+        "stages": ["stream", "uaf", "cred", "selinux", "rootd"]
+      }
     },
     {
       "name": "reach_probe",
@@ -49,12 +57,12 @@
       "size": 51368,
       "gitBlobSha1": "673fd33c7a4dfa749742e56b944dc857fd40eb6b",
       "sha256": null,
-      "origin": "prebuilt-with-draft-source",
+      "origin": "prebuilt-with-source",
       "sourceDraft": "plant/reach_probe.c",
       "inApk": true,
       "usedBy": "core/AssetDeployer.RUNTIME_ASSETS（接口可达性诊断）",
-      "status": "draft-source-unlinked",
-      "action": "接入 app 构建（plant.yml 产物 → assets），替换后加等价性验证"
+      "status": "source-equivalent-static",
+      "action": "静态锚点已全部通过（表格格式 + 接口清单 + OK/FAIL 汇总段）；待设备侧跑一次比对输出后替换"
     },
     {
       "name": "slide_probe",
@@ -62,12 +70,12 @@
       "size": 44776,
       "gitBlobSha1": "022326460fb7ab31f6c0af7ccd34cccf37b276eb",
       "sha256": null,
-      "origin": "prebuilt-with-draft-source",
+      "origin": "prebuilt-with-source",
       "sourceDraft": "plant/slide_probe.c",
       "inApk": true,
-      "usedBy": "core/AssetDeployer.RUNTIME_ASSETS（KASLR 位移）",
-      "status": "draft-source-unlinked",
-      "action": "同上"
+      "usedBy": "core/AssetDeployer.RUNTIME_ASSETS（tracefs 触发器测 KASLR 位移）",
+      "status": "source-equivalent-static",
+      "action": "3 个日志锚点全中；待设备侧比对 trace 输出后替换"
     },
     {
       "name": "perf_slide",
@@ -75,12 +83,12 @@
       "size": 31840,
       "gitBlobSha1": "9aec90ed6e3fb91af5ea4800ab1895b9f87d9072",
       "sha256": null,
-      "origin": "prebuilt-with-draft-source",
+      "origin": "prebuilt-with-source",
       "sourceDraft": "plant/perf_slide.c",
       "inApk": true,
-      "usedBy": "core/AssetDeployer.RUNTIME_ASSETS",
-      "status": "draft-source-unlinked",
-      "action": "同上"
+      "usedBy": "core/AssetDeployer.RUNTIME_ASSETS（硬件 PMU 采样投票）",
+      "status": "source-equivalent-static",
+      "action": "5 个日志锚点全中；待设备侧比对采样输出后替换"
     },
     {
       "name": "pc98260-su",
@@ -88,12 +96,12 @@
       "size": 28416,
       "gitBlobSha1": "4c37dd5341b15daf1f9f159da7ccbeb853b6b7d1",
       "sha256": null,
-      "origin": "prebuilt-with-draft-source",
+      "origin": "prebuilt-with-source",
       "sourceDraft": "plant/pc98260-su.c",
       "inApk": true,
-      "usedBy": "core/AssetDeployer.RUNTIME_ASSETS（提权后连 root 服务的客户端）",
-      "status": "draft-source-unlinked",
-      "action": "同上"
+      "usedBy": "core/AssetDeployer.RUNTIME_ASSETS（连 rootd 执行命令）",
+      "status": "source-equivalent-static",
+      "action": "字符串表已逐条对齐（PC98260_SOCK / usage / connect root daemon / /dev/null）；建议第一个做设备侧替换"
     },
     {
       "name": "lhasa_profile.txt",
@@ -106,7 +114,7 @@
       "inApk": true,
       "usedBy": "core/AssetDeployer.RUNTIME_ASSETS（内核特征数据）",
       "status": "data",
-      "action": "保持；若含设备指纹，导出日志时脱敏"
+      "action": "保持；导出日志已由 LogRedactor 脱敏"
     }
   ]
 }
