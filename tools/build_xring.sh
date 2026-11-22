@@ -3,12 +3,18 @@
 #
 # 用法：tools/build_xring.sh <输出目录>
 #
-# 关键：不用上游的 src/xr98260_profiles.c（它只认作者手上那两条内核，且匹配不到
-# 就 exit 2），而是先用 tools/gen_xr_profiles.py 从
+# 关键：不用上游的 src/xr98260_profiles.c（只认作者手上那两条内核，且匹配不到就
+# exit 2），而是先用 tools/gen_xr_profiles.py 从
 # app/src/main/assets/lhasa_profile.txt 生成 profile 表，再和开源码一起编译。
 # 生成的表匹配不到内核时只警告并退回最新一条，不阻止运行。
 #
-# 编译选项与自有产物一致：-s 去符号、--gc-sections 砍死代码、关 unwind 表。
+# 主利用选 xring_plant_realcred.c：它是 timer-UAF 主链
+#   --slide 0x…                 全链：task → selinux → cred → rootd
+#   --slide 0x… --task-only     只漏 task_struct
+#   --slide 0x… --selinux-only  只清 selinux_state.enforcing
+#   --slide 0x… --kptr-test     只测 kptr_restrict
+# 构建需要 pc98260_rootd.c（rootd 驻留进程）。
+# 注意：exploit-android-*.c 是另一条路径（要求 --target，且要 4K 页），不要用。
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -59,7 +65,6 @@ mkdir -p "$GEN"
 cp "$SRC/src/xr98260_profiles.h" "$GEN/"
 python3 "$ROOT/tools/gen_xr_profiles.py" "$PROFILE" "$GEN/xr98260_profiles.c"
 
-# 自检：表里必须至少有当前内核；没有就说明 profile 文件格式变了，别默默编出个次品。
 count=$(grep -c '\.id = "l' "$GEN/xr98260_profiles.c" || true)
 kernel=$(uname -r 2>/dev/null || echo "")
 echo "profile 条数=$count 当前内核=$kernel"
@@ -67,14 +72,11 @@ if [ "${count:-0}" -lt 1 ]; then
   echo "生成的 profile 表为空" >&2
   exit 1
 fi
-if [ -n "$kernel" ] && ! grep -q -- "$kernel" "$GEN/xr98260_profiles.c"; then
-  echo "提示：当前内核不在生成表内，产物运行时会退回最新一条并打警告"
-fi
 
 CFLAGS=(-target aarch64-linux-musl -std=gnu11 -O2 -static -s -pthread
         -ffunction-sections -fdata-sections -Wl,--gc-sections
         -fno-asynchronous-unwind-tables -fno-unwind-tables
-        -I"$GEN")
+        -I"$GEN" -I"$SRC/src")
 
 echo "== slide_probe（tracefs 二进制记录扫描）"
 zig cc "${CFLAGS[@]}" \
@@ -87,9 +89,10 @@ zig cc "${CFLAGS[@]}" \
   "$SRC/src/pc98260_su.c" \
   -o "$OUT/pc98260-su"
 
-echo "== uaf_plant_replay（早期单文件变体，CLI 与 App 现有调用一致）"
+echo "== uaf_plant_replay（timer-UAF 主链 + rootd）"
 zig cc "${CFLAGS[@]}" \
-  "$SRC/src/exploit-android-perf.c" \
+  "$SRC/src/xring_plant_realcred.c" \
+  "$SRC/src/pc98260_rootd.c" \
   "$GEN/xr98260_profiles.c" \
   -o "$OUT/uaf_plant_replay"
 
