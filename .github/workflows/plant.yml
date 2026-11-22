@@ -3,8 +3,6 @@ name: plant
 # plant/ 下的自有 C 源码：交叉编译 + 与预编译件的等价性验证。
 #
 # 只读：所有结果作为 Artifact 产出，仓库里不留 CI 生成物。
-# 基线的建立（equiv.py baseline）是显式动作，产物需人工提交到 plant/equiv/，
-# 这样「标准答案」永远在版本库里、可 review，不会由 CI 自己写出来。
 
 on:
   push:
@@ -47,11 +45,16 @@ jobs:
             echo "plant/ 下还没有源码。"
             exit 0
           fi
+          # -s 去符号表，-ffunction-sections/gc-sections 砍死代码：
+          # 原件是 stripped 的 musl 静态件（28–51 KB），不 strip 会到 1 MB，体积门槛就没意义了。
+          CFLAGS=(-target aarch64-linux-musl -O2 -static -s
+                  -ffunction-sections -fdata-sections -Wl,--gc-sections
+                  -fno-asynchronous-unwind-tables -fno-unwind-tables -pthread)
           for src in "${files[@]}"; do
             out="$RUNNER_TEMP/out/$(basename "${src%.c}")"
             echo "== zig cc $src -> $out"
-            zig cc -target aarch64-linux-musl -O2 -static -pthread "$src" -o "$out"
-            file "$out"
+            zig cc "${CFLAGS[@]}" "$src" -o "$out"
+            ls -l "$out"
           done
 
       - name: 等价性验证
@@ -59,6 +62,19 @@ jobs:
           set -uo pipefail
           python3 tools/equiv.py check-dir "$RUNNER_TEMP/out" 2>&1 | tee "$RUNNER_TEMP/equiv.log"
           exit "${PIPESTATUS[0]}"
+
+      - name: 导出字符串表
+        if: always()
+        run: |
+          set -uo pipefail
+          mkdir -p "$RUNNER_TEMP/strings"
+          for name in uaf_plant_replay reach_probe slide_probe perf_slide pc98260-su; do
+            src="app/src/main/assets/$name"
+            [ -f "$src" ] && strings -n 4 "$src" | sort -u > "$RUNNER_TEMP/strings/$name.orig.txt"
+            [ -f "$RUNNER_TEMP/out/$name" ] && \
+              strings -n 4 "$RUNNER_TEMP/out/$name" | sort -u > "$RUNNER_TEMP/strings/$name.rebuilt.txt"
+          done
+          wc -l "$RUNNER_TEMP"/strings/*.txt
 
       - name: 上传产物
         if: always()
@@ -68,6 +84,7 @@ jobs:
           path: |
             ${{ runner.temp }}/out/*
             ${{ runner.temp }}/equiv.log
+            ${{ runner.temp }}/strings/*.txt
           if-no-files-found: ignore
 
   baseline:
