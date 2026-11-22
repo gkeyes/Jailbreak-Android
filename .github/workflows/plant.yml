@@ -37,27 +37,36 @@ jobs:
 
       - name: 编译 plant/*.c
         run: |
-          set -euo pipefail
+          set -uo pipefail
           shopt -s nullglob
+          LOG="$RUNNER_TEMP/compile.log"
+          : > "$LOG"
           files=(plant/*.c)
           mkdir -p "$RUNNER_TEMP/out"
           if [ ${#files[@]} -eq 0 ]; then
-            echo "plant/ 下还没有源码。"
+            echo "plant/ 下还没有源码。" | tee -a "$LOG"
             exit 0
           fi
           # -s 去符号表，-ffunction-sections/gc-sections 砍死代码：
-          # 原件是 stripped 的 musl 静态件（28–51 KB），不 strip 会到 1 MB，体积门槛就没意义了。
+          # 原件是 stripped 的 musl 静态件（28–51 KB），不 strip 会到 1 MB。
           CFLAGS=(-target aarch64-linux-musl -O2 -static -s
                   -ffunction-sections -fdata-sections -Wl,--gc-sections
                   -fno-asynchronous-unwind-tables -fno-unwind-tables -pthread)
+          status=0
           for src in "${files[@]}"; do
             out="$RUNNER_TEMP/out/$(basename "${src%.c}")"
-            echo "== zig cc $src -> $out"
-            zig cc "${CFLAGS[@]}" "$src" -o "$out"
-            ls -l "$out"
+            echo "== zig cc $src -> $out" | tee -a "$LOG"
+            if zig cc "${CFLAGS[@]}" "$src" -o "$out" 2>&1 | tee -a "$LOG"; then
+              ls -l "$out" | tee -a "$LOG"
+            else
+              echo "::error::编译失败 $src"
+              status=1
+            fi
           done
+          exit $status
 
       - name: 等价性验证
+        if: always()
         run: |
           set -uo pipefail
           python3 tools/equiv.py check-dir "$RUNNER_TEMP/out" 2>&1 | tee "$RUNNER_TEMP/equiv.log"
@@ -84,6 +93,7 @@ jobs:
           path: |
             ${{ runner.temp }}/out/*
             ${{ runner.temp }}/equiv.log
+            ${{ runner.temp }}/compile.log
             ${{ runner.temp }}/strings/*.txt
           if-no-files-found: ignore
 
