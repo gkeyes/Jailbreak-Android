@@ -31,9 +31,6 @@ import rikka.shizuku.Shizuku;
 /**
  * Host for the Miuix console. ComponentActivity is required because AbstractComposeView resolves
  * ViewTreeLifecycleOwner and ViewTreeSavedStateRegistryOwner from the view tree.
- *
- * The primary action is never hard-disabled by Shizuku state: tapping it walks the user through
- * starting Shizuku and granting access, then runs the workflow.
  */
 public final class ConsoleActivity extends ComponentActivity
         implements WorkflowCallbacks, FoldConsoleView.Listener {
@@ -43,11 +40,16 @@ public final class ConsoleActivity extends ComponentActivity
     private static final long AUTO_KSU_DELAY_MS = 600L;
 
     /**
+     * 完整框架重启：zygote 会全新拉起，Zygisk 因此在 zygote 启动时重新注入，
+     * LSPosed 随之生效。只 `ctl.restart zygote` 不会重建这套注入链。
+     */
+    private static final String SOFT_REBOOT_COMMAND = "/system/bin/su -c 'stop; start'";
+
+    /**
      * 可安全清理的运行产物。
      *
-     * 注意 `.lhasa_failed_boot` **不在**这里：它是「本次开机已经动过内核」的唯一记录，
+     * `.lhasa_failed_boot` **不在**这里：它是「本次开机已经动过内核」的唯一记录，
      * 一旦在本次开机内被删掉，再点主按钮就可能对已释放节点二次 rb_erase 打 panic。
-     * 它重启后自然失效，不需要也不允许手动清除。
      */
     private static final String CLEAN_TARGETS =
             "uaf_replay.log diag.log ksu_try.log .lhasa_stage";
@@ -59,10 +61,6 @@ public final class ConsoleActivity extends ComponentActivity
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final StringBuilder sessionLog = new StringBuilder();
 
-    /**
-     * 监听力必须持有引用才能注销。方法引用每次求值都是新对象，
-     * removeXxxListener 拿它比对必然失败——这是之前注销不掉的根本原因。
-     */
     private final Shizuku.OnBinderReceivedListener binderReceivedListener =
             () -> refreshAuthorization();
     private final Shizuku.OnBinderDeadListener binderDeadListener =
@@ -85,8 +83,6 @@ public final class ConsoleActivity extends ComponentActivity
     private boolean shizukuAlive;
     private boolean shizukuGranted;
     private boolean keepScreenOn = true;
-    /** 自动接管只做一次，避免状态回调把流程反复拉起。 */
-    private boolean autoKsuArmed;
     private long startAt;
 
     private final Runnable ticker = new Runnable() {
@@ -296,8 +292,10 @@ public final class ConsoleActivity extends ComponentActivity
                         + "; do [ -e \"$f\" ] && rm -f \"$f\"; done; true", "临时文件已清理");
                 break;
             case SOFT_REBOOT:
-                confirm("软重启", "将重启系统框架，未保存的内容可能丢失。", () ->
-                        maintenance("kill -9 $(pidof system_server)", "软重启指令已提交"));
+                confirm("软重启（重载框架）",
+                        "会停止并重新启动全部 Android 服务：zygote 重新拉起，"
+                                + "Zygisk/LSPosed 因此重新注入。\n屏幕会黑几秒，请勿中断。",
+                        () -> maintenance(SOFT_REBOOT_COMMAND, "已提交框架重启"));
                 break;
             case REBOOT:
                 confirm("重启设备", "本次开机取得的临时 ROOT 会失效。", () ->
@@ -310,7 +308,9 @@ public final class ConsoleActivity extends ComponentActivity
                                 + "2. 接口诊断确认环境\n"
                                 + "3. 一键临时 ROOT：拿到临时 root 后会自动接管 KernelSU\n"
                                 + "4. 接管会 late-load 内核模块，这是最容易触发重启的一步\n"
-                                + "5. 重启后临时 ROOT 失效，需要重新执行")
+                                + "5. 软重启会重载框架，Zygisk/LSPosed 随之重新注入；\n"
+                                + "   若仍不生效，用内核管理器里热重启模块的动作（会额外重建 lspd/zygiskd）\n"
+                                + "6. 重启后临时 ROOT 失效，需要重新执行")
                         .setPositiveButton("知道了", null)
                         .show();
                 break;
@@ -479,7 +479,6 @@ public final class ConsoleActivity extends ComponentActivity
                     privilege = "临时 ROOT";
                     handler.removeCallbacks(ticker);
                     // 临时 ROOT 就绪 → 自动接管 KernelSU，不再让用户点第二次。
-                    autoKsuArmed = true;
                     handler.removeCallbacks(autoKsu);
                     handler.postDelayed(autoKsu, AUTO_KSU_DELAY_MS);
                     break;
@@ -491,7 +490,6 @@ public final class ConsoleActivity extends ComponentActivity
                 case COMPLETE:
                     running = false;
                     privilege = "KernelSU 已接管";
-                    autoKsuArmed = false;
                     handler.removeCallbacks(autoKsu);
                     handler.removeCallbacks(ticker);
                     break;
