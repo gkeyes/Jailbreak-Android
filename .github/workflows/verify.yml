@@ -2,17 +2,8 @@ name: verify
 
 # 只读校验：资产台账 + 单测 + 组装 debug APK。
 #
-# 写权限只有 issues: 写，且只在失败时用它把日志写进一条 issue——
-# CI 日志在 MCP 侧取不到，落在 issue 里才能被程序读到。
-# 仓库内容零写入。
-#
-# 关于 Artifact：免费额度 500 MB，之前每次 push 都存一个 44 MB 的 debug APK，
-# 配额满了之后 upload-artifact 一律 403，把整个 job 拖成红的（而构建其实是好的）。
-# 所以：
-#   1. APK 只在 workflow_dispatch 或提交信息含 [apk] 时上传；
-#   2. 两个上传都 continue-on-error —— 存不下是配额问题，不该掩盖构建结果；
-#   3. retention-days: 2，新产物不再长期占空间。
-# 老产物需要在 Actions 页面手动清理一次。
+# 唯一的写权限是 issues：写，且只在失败时用它把日志写进一条 issue——
+# CI 日志在 MCP 侧取不到，落在 issue 里才能被程序读到。仓库内容零写入。
 
 on:
   push:
@@ -69,6 +60,7 @@ jobs:
           if-no-files-found: warn
           retention-days: 2
       - name: 失败时把日志写进 issue
+        id: report
         if: failure()
         env:
           GH_TOKEN: ${{ github.token }}
@@ -92,9 +84,15 @@ jobs:
             echo "upload APK    = ${OUT_UPLOAD_APK}"
             echo "upload logs   = ${OUT_UPLOAD_LOGS}"
             echo '```'
+            echo "### 报错行"
+            echo '```text'
+            grep -nE '(^e: |error:|FAILURE:|Caused by:|What went wrong|> Task .* FAILED|BUILD FAILED)' \
+              "$RUNNER_TEMP/verify.log" "$RUNNER_TEMP/test.log" "$RUNNER_TEMP/build.log" 2>/dev/null | head -60 \
+              || echo "（没有匹配的报错行）"
+            echo '```'
             echo "### verify.sh 输出（结尾）"
             echo '```text'
-            tail -c 14000 "$RUNNER_TEMP/verify.log" 2>/dev/null || echo "（无 verify.log）"
+            tail -c 12000 "$RUNNER_TEMP/verify.log" 2>/dev/null || echo "（无 verify.log）"
             echo '```'
           } > "$body"
           gh issue create --title "$title" --body-file "$body" \
