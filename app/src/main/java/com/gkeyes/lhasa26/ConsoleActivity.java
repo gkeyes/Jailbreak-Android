@@ -39,6 +39,8 @@ public final class ConsoleActivity extends ComponentActivity
         implements WorkflowCallbacks, FoldConsoleView.Listener {
 
     private static final int REQUEST_SHIZUKU = 1001;
+    /** 临时 ROOT 就绪后自动接管 KernelSU 的延迟，让 UI 先渲染一次结果。 */
+    private static final long AUTO_KSU_DELAY_MS = 600L;
 
     /**
      * 可安全清理的运行产物。
@@ -83,6 +85,8 @@ public final class ConsoleActivity extends ComponentActivity
     private boolean shizukuAlive;
     private boolean shizukuGranted;
     private boolean keepScreenOn = true;
+    /** 自动接管只做一次，避免状态回调把流程反复拉起。 */
+    private boolean autoKsuArmed;
     private long startAt;
 
     private final Runnable ticker = new Runnable() {
@@ -94,6 +98,20 @@ public final class ConsoleActivity extends ComponentActivity
             elapsed = ((System.currentTimeMillis() - startAt) / 1000) + " s";
             render();
             handler.postDelayed(this, 1000L);
+        }
+    };
+
+    private final Runnable autoKsu = () -> {
+        if (engine == null || running) {
+            return;
+        }
+        if (engine.getState() != WorkflowEngine.State.ROOTED) {
+            return;
+        }
+        status = "已获得临时 ROOT · 自动接管 KernelSU";
+        render();
+        if (engine.retryKernelSu()) {
+            beginRun();
         }
     };
 
@@ -172,8 +190,12 @@ public final class ConsoleActivity extends ComponentActivity
 
     private void refreshActionLabel() {
         WorkflowEngine.State state = engine == null ? WorkflowEngine.State.IDLE : engine.getState();
-        if (state == WorkflowEngine.State.ROOTED || state == WorkflowEngine.State.KSU_PENDING) {
-            actionLabel = "加载 KernelSU";
+        if (state == WorkflowEngine.State.ROOTED) {
+            actionLabel = "接管 KernelSU";
+            return;
+        }
+        if (state == WorkflowEngine.State.KSU_PENDING) {
+            actionLabel = "重试 KernelSU 接管";
             return;
         }
         if (state == WorkflowEngine.State.COMPLETE) {
@@ -243,21 +265,16 @@ public final class ConsoleActivity extends ComponentActivity
                 }
                 WorkflowEngine.State state = engine.getState();
                 if (state == WorkflowEngine.State.COMPLETE) {
-                    // KernelSU 已接管：绝不能再跑一遍 UAF（内核模块已加载，堆状态已变）。
                     toast("已接管 KernelSU，无需再执行；需要记录请先导出日志");
                     status = "已完成 · 如需重做请重启设备后再点";
                     render();
                     break;
                 }
                 if (state == WorkflowEngine.State.ROOTED || state == WorkflowEngine.State.KSU_PENDING) {
-                    confirm("加载 KernelSU",
-                            "会 late-load 加载内核模块，这是整条链里最容易导致重启的一步。\n"
-                                    + "建议先把当前日志导出。确认现在加载？",
-                            () -> {
-                                if (engine.retryKernelSu()) {
-                                    beginRun();
-                                }
-                            });
+                    // 自动接管已内建；这里只是手动补一次，不再弹确认框。
+                    if (engine.retryKernelSu()) {
+                        beginRun();
+                    }
                 } else if (engine.startRoot()) {
                     beginRun();
                 }
@@ -291,8 +308,8 @@ public final class ConsoleActivity extends ComponentActivity
                         .setTitle("使用帮助")
                         .setMessage("1. 点击主按钮：自动打开 Shizuku 并请求授权\n"
                                 + "2. 接口诊断确认环境\n"
-                                + "3. 一键临时 ROOT（这一步跑完就停，不会自动加载 KernelSU）\n"
-                                + "4. 需要常驻再点一次主按钮，会有二次确认\n"
+                                + "3. 一键临时 ROOT：拿到临时 root 后会自动接管 KernelSU\n"
+                                + "4. 接管会 late-load 内核模块，这是最容易触发重启的一步\n"
                                 + "5. 重启后临时 ROOT 失效，需要重新执行")
                         .setPositiveButton("知道了", null)
                         .show();
@@ -458,6 +475,14 @@ public final class ConsoleActivity extends ComponentActivity
                     handler.post(ticker);
                     break;
                 case ROOTED:
+                    running = false;
+                    privilege = "临时 ROOT";
+                    handler.removeCallbacks(ticker);
+                    // 临时 ROOT 就绪 → 自动接管 KernelSU，不再让用户点第二次。
+                    autoKsuArmed = true;
+                    handler.removeCallbacks(autoKsu);
+                    handler.postDelayed(autoKsu, AUTO_KSU_DELAY_MS);
+                    break;
                 case KSU_PENDING:
                     running = false;
                     privilege = "临时 ROOT";
@@ -466,6 +491,8 @@ public final class ConsoleActivity extends ComponentActivity
                 case COMPLETE:
                     running = false;
                     privilege = "KernelSU 已接管";
+                    autoKsuArmed = false;
+                    handler.removeCallbacks(autoKsu);
                     handler.removeCallbacks(ticker);
                     break;
                 case FAILED:
