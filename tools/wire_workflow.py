@@ -2,8 +2,10 @@
 """把 BootGuard / DeployGate 接到 WorkflowEngine 的真实入口。
 
 不用 patch / diff：hunk 行号与行数太容易写错，git apply 会整份拒绝。
-这里改为锚点式替换，每处都断言“恰好命中一次”，不命中就报错退出，绝不静默跳过。
-幂等：已经接过线就只打印状态。
+这里改为锚点式替换，每处断言“恰好命中一次”，不命中就报错退出，绝不静默跳过。
+
+幂等粒度是“逐处”：已替换过的位置（锚点不在但替换结果在）直接跳过，
+新加的替换项仍能补到已经接好线的文件上。
 """
 from __future__ import annotations
 
@@ -103,6 +105,15 @@ REPLACEMENTS: list[tuple[str, str, str]] = [
         '        run(BootGuard.killCommand(), true);\n',
     ),
     (
+        "cleanupBinaries 也改用进程组信号",
+        '            if (!keepRootClient) {\n'
+        '                run("pkill -f uaf_plant_replay 2>/dev/null; true", true);\n'
+        '            }\n',
+        '            if (!keepRootClient) {\n'
+        '                run(BootGuard.killCommand(), true);\n'
+        '            }\n',
+    ),
+    (
         "payloadProcessCount 改用 kill -0",
         '        String output = run("ps -A 2>/dev/null | grep -c \'[u]af_plant_replay\'", true).output.trim();\n'
         '        int count;\n'
@@ -119,19 +130,23 @@ REPLACEMENTS: list[tuple[str, str, str]] = [
 def main() -> int:
     source = TARGET.read_text(encoding="utf-8")
 
-    if "BootGuard.classify" in source and "DeployGate" in source:
-        print("already wired; nothing to do")
-        return 0
-
-    failures: list[str] = []
     applied = 0
+    skipped = 0
+    failures: list[str] = []
+
     for label, needle, replacement in REPLACEMENTS:
         hits = source.count(needle)
-        if hits != 1:
-            failures.append(f"{label}: 命中 {hits} 次（应为 1）")
+        if hits == 1:
+            source = source.replace(needle, replacement)
+            applied += 1
             continue
-        source = source.replace(needle, replacement)
-        applied += 1
+        if hits == 0 and replacement and replacement in source:
+            skipped += 1
+            continue
+        if hits == 0 and not replacement:
+            skipped += 1
+            continue
+        failures.append(f"{label}: 锚点命中 {hits} 次（应为 1）")
 
     if failures:
         for line in failures:
@@ -139,15 +154,18 @@ def main() -> int:
         return 1
 
     TARGET.write_text(source, encoding="utf-8")
-    print(f"wired {applied} sites")
+    print(f"applied={applied} skipped={skipped}")
     print(f"BootGuard.classify: {source.count('BootGuard.classify')}")
     print(f"DeployGate:         {source.count('DeployGate')}")
     print(f"DEPLOY_TIMEOUT_MS:  {source.count('DEPLOY_TIMEOUT_MS')}")
 
-    for leftover in ("containsSuccessMarker", "containsRetryMarker", "pkill -f uaf_plant_replay"):
+    for leftover in ("containsSuccessMarker", "containsRetryMarker",
+                     "pkill -f uaf_plant_replay", "killall uaf_plant_replay"):
         remaining = source.count(leftover)
         if remaining:
-            print(f"::warning::仍残留 {leftover} x{remaining}")
+            print(f"::error::仍残留 {leftover} x{remaining}")
+            return 1
+    print("no leftovers")
     return 0
 
 

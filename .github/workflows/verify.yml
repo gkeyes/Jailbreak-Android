@@ -1,8 +1,10 @@
 name: verify
 
-# 把改动真正接到入口（WorkflowEngine.java），在入口上跑模拟任务验收，
-# 结果写回分支并用 tag 绑定提交。
-# 注意：本文件的注释里不得出现触发器关键字，否则会变成重复键导致整份 YAML 无效。
+# 一个工作流干完三件事，不再拆多个文件：
+#   verify —— 接线、单测、release 编译，结果写回分支并打 tag；
+#   plant  —— zig 交叉编译 plant/*.c，审计 assets 里还没有源码的 ELF。
+# 两个 job 串行，避免同时 push 抢分支。
+# 注意：本文件注释里不得出现触发器关键字。
 
 on:
   push:
@@ -10,6 +12,7 @@ on:
     paths:
       - 'app/**'
       - 'tools/**'
+      - 'plant/**'
       - '.github/workflows/verify.yml'
   workflow_dispatch:
 
@@ -100,14 +103,13 @@ jobs:
             wf=app/src/main/java/com/gkeyes/lhasa26/core/WorkflowEngine.java
             echo "BootGuard.classify  x$(grep -c 'BootGuard.classify' "$wf" 2>/dev/null || echo 0)"
             echo "DeployGate           x$(grep -c 'DeployGate' "$wf" 2>/dev/null || echo 0)"
-            echo "DEPLOY_TIMEOUT_MS    x$(grep -c 'DEPLOY_TIMEOUT_MS' "$wf" 2>/dev/null || echo 0)"
             echo "旧 pkill 路径       x$(grep -c 'pkill -f uaf_plant_replay' "$wf" 2>/dev/null || echo 0)"
             echo '```'
             echo
             echo "## 日志尾部"
             echo
             echo '```text'
-            tail -n 40 test.log 2>/dev/null
+            tail -n 30 test.log 2>/dev/null
             echo '```'
           } > plant/verify-report.md
 
@@ -142,3 +144,94 @@ jobs:
           git tag -f "$tag" "$GITHUB_SHA"
           git push origin "refs/tags/$tag" --force
           echo "tag=$tag"
+
+  plant:
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/p0-clean-boot-retry
+
+      - name: Install zig
+        run: |
+          set -e
+          curl -fsSL -o /tmp/zig.tar.xz https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz
+          tar -xf /tmp/zig.tar.xz -C /tmp
+          echo "/tmp/zig-linux-x86_64-0.13.0" >> "$GITHUB_PATH"
+
+      - name: Audit assets and compile plant sources
+        run: |
+          set +e
+          export PATH="/tmp/zig-linux-x86_64-0.13.0:$PATH"
+          mkdir -p plant/out
+          python3 - > plant/audit.log <<'PY'
+          import pathlib
+          assets = pathlib.Path("app/src/main/assets")
+          sources = {p.name[:-2] for p in pathlib.Path("plant").glob("*.c")}
+          missing = []
+          print(f"{'status':8} {'asset':22} {'size':>10}  source")
+          for path in sorted(assets.iterdir()):
+              if not path.is_file():
+                  continue
+              if path.open("rb").read(4) != b"\x7fELF":
+                  continue
+              has = path.name in sources
+              if not has:
+                  missing.append(path.name)
+              print(f"{'OK' if has else 'MISSING':8} {path.name:22} {path.stat().st_size:>10}  {path.name + '.c' if has else '-'}")
+          print()
+          print(f"合计 {len(missing)} 个资产尚无源码")
+          PY
+          cat plant/audit.log
+          : > plant/build.log
+          failed=0
+          for src in plant/*.c; do
+            [ -e "$src" ] || continue
+            out="plant/out/$(basename "${src%.c}")"
+            echo "== zig cc $src -> $out" >> plant/build.log
+            if zig cc -target aarch64-linux-musl -O2 -static -pthread "$src" -o "$out" >> plant/build.log 2>&1; then
+              file "$out" >> plant/build.log
+            else
+              echo "FAILED $src" >> plant/build.log
+              failed=1
+            fi
+          done
+          ls -l plant/out >> plant/build.log 2>&1
+          echo "failed=$failed" >> plant/build.log
+          {
+            echo "# plant 构建状态"
+            echo
+            echo "- commit: \`${GITHUB_SHA:0:8}\`"
+            echo "- failed: ${failed}"
+            echo
+            echo "## 资产审计"
+            echo
+            echo '```text'
+            cat plant/audit.log
+            echo '```'
+            echo
+            echo "## 编译日志"
+            echo
+            echo '```text'
+            tail -n 80 plant/build.log
+            echo '```'
+          } > plant/build-status.md
+          git config user.name "lhasa-ci"
+          git config user.email "lhasa-ci@users.noreply.github.com"
+          git add plant/build-status.md plant/build.log plant/audit.log
+          if git diff --cached --quiet; then
+            echo "nothing to commit"
+          else
+            git commit -m "plant: 交叉编译结果 failed=${failed} [plant]"
+            git push
+          fi
+          exit $failed
+
+      - name: Upload plant binaries
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: plant-binaries
+          path: plant/out/*
+          if-no-files-found: ignore
