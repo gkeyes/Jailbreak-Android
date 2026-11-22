@@ -40,6 +40,16 @@ public final class ConsoleActivity extends ComponentActivity
 
     private static final int REQUEST_SHIZUKU = 1001;
 
+    /**
+     * 可安全清理的运行产物。
+     *
+     * 注意 `.lhasa_failed_boot` **不在**这里：它是「本次开机已经把节点挂进 rbtree」的唯一记录，
+     * 由 WorkflowEngine 写入并绑定 boot_id。一旦在本次开机内被删掉，再点主按钮就会对已释放
+     * 节点二次 rb_erase，直接把内核打 panic。它重启后自然失效，不需要也不允许手动清除。
+     */
+    private static final String CLEAN_TARGETS =
+            "uaf_replay.log diag.log ksu_try.log .lhasa_stage";
+
     private WorkflowEngine engine;
     private ShizukuExecutor executor;
     private FoldConsoleView console;
@@ -142,6 +152,7 @@ public final class ConsoleActivity extends ComponentActivity
 
     private void refreshAuthorization() {
         runOnUiThread(() -> {
+            boolean wasGranted = shizukuGranted;
             shizukuAlive = Shizuku.pingBinder();
             shizukuGranted = false;
             if (shizukuAlive) {
@@ -154,6 +165,11 @@ public final class ConsoleActivity extends ComponentActivity
             authorization = !shizukuAlive ? "未运行" : (shizukuGranted ? "已授权" : "需要授权");
             refreshActionLabel();
             render();
+            // 先开 App 再授权 Shizuku 的话，onCreate 那次 refreshDeviceInfo 直接 return 了，
+            // 设备/内核信息会一直是占位符。这里补一次。
+            if (shizukuGranted && !wasGranted && "—".equals(kernel) && engine != null) {
+                engine.refreshDeviceInfo();
+            }
         });
     }
 
@@ -261,16 +277,17 @@ public final class ConsoleActivity extends ComponentActivity
                 exportLog();
                 break;
             case CLEAN:
-                maintenance("cd /data/local/tmp 2>/dev/null; for f in uaf_replay.log diag.log ksu_try.log .lhasa_failed_boot .lhasa_stage; "
-                        + "do [ -e \"$f\" ] && rm -f \"$f\"; done; true", "临时文件已清理");
+                // 不动 .lhasa_failed_boot：它是防二次 UAF 的门禁（见 CLEAN_TARGETS 注释）。
+                maintenance("cd /data/local/tmp 2>/dev/null; for f in " + CLEAN_TARGETS
+                        + "; do [ -e \"$f\" ] && rm -f \"$f\"; done; true", "临时文件已清理");
                 break;
             case SOFT_REBOOT:
                 confirm("软重启", "将重启系统框架，未保存的内容可能丢失。", () ->
-                        maintenance("kill -9 $(pidof system_server)", "软重启指令已发送"));
+                        maintenance("kill -9 $(pidof system_server)", "软重启指令已提交"));
                 break;
             case REBOOT:
                 confirm("重启设备", "本次开机取得的临时 ROOT 会失效。", () ->
-                        maintenance("reboot 2>/dev/null || svc power reboot 2>/dev/null", "重启指令已发送"));
+                        maintenance("reboot 2>/dev/null || svc power reboot 2>/dev/null", "重启指令已提交"));
                 break;
             case HELP:
                 new AlertDialog.Builder(this)
@@ -451,7 +468,7 @@ public final class ConsoleActivity extends ComponentActivity
                     break;
                 case COMPLETE:
                     running = false;
-                    privilege = "临时 ROOT";
+                    privilege = "KernelSU 已接管";
                     handler.removeCallbacks(ticker);
                     break;
                 case FAILED:
