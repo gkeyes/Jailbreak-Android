@@ -6,6 +6,9 @@
 # 流程：按 tools/xring.lock.properties 下载 tarball → 校验 sha256 → 解包 →
 #       用 zig cc 交叉编译 → 产物写到 <输出目录>/。
 #
+# 编译选项与自有产物保持一致：-s 去符号表，-ffunction-sections/--gc-sections 砍死代码，
+# 关掉 unwind 表。少了这些，musl 静态件会从 26 KB 涨到 1 MB。
+#
 # 只做本地编译，不接触设备。
 set -euo pipefail
 
@@ -50,8 +53,9 @@ if [ ! -d "$SRC" ]; then
 fi
 echo "源码目录 $SRC"
 
-CFLAGS=(-target aarch64-linux-musl -std=gnu11 -O2 -static -pthread
-        -ffunction-sections -fdata-sections -Wl,--gc-sections)
+CFLAGS=(-target aarch64-linux-musl -std=gnu11 -O2 -static -s -pthread
+        -ffunction-sections -fdata-sections -Wl,--gc-sections
+        -fno-asynchronous-unwind-tables -fno-unwind-tables)
 
 echo "== slide_probe（tracefs 二进制记录扫描）"
 zig cc "${CFLAGS[@]}" \
