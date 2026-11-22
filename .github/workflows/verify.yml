@@ -2,10 +2,17 @@ name: verify
 
 # 只读校验：资产台账 + 单测 + 组装 debug APK。
 #
-# 唯一的写权限是 issues：写，而且**只在失败时**用它把日志尾巴写成一条 issue。
-# 原因很实际：CI 日志只能从网页看，MCP 侧拿不到 Artifact，
-# 失败原因落在 issue 里才能被程序读到。
-# 它不碰仓库内容：没有任何 git 写操作。
+# 写权限只有 issues: 写，且只在失败时用它把日志写进一条 issue——
+# CI 日志在 MCP 侧取不到，落在 issue 里才能被程序读到。
+# 仓库内容零写入。
+#
+# 关于 Artifact：免费额度 500 MB，之前每次 push 都存一个 44 MB 的 debug APK，
+# 配额满了之后 upload-artifact 一律 403，把整个 job 拖成红的（而构建其实是好的）。
+# 所以：
+#   1. APK 只在 workflow_dispatch 或提交信息含 [apk] 时上传；
+#   2. 两个上传都 continue-on-error —— 存不下是配额问题，不该掩盖构建结果；
+#   3. retention-days: 2，新产物不再长期占空间。
+# 老产物需要在 Actions 页面手动清理一次。
 
 on:
   push:
@@ -36,12 +43,10 @@ jobs:
         run: |
           set -o pipefail
           bash tools/ci_verify.sh 2>&1 | tee "$RUNNER_TEMP/verify.log"
-      # 44 MB 的 debug APK 每次 push 都存一份，很快就把 Artifact 配额吃光
-      # （配额满时 upload-artifact 返回 403，表现成"除脚本外全红"）。
-      # 默认只留日志；要 APK 就在提交信息里写 [apk]，或手动触发。
       - name: Upload APK
         id: upload_apk
         if: success() && (github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[apk]'))
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: lhasa26-debug-apk
@@ -51,6 +56,7 @@ jobs:
       - name: Upload logs
         id: upload_logs
         if: always()
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: lhasa26-build-logs
