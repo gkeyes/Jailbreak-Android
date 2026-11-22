@@ -40,7 +40,6 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
     });
     private final Object logLock = new Object();
     private final StringBuilder sessionLog = new StringBuilder();
-    /** payload 输出去重：同一条日志行只进 sessionLog 一次。 */
     private final Set<String> payloadLines = new LinkedHashSet<>();
     private volatile State state = State.IDLE;
     private volatile long startedAt;
@@ -221,7 +220,6 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
         String boot = bootId();
         captureBaseline();
 
-        // 已经持有 KernelSU root 时不要再跑 UAF：内核模块已加载，堆状态与 exploit 假设不同。
         if (rootBeforeRun) {
             clearRunMarker();
             run(BootGuard.clearStageCommand(), true);
@@ -355,6 +353,10 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
         callbacks.onState(state, message);
     }
 
+    /**
+     * KMI 只取「Android 版本 + 内核主次版本」：本机 release 字符串里两者都在。
+     * 现算的好处是 OTA 换主次版本时不用改代码；解析失败回退 android17-6.18。
+     */
     private void runKernelSuStep() {
         try {
             step(6);
@@ -362,7 +364,12 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
             run(BootGuard.markCommand("ksu"), true);
             stageKsudIfNeeded();
             CommandResult load = run("rm -f /data/local/tmp/ksu_try.log; "
-                    + "/data/local/tmp/pc98260-su -c \"cd /data/local/tmp && ./ksud late-load --kmi android17-6.18 --allow-shell --package-name me.weishu.kernelsu\" "
+                    + "r=$(uname -r); "
+                    + "a=$(echo \"$r\" | sed -n 's/.*\\(android[0-9][0-9]*\\).*/\\1/p'); "
+                    + "k=$(echo \"$r\" | cut -d. -f1,2); "
+                    + "kmi=\"${a:-android17}-${k:-6.18}\"; "
+                    + "echo \"kmi=$kmi (from $r)\" >> /data/local/tmp/ksu_try.log; "
+                    + "/data/local/tmp/pc98260-su -c \"cd /data/local/tmp && ./ksud late-load --kmi $kmi --allow-shell --package-name me.weishu.kernelsu\" "
                     + ">> /data/local/tmp/ksu_try.log 2>&1; echo rc=$? >> /data/local/tmp/ksu_try.log; "
                     + "for i in 1 2 3 4 5 6 7 8 9 10; do /system/bin/su -c id >> /data/local/tmp/ksu_try.log 2>&1 && break; sleep 0.3; done", true);
             String log = run("cat /data/local/tmp/ksu_try.log 2>/dev/null", true).output;
