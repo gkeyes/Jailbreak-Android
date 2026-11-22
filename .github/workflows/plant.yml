@@ -2,8 +2,12 @@ name: plant
 
 # plant/ 下的自有 C 源码：交叉编译 + 与原件/基线的等价性验证。
 #
-# 默认全只读。唯一会写仓库的是 publish job：workflow_dispatch 专用，
-# 而且必须显式勾选 publish=true 才会跑。
+# 默认全只读。唯一会写仓库的是 publish job，两种触发方式：
+#   1. workflow_dispatch 且勾选 publish（注意：只在默认分支上能看到按钮）
+#   2. 提交信息里带 [publish]（默认分支被冻结时用这条）
+#
+# 它把编译产物提交进 app/src/main/assets，并带 [apk] [release] 回来，
+# 于是 verify 会保留 APK、build-apk 会产出带签名的发布包。
 
 on:
   push:
@@ -142,7 +146,7 @@ jobs:
 
   publish:
     name: 把自有产物替换进 assets
-    if: github.event_name == 'workflow_dispatch' && inputs.publish
+    if: (github.event_name == 'workflow_dispatch' && inputs.publish) || contains(github.event.head_commit.message, '[publish]')
     needs: compile
     runs-on: ubuntu-latest
     permissions:
