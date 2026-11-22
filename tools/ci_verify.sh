@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # CI 全部检查：接线、单测、release 编译、plant 交叉编译。
 #
-# 设计原则：流程写在一个脚本里，每完成一项立刻 flush 一份报告并提交。
-# 之前把流程拆成多个 step，任何一步提前失败（或 YAML 解析失败）都不会留下任何证据，
-# 只能看到“verify-fail”而不知道为什么。
+# 两条铁律：
+#   1. 每完成一项就 flush 一份报告并提交，任何提前退出都留下证据；
+#   2. 只有在接线/单测/编译/plant 全部成功时，才允许把 app/ 的改动提交回分支。
+#      之前用 always() 写回，导致“单测 skipped”的提交同时接入了代码。
 set +e
 cd "$(dirname "$0")/.." || exit 1
 
@@ -11,6 +12,7 @@ WIRE=skipped
 TEST=skipped
 COMPILE=skipped
 PLANT=skipped
+COMMIT_CODE=0
 
 flush() {
   {
@@ -21,6 +23,7 @@ flush() {
     echo "- 单测: ${TEST}"
     echo "- 编译: ${COMPILE}"
     echo "- plant: ${PLANT}"
+    echo "- 是否回写源码: ${COMMIT_CODE}"
     echo
     echo "## 接线日志"
     echo
@@ -44,6 +47,7 @@ flush() {
     wf=app/src/main/java/com/gkeyes/lhasa26/core/WorkflowEngine.java
     echo "BootGuard.classify x$(grep -c 'BootGuard.classify' "$wf" 2>/dev/null || echo 0)"
     echo "DeployGate         x$(grep -c 'DeployGate' "$wf" 2>/dev/null || echo 0)"
+    echo "markCompleted      x$(grep -c 'markCompleted' "$wf" 2>/dev/null || echo 0)"
     echo "旧 pkill 路径     x$(grep -c 'pkill -f uaf_plant_replay' "$wf" 2>/dev/null || echo 0)"
     echo '```'
     echo
@@ -62,13 +66,15 @@ flush() {
 
   git config user.name "lhasa-ci"
   git config user.email "lhasa-ci@users.noreply.github.com"
-  git add -A app 2>/dev/null
   git add plant/verify-report.md plant/build.log plant/audit.log 2>/dev/null
+  if [ "$COMMIT_CODE" = "1" ]; then
+    git add -A app 2>/dev/null
+  fi
   if git diff --cached --quiet; then
     echo "report unchanged"
   else
-    git commit -m "verify: wire=${WIRE} test=${TEST} compile=${COMPILE} plant=${PLANT} [verify]" >/dev/null 2>&1
-    git push >/dev/null 2>&1 || echo "::warning::git push 失败，报告只在运行器上"
+    git commit -m "verify: wire=${WIRE} test=${TEST} compile=${COMPILE} plant=${PLANT} code=${COMMIT_CODE} [verify]" >/dev/null 2>&1
+    git push >/dev/null 2>&1 || echo "::warning::git push 失败"
   fi
 }
 
@@ -125,9 +131,6 @@ fi
   python3 - <<'PY'
 import pathlib
 
-def has_elf(head: bytes) -> bool:
-    return head[:4] == b"\x7fELF"
-
 assets = pathlib.Path("app/src/main/assets")
 sources = {p.name[:-2] for p in pathlib.Path("plant").glob("*.c")}
 missing = []
@@ -135,7 +138,7 @@ for path in sorted(assets.iterdir()):
     if not path.is_file():
         continue
     with path.open("rb") as fh:
-        if not has_elf(fh.read(4)):
+        if fh.read(4) != b"\x7fELF":
             continue
     ok = path.name in sources
     if not ok:
@@ -144,7 +147,7 @@ for path in sorted(assets.iterdir()):
 print(f"合计 {len(missing)} 个资产尚无源码")
 PY
 } >> plant/build.log 2>&1
-tee plant/audit.log < plant/build.log >/dev/null
+cp plant/build.log plant/audit.log
 
 failed=0
 for src in plant/*.c; do
@@ -161,9 +164,13 @@ done
 ls -l plant/out >> plant/build.log 2>&1
 if [ "$failed" -eq 0 ] && ls plant/out/* >/dev/null 2>&1; then PLANT=success; else PLANT=failure; fi
 echo "PLANT=$PLANT"
+
+if [ "$WIRE" = success ] && [ "$TEST" = success ] && [ "$COMPILE" = success ]; then
+  COMMIT_CODE=1
+fi
 flush
 
-if [ "$WIRE" = success ] && [ "$TEST" = success ] && [ "$COMPILE" = success ] && [ "$PLANT" = success ]; then
+if [ "$COMMIT_CODE" = "1" ] && [ "$PLANT" = success ]; then
   exit 0
 fi
 exit 1
