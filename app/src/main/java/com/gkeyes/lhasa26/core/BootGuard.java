@@ -29,8 +29,12 @@ public final class BootGuard {
     }
 
     /**
-     * Written by the launch wrapper. Under setsid the recorded shell id doubles as the process group
-     * id, which is what makes a whole-tree kill possible without scanning /proc.
+     * Written by the launch wrapper as `&lt;pgid&gt;:&lt;boot_id&gt;`. Under setsid the recorded shell id doubles
+     * as the process group id, which is what makes a whole-tree kill possible without scanning /proc.
+     *
+     * The boot id is essential: /data/local/tmp survives reboots, and a stale pgid can be reused by
+     * an unrelated shell-uid process (shizuku_server, an adbd child). Without the guard the workflow
+     * would either refuse to start or kill that innocent group.
      */
     public static final String PID_FILE = "/data/local/tmp/.lhasa_pid";
 
@@ -42,6 +46,12 @@ public final class BootGuard {
 
     /** timeout(1) 被触发时的退出码，用来把"卡死"和"程序自己返回失败"区分开。 */
     public static final int TIMEOUT_EXIT = 124;
+
+    /** 运行态文件里的 boot id 分隔符；pgid 是数字，boot id 是 uuid，冒号不会歧义。 */
+    private static final char BOOT_SEP = ':';
+
+    /** 读当前开机 id 的 shell 片段（toybox cat，无需 root）。 */
+    private static final String BOOT_ID_READ = "$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)";
 
     /**
      * Payload prefixes that mean the kernel heap is already dirty. Checked before the success markers
@@ -113,12 +123,12 @@ public final class BootGuard {
     /**
      * 给单次探测命令套上硬超时。
      *
-     * 采样器（perf_slide）和 tracefs 探测在异常内核上可能永远不返回；没有 timeout 时它们会
-     * 以 root 身份常驻，把设备拖进 soft lockup，最后表现成"用一次就重启一次"。
-     * timeout 是 toybox 自带，Android 9 以后都在。
+     * 采样器和 tracefs 探测在异常内核上可能永远不返回；没有 timeout 时它们会以 root 身份常驻，
+     * 把设备拖进 soft lockup，最后表现成"用一次就重启一次"。
+     * `-k 2` 是第二道保险：SIGTERM 后 2 秒仍不退就 SIGKILL。
      */
     public static String withTimeout(int seconds, String command) {
-        return "timeout " + seconds + " " + command;
+        return "timeout -k 2 " + seconds + " " + command;
     }
 
     /** 记下"接下来要碰内核了"；失败或重启后靠它定位。 */
@@ -133,7 +143,6 @@ public final class BootGuard {
 
     /**
      * 把上一次残留的阶段读成一句人话；没有残留就返回空串。
-     * timestamp 用于判断是不是本次开机的事。
      */
     public static String leftoverStageHint(String stageFileContent) {
         if (stageFileContent == null || stageFileContent.trim().isEmpty()) {
@@ -148,9 +157,6 @@ public final class BootGuard {
                 break;
             case "ksu":
                 label = "KernelSU late-load（加载内核模块）";
-                break;
-            case "probe-perf":
-                label = "perf_slide 采样";
                 break;
             case "probe-slide":
                 label = "slide_probe 测量";
@@ -173,31 +179,41 @@ public final class BootGuard {
     }
 
     /**
-     * Starts the payload in its own session so the whole group can be signalled later, and records the
-     * shell id (the group id under setsid) to {@link #PID_FILE}.
+     * Starts the payload in its own session so the whole group can be signalled later, and records
+     * `&lt;pgid&gt;:&lt;boot_id&gt;` to {@link #PID_FILE}.
      */
     public static String launchCommand(String binary, String arguments, String logPath) {
         return "toybox setsid sh -c '" + binary + " " + arguments
-                + " > " + logPath + " 2>&1 < /dev/null & echo $$ > " + PID_FILE
+                + " > " + logPath + " 2>&1 < /dev/null & echo \"$$" + BOOT_SEP + "\""
+                + BOOT_ID_READ + " > " + PID_FILE
                 + "' >/dev/null 2>&1 &";
     }
 
     /**
-     * Signals the recorded process group.
+     * Signals the recorded process group — but only when the record belongs to the running boot.
      *
      * pkill and killall cannot be used here: /proc is mounted hidepid=invisible on this device, so an
      * unprivileged scan never sees the payload and the old process keeps running next to the new one.
      */
     public static String killCommand() {
-        return "if [ -s " + PID_FILE + " ]; then p=$(cat " + PID_FILE + "); "
+        return "if [ -s " + PID_FILE + " ]; then "
+                + "rec=$(cat " + PID_FILE + " 2>/dev/null); "
+                + "p=${rec%%" + BOOT_SEP + "*}; b=${rec##*" + BOOT_SEP + "}; "
+                + "now=" + BOOT_ID_READ + "; "
+                + "if [ -n \"$now\" ] && [ \"$b\" = \"$now\" ]; then "
                 + "kill -TERM -$p 2>/dev/null; sleep 1; kill -KILL -$p 2>/dev/null; "
-                + "rm -f " + PID_FILE + "; fi; true";
+                + "fi; rm -f " + PID_FILE + "; fi; true";
     }
 
-    /** Prints 1 when the recorded process group still exists, 0 otherwise. */
+    /** Prints 1 when the recorded process group still exists <b>in this boot</b>, 0 otherwise. */
     public static String aliveCommand() {
-        return "if [ -s " + PID_FILE + " ]; then p=$(cat " + PID_FILE + "); "
-                + "kill -0 -$p 2>/dev/null && echo 1 || echo 0; else echo 0; fi";
+        return "if [ -s " + PID_FILE + " ]; then "
+                + "rec=$(cat " + PID_FILE + " 2>/dev/null); "
+                + "p=${rec%%" + BOOT_SEP + "*}; b=${rec##*" + BOOT_SEP + "}; "
+                + "now=" + BOOT_ID_READ + "; "
+                + "if [ -n \"$now\" ] && [ \"$b\" = \"$now\" ] && kill -0 -$p 2>/dev/null; then echo 1; "
+                + "else rm -f " + PID_FILE + "; echo 0; fi; "
+                + "else echo 0; fi";
     }
 
     private static boolean containsAny(String haystack, String[] needles) {
