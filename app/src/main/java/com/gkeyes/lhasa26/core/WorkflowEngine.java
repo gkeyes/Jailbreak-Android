@@ -30,6 +30,13 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
     private static final String FAILED_MARKER = "/data/local/tmp/.lhasa_failed_boot";
     private static final String ROOTD_SOCKET = "/data/local/tmp/pc98260-root.sock";
     private static final String EXPLOIT_BINARIES = "uaf_plant_replay perf_slide slide_probe reach_probe";
+    /**
+     * 单次探测的硬上限（秒）。超出就 kill，绝不让采样器以 root 常驻——
+     * 常驻的 perf_slide 会把设备拖进 soft lockup，表现就是"跑一次重启一次"。
+     */
+    private static final int PERF_PROBE_TIMEOUT_S = 8;
+    private static final int SLIDE_PROBE_TIMEOUT_S = 12;
+    private static final int DIAGNOSE_TIMEOUT_S = 25;
     private final CommandExecutor executor;
     private final AssetDeployer deployer;
     private final WorkflowCallbacks callbacks;
@@ -212,6 +219,12 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
         }
         String boot = bootId();
         writeRunMarker(boot);
+        // 上次是不是被重启打断的？面包屑还在就说明是。
+        String leftover = run("cat " + BootGuard.STAGE_FILE + " 2>/dev/null", true).output;
+        String hint = BootGuard.leftoverStageHint(leftover);
+        if (!hint.isEmpty()) {
+            append("[上次] " + hint);
+        }
         String failed = run("cat " + FAILED_MARKER + " 2>/dev/null", true).output.trim();
         if (!boot.isEmpty() && !failed.isEmpty()) {
             String[] parts = failed.split("\\s+");
@@ -254,6 +267,7 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
 
         step(4);
         status("提权执行中，请稍候");
+        run(BootGuard.markCommand("payload"), true);
         if (!runPayload(addressArgument, boot)) {
             stopPayload();
             recordFailedBoot(boot);
@@ -270,31 +284,41 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
         }
         run("rm -f " + FAILED_MARKER, true);
         clearRunMarker();
+        run(BootGuard.clearStageCommand(), true);
         state = State.ROOTED;
         selinuxAfterRoot = enforceNow();
-        callbacks.onStatus("已获得临时 ROOT · 正在加载 KernelSU · SELinux " + selinuxAfterRoot);
+        callbacks.onStatus("已获得临时 ROOT · SELinux " + selinuxAfterRoot);
         append("临时 ROOT 已就绪。");
         append("[归因] " + (rootBeforeRun
                 ? "开始时检查进程已是 uid=0（root 非本次取得），本次只确认根通道可用"
                 : "开始时检查进程为 shell（未持有 root），结束时获得 uid=0")
                 + " · SELinux " + (enforceBeforeRun.isEmpty() ? "?" : enforceBeforeRun)
                 + " → " + selinuxAfterRoot);
-
-        runKernelSuStep();
-        append(String.format(Locale.US, "[耗时] 从点击到核管接管结束 %.1fs",
+        // KernelSU 接管会 late-load 内核模块，是整条链里最容易把设备带走的一步，
+        // 所以不再自动执行：按钮会变成「重试 KernelSU 接管」，由用户决定何时做。
+        append("[下一步] 需要 KernelSU 常驻时，再点一次主按钮执行接管（会加载内核模块，可能重启）。");
+        callbacks.onState(State.ROOTED,
+                "已获得临时 ROOT · 需要常驻再点一次加载 KernelSU · SELinux " + selinuxAfterRoot);
+        append(String.format(Locale.US, "[耗时] 从点击到临时 ROOT 就绪 %.1fs",
                 (System.currentTimeMillis() - chainStart) / 1000.0));
     }
 
     private void runDiagnosis() throws Exception {
         status("正在诊断");
         deployer.stage("reach_probe");
-        CommandResult result = run("/data/local/tmp/reach_probe > /data/local/tmp/diag.log 2>&1", true);
+        run(BootGuard.markCommand("diagnose"), true);
+        CommandResult result = run(BootGuard.withTimeout(DIAGNOSE_TIMEOUT_S,
+                "/data/local/tmp/reach_probe > /data/local/tmp/diag.log 2>&1"), true);
         String report = run("cat /data/local/tmp/diag.log 2>/dev/null", true).output;
         if (report.trim().isEmpty()) {
             report = result.output;
         }
         append(report);
+        if (result.exitCode == BootGuard.TIMEOUT_EXIT) {
+            append("[诊断] reach_probe 超过 " + DIAGNOSE_TIMEOUT_S + " 秒被 timeout 终止——探针卡住了，不是环境不合格。");
+        }
         run("echo '!enable_event:kmem:kmem_cache_alloc' > /sys/kernel/tracing/events/kmem/rss_stat/trigger 2>/dev/null; echo 0 > /sys/kernel/tracing/tracing_on 2>/dev/null", true);
+        run(BootGuard.clearStageCommand(), true);
         String patch = run("getprop ro.build.version.security_patch", true).output.trim();
         append("[诊断] security_patch=" + patch + (patch.compareTo("2026-10-06") < 0
                 ? " · 未修补窗口"
@@ -302,7 +326,8 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
         // reach_probe 用较新的工具链编译，attr.size 超出 6.18 内核接受的范围，
         // perf_event_open 会拿到 E2BIG；用真正取址的 perf_slide 复核这一项。
         if (report.contains("perf_event_open") && report.contains("FAIL")) {
-            CommandResult slideProbe = run("/data/local/tmp/perf_slide --duration 1", true);
+            CommandResult slideProbe = run(BootGuard.withTimeout(PERF_PROBE_TIMEOUT_S,
+                    "/data/local/tmp/perf_slide --duration 1"), true);
             String slide = KernelSupport.extractSlide(slideProbe.output);
             boolean usable = slide != null && KernelSupport.isSlideValid(KernelSupport.parseHex(slide));
             append("[诊断] 覆盖：" + (usable
@@ -332,6 +357,7 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
         try {
             step(6);
             status("已获得临时 ROOT · 正在加载 KernelSU");
+            run(BootGuard.markCommand("ksu"), true);
             deployer.stage("ksud");
             CommandResult load = run("rm -f /data/local/tmp/ksu_try.log; "
                     + "/data/local/tmp/pc98260-su -c \"cd /data/local/tmp && ./ksud late-load --kmi android17-6.18 --allow-shell --package-name me.weishu.kernelsu\" "
@@ -348,6 +374,7 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
             append("[KSU] ksud -V → " + oneLine(ksudProbe.output));
             selinuxAfterRoot = enforceNow();
             append("[SELinux] 最终实测 " + selinuxAfterRoot);
+            run(BootGuard.clearStageCommand(), true);
             if (suProbe.output.contains("uid=0")) {
                 state = State.COMPLETE;
                 callbacks.onState(State.COMPLETE, "全部完成 · 已接管 · SELinux " + selinuxAfterRoot);
@@ -418,10 +445,15 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
 
     private String measureAddress() throws Exception {
         for (int seconds : new int[]{1, 2}) {
-            CommandResult result = run("/data/local/tmp/perf_slide --duration " + seconds, true);
+            run(BootGuard.markCommand("probe-perf"), true);
+            CommandResult result = run(BootGuard.withTimeout(PERF_PROBE_TIMEOUT_S,
+                    "/data/local/tmp/perf_slide --duration " + seconds), true);
             String output = filterProbe(result.output);
             if (!output.trim().isEmpty()) {
                 append(output);
+            }
+            if (result.exitCode == BootGuard.TIMEOUT_EXIT) {
+                append("perf_slide 超过 " + PERF_PROBE_TIMEOUT_S + " 秒被 timeout 终止（采样器卡住），换下一档");
             }
             String slide = KernelSupport.extractSlide(result.output);
             long parsed = KernelSupport.parseHex(slide);
@@ -434,8 +466,13 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
             }
         }
         append("perf_slide 未取到，改用 slide_probe");
-        CommandResult probe = run("/data/local/tmp/slide_probe", false);
+        run(BootGuard.markCommand("probe-slide"), true);
+        CommandResult probe = run(BootGuard.withTimeout(SLIDE_PROBE_TIMEOUT_S,
+                "/data/local/tmp/slide_probe"), false);
         append(filterProbe(probe.output));
+        if (probe.exitCode == BootGuard.TIMEOUT_EXIT) {
+            append("slide_probe 超过 " + SLIDE_PROBE_TIMEOUT_S + " 秒被 timeout 终止");
+        }
         String calc = KernelSupport.extractCalc(probe.output);
         if (calc != null) {
             append("slide = " + calc + "（kprobe）");
