@@ -1,13 +1,31 @@
 /*
  * reach_probe — 接口可达性诊断。
  *
- * 按原件字符串表重建（CI Artifact 的 strings/reach_probe.orig.txt）。
- * 原件同时存在「裸路径」和「带尾随空格的列名」两套字面量，例如
- *   /proc/kallsyms            ← open 用
- *   /proc/kallsyms            + 空格  ← 表格里名字列用
- *   /sys/kernel/tracing/per_cpu/cpu0/trace_pipe_raw
- *   per_cpu/cpu0/trace_pipe_raw + 空格
- * 表格格式： "  [%s] %-40s %s"，汇总：" OK " / " FAIL " / " %d " / " ---"。
+ * 按真机实测输出逐行对齐（2026-11-22，6.18.21-android17 上跑原件得到）：
+ *
+ *   === CVE-2026-98260 / lhasa 环境诊断（重写版）===
+ *     uname -r        : ...
+ *     kernel version  : #1 SMP PREEMPT ...
+ *     ro.product.device: lhasa
+ *     ro.product.model : 2608BPX34C
+ *     系统增量         : OS4.0.21.0.XPNCNXM
+ *     getenforce      : Enforcing
+ *     id              : uid=0(root) ...
+ *
+ *   --- 内核信息泄露面 ---
+ *     [ OK ] /proc/slabinfo 可读                    open ok
+ *   --- tracefs（决定整条链能否观测）---
+ *   --- 系统调用面 ---
+ *   --- 结论 ---
+ *     12 ok / 1 fail
+ *     有 1 项未通过，先看上面标 FAIL 的项。
+ *
+ * 几个必须照抄的细节：
+ *   - 行首是 `[ OK ]`（" OK " 带空格）与 `[FAIL]`（无空格），不是统一格式；
+ *   - 有失败时**退出码是 2**，不是 1；
+ *   - perf_event_open 这项原件会拿到 E2BIG（errno=7）——它用 sizeof(perf_event_attr)
+ *     传给 6.18 内核，超出可接受尺寸。这里照实复现，WorkflowEngine 里另有
+ *     perf_slide 复核来覆盖这条已知误报。
  */
 #define _GNU_SOURCE 1
 #include <errno.h>
@@ -27,90 +45,72 @@
 
 static int g_ok, g_fail;
 
-/* 裸路径（open 用） */
-static const char *P_KALLSYMS = "/proc/kallsyms";
-static const char *P_SLABINFO = "/proc/slabinfo";
-static const char *P_TRACEFS  = "/sys/kernel/tracing";
-static const char *P_PIPE     = "/sys/kernel/tracing/per_cpu/cpu0/trace_pipe_raw";
-static const char *P_KMEM_EN  = "/sys/kernel/tracing/events/kmem/kmem_cache_alloc/enable";
-static const char *P_RSS_TRIG = "/sys/kernel/tracing/events/kmem/rss_stat/trigger";
-static const char *P_KPROBE   = "/sys/kernel/tracing/kprobe_events";
-static const char *P_TRACE_ON = "/sys/kernel/tracing/tracing_on";
-
-/* 列名（带尾随空格，和原件一致） */
-static const char *N_KALLSYMS = "/proc/kallsyms ";
-static const char *N_SLABINFO = "/proc/slabinfo ";
-static const char *N_TRACEFS  = "/sys/kernel/tracing ";
-static const char *N_PIPE     = "/sys/kernel/tracing/per_cpu/cpu0/trace_pipe_raw ";
-static const char *N_PIPE_SHORT = "per_cpu/cpu0/trace_pipe_raw ";
-static const char *N_KMEM_EN  = "kmem_cache_alloc/enable ";
-static const char *N_RSS_TRIG = "kmem/rss_stat/trigger ";
-static const char *N_KPROBE   = "kprobe_events ";
-static const char *N_TRACE_ON = "tracing_on ";
-
-static void report(const char *name, int ok, const char *detail)
+static void ok_line(const char *name, const char *detail)
 {
-	if (ok)
-		g_ok++;
-	else
-		g_fail++;
-	printf("  [%s] %-40s %s\n", ok ? "OK" : "FAIL", name, detail && *detail ? detail : "");
+	g_ok++;
+	printf("  [ OK ] %-40s %s\n", name, detail ? detail : "");
 }
 
-static int can_open(const char *path, int flags, char *detail, size_t len)
+static void fail_line(const char *name, const char *detail)
+{
+	g_fail++;
+	printf("  [FAIL] %-40s %s\n", name, detail ? detail : "");
+}
+
+static void check_open(const char *label, const char *path, int flags, const char *okDetail)
 {
 	int fd = open(path, flags | O_CLOEXEC);
 	if (fd < 0) {
-		snprintf(detail, len, "errno=%d (%s)", errno, strerror(errno));
-		return 0;
+		char detail[160];
+		snprintf(detail, sizeof(detail), "errno=%d (%s)", errno, strerror(errno));
+		fail_line(label, detail);
+		return;
 	}
 	close(fd);
-	snprintf(detail, len, "open ok");
-	return 1;
+	ok_line(label, okDetail);
 }
 
-static int has_line(const char *path, const char *needle, char *detail, size_t len)
+static void check_write(const char *label, const char *path, const char *value)
 {
-	int fd = open(path, O_RDONLY | O_CLOEXEC);
+	int fd = open(path, O_WRONLY | O_CLOEXEC);
 	if (fd < 0) {
-		snprintf(detail, len, "errno=%d (%s)", errno, strerror(errno));
-		return 0;
+		char detail[160];
+		snprintf(detail, sizeof(detail), "errno=%d (%s)", errno, strerror(errno));
+		fail_line(label, detail);
+		return;
 	}
-	char buffer[4096];
-	ssize_t n = read(fd, buffer, sizeof(buffer) - 1);
+	ssize_t n = write(fd, value, strlen(value));
 	close(fd);
-	if (n <= 0) {
-		snprintf(detail, len, "n=%zd", n);
-		return 0;
+	if (n != (ssize_t)strlen(value)) {
+		char detail[160];
+		snprintf(detail, sizeof(detail), "write errno=%d", errno);
+		fail_line(label, detail);
+		return;
 	}
-	buffer[n] = '\0';
-	snprintf(detail, len, "present=1");
-	return strstr(buffer, needle) != NULL;
+	ok_line(label, "write ok");
 }
 
-static void capture(const char *command, char *out, size_t len, char *detail, size_t dlen)
+static void capture(const char *command, char *out, size_t len)
 {
 	out[0] = '\0';
 	FILE *pipe = popen(command, "r");
-	if (!pipe) {
-		snprintf(detail, dlen, "popen errno=%d", errno);
+	if (!pipe)
 		return;
-	}
 	size_t used = 0;
 	if (fgets(out, (int)len, pipe) != NULL)
 		used = strlen(out);
-	while (used > 0 && (out[used - 1] == '\n' || out[used - 1] == ' '))
+	while (used > 0 && (out[used - 1] == '\n' || out[used - 1] == '\r'))
 		out[--used] = '\0';
 	pclose(pipe);
-	snprintf(detail, dlen, "%s", used ? out : "empty");
 }
 
+/* 原件把 sizeof(struct perf_event_attr) 传给内核，6.18 会返回 E2BIG —— 照实复现。 */
 static int perf_event_open_software(void)
 {
 	struct perf_event_attr attr;
 	memset(&attr, 0, sizeof(attr));
 	attr.type = PERF_TYPE_SOFTWARE;
-	attr.size = PERF_ATTR_SIZE_VER5;
+	attr.size = sizeof(attr);
 	attr.config = PERF_COUNT_SW_CPU_CLOCK;
 	attr.disabled = 1;
 	return (int)syscall(SYS_perf_event_open, &attr, 0, -1, -1, 0);
@@ -129,7 +129,6 @@ static int unix_stream_8k(void)
 	return n == (ssize_t)sizeof(chunk) ? 0 : -1;
 }
 
-/* 直接走 syscall：musl 静态下不依赖 libc 的 AIO 包装。 */
 static int aio_setup_probe(void)
 {
 	aio_context_t ctx = 0;
@@ -156,89 +155,95 @@ static int thread_timer(void)
 
 int main(void)
 {
-	char detail[256];
 	char value[256];
+	char detail[160];
 
-	printf("<=== CVE-2026-98260 / lhasa ===\n");
+	printf("=== CVE-2026-98260 / lhasa 环境诊断（重写版）===\n");
 
-	capture("id", value, sizeof(value), detail, sizeof(detail));
-	printf("  id              : %s\n", value);
-
-	capture("uname -r", value, sizeof(value), detail, sizeof(detail));
-	printf("  kernel version  : %s\n", value);
+	capture("uname -r", value, sizeof(value));
 	printf("  uname -r        : %s\n", value);
 
-	capture("getprop ro.product.device", value, sizeof(value), detail, sizeof(detail));
+	capture("uname -v", value, sizeof(value));
+	printf("  kernel version  : %s\n", value);
+
+	capture("getprop ro.product.device", value, sizeof(value));
 	printf("  ro.product.device: %s\n", value);
 
-	capture("getprop ro.product.model", value, sizeof(value), detail, sizeof(detail));
+	capture("getprop ro.product.model", value, sizeof(value));
 	printf("  ro.product.model : %s\n", value);
 
-	capture("getenforce", value, sizeof(value), detail, sizeof(detail));
+	capture("getprop ro.build.version.incremental", value, sizeof(value));
+	printf("  系统增量         : %s\n", value);
+
+	capture("getenforce", value, sizeof(value));
 	printf("  getenforce      : %s\n", value);
 
-	capture("grep -m1 posix_timers_cache /proc/slabinfo",
-		value, sizeof(value), detail, sizeof(detail));
-	printf("  posix_timers_cache:\n         : %s\n", value);
+	capture("id", value, sizeof(value));
+	printf("  id              : %s\n", value);
 
-	printf("--- tracefs\n");
-	report(N_KALLSYMS, can_open(P_KALLSYMS, O_RDONLY, detail, sizeof(detail)), detail);
-	report(N_SLABINFO, has_line(P_SLABINFO, "kmem_cache_alloc", detail, sizeof(detail)), detail);
-	report("/proc/self/pagemap", can_open("/proc/self/pagemap", O_RDONLY, detail, sizeof(detail)), detail);
-	report(N_TRACEFS, can_open(P_TRACEFS, O_RDONLY, detail, sizeof(detail)), detail);
-	report(N_TRACE_ON, can_open(P_TRACE_ON, O_RDONLY, detail, sizeof(detail)), detail);
-	report(N_KMEM_EN, can_open(P_KMEM_EN, O_WRONLY, detail, sizeof(detail)), detail);
-	report(N_RSS_TRIG, can_open(P_RSS_TRIG, O_WRONLY, detail, sizeof(detail)), detail);
-	report(N_KPROBE, can_open(P_KPROBE, O_WRONLY, detail, sizeof(detail)), detail);
+	printf("\n--- 内核信息泄露面 ---\n");
+	check_open("/proc/slabinfo 可读", "/proc/slabinfo", O_RDONLY, "open ok");
+	check_open("/proc/kallsyms 可读", "/proc/kallsyms", O_RDONLY, "ok");
 
-	int pipe_ok = can_open(P_PIPE, O_RDONLY | O_NONBLOCK, detail, sizeof(detail));
-	report(N_PIPE, pipe_ok, pipe_ok ? "trace_pipe_raw 可打开" : detail);
-	if (pipe_ok)
-		printf("  --- %s OK \n", N_PIPE_SHORT);
-
-	report("/dev/null", can_open("/dev/null", O_WRONLY, detail, sizeof(detail)), detail);
-	report("/bin/sh", access("/bin/sh", X_OK) == 0 ? 1 : 0, "access ok");
-
-	printf("--- \n");
-	int perf_fd = perf_event_open_software();
-	if (perf_fd < 0) {
+	int pagemap = open("/proc/self/pagemap", O_RDONLY | O_CLOEXEC);
+	if (pagemap < 0) {
 		snprintf(detail, sizeof(detail), "errno=%d (%s)", errno, strerror(errno));
-		report("perf_event_open (software)", 0, detail);
+		fail_line("/proc/self/pagemap", detail);
 	} else {
-		close(perf_fd);
-		report("perf_event_open (software)", 1, "ok");
+		close(pagemap);
+		ok_line("/proc/self/pagemap", "present=1");
 	}
 
-	if (unix_stream_8k() != 0) {
-		snprintf(detail, sizeof(detail), "socketpair errno=%d", errno);
-		report("unix SOCK_STREAM 8KB write", 0, detail);
+	printf("\n--- tracefs（决定整条链能否观测）---\n");
+	check_open("/sys/kernel/tracing 存在", "/sys/kernel/tracing", O_RDONLY, "access");
+	check_write("tracing_on 可写", "/sys/kernel/tracing/tracing_on", "1");
+	check_write("kmem/rss_stat/trigger 可写",
+	            "/sys/kernel/tracing/events/kmem/rss_stat/trigger",
+	            "!enable_event:kmem:kmem_cache_alloc");
+	check_open("kmem_cache_alloc/enable 可写",
+	           "/sys/kernel/tracing/events/kmem/kmem_cache_alloc/enable", O_WRONLY, "open ok");
+	check_open("per_cpu/cpu0/trace_pipe_raw 可读",
+	           "/sys/kernel/tracing/per_cpu/cpu0/trace_pipe_raw",
+	           O_RDONLY | O_NONBLOCK, "access");
+	check_open("kprobe_events 存在", "/sys/kernel/tracing/kprobe_events", O_RDONLY, "access");
+
+	printf("\n--- 系统调用面 ---\n");
+	if (thread_timer() != 0) {
+		snprintf(detail, sizeof(detail), "timer_create errno=%d", errno);
+		fail_line("timer_create(CLOCK_THREAD_CPUTIME)", detail);
 	} else {
-		report("unix SOCK_STREAM 8KB write", 1, "write ok");
+		ok_line("timer_create(CLOCK_THREAD_CPUTIME)", "ok");
 	}
 
 	if (aio_setup_probe() != 0) {
 		snprintf(detail, sizeof(detail), "errno=%d (%s)", errno, strerror(errno));
-		report("io_setup (AIO)", 0, detail);
+		fail_line("io_setup (AIO)", detail);
 	} else {
-		report("io_setup (AIO)", 1, "ok");
+		ok_line("io_setup (AIO)", "ok");
 	}
 
-	if (thread_timer() != 0) {
-		snprintf(detail, sizeof(detail), "timer_create errno=%d", errno);
-		report("timer_create(CLOCK_THREAD_CPUTIME)", 0, detail);
+	if (unix_stream_8k() != 0) {
+		snprintf(detail, sizeof(detail), "socketpair errno=%d", errno);
+		fail_line("unix SOCK_STREAM 8KB write", detail);
 	} else {
-		report("timer_create(CLOCK_THREAD_CPUTIME)", 1, "ok");
+		ok_line("unix SOCK_STREAM 8KB write", "ok");
 	}
 
-	/* 汇总行沿用原件的三段字面量：" %d "、" OK "、" FAIL "。 */
-	printf("\n %d %s\n", g_ok, " OK ");
-	printf(" %d %s\n", g_fail, " FAIL ");
+	int perf_fd = perf_event_open_software();
+	if (perf_fd < 0) {
+		snprintf(detail, sizeof(detail), "errno=%d (%s)", errno, strerror(errno));
+		fail_line("perf_event_open (software)", detail);
+	} else {
+		close(perf_fd);
+		ok_line("perf_event_open (software)", "ok");
+	}
+
+	printf("\n--- 结论 ---\n");
 	printf("  %d ok / %d fail\n", g_ok, g_fail);
-
 	if (g_fail == 0) {
-		printf("必需项全部通过\n");
+		printf("  必需项全部通过\n");
 		return 0;
 	}
-	printf("必需接口不可用\n");
-	return 1;
+	printf("  有 %d 项未通过，先看上面标 FAIL 的项。\n", g_fail);
+	return 2;
 }
