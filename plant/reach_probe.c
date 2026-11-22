@@ -1,18 +1,17 @@
 /*
  * reach_probe — 接口可达性诊断。
  *
- * 按原件字符串表重建（assets/reach_probe 的 strings，见 CI Artifact 里的
- * strings/reach_probe.orig.txt）。原件输出是一张表，不是一行行 [probe]：
- *
+ * 按原件字符串表重建（见 CI Artifact 的 strings/reach_probe.orig.txt）。
+ * 原件输出是一张表：
  *   环境段：  id / kernel version / uname -r / ro.product.device /
  *            ro.product.model / getenforce / posix_timers_cache
  *   检查段：  "  [%s] %-40s %s"（OK / FAIL，名字左对齐 40 列）
  *   汇总：    "  %d ok / %d fail"
  *
- * 原件里多数路径常量带一个尾随空格（"per_cpu/cpu0/trace_pipe_raw "），
- * 那是 printf 名字列留下的；这里保留同样的字面量，open 之前 trim。
+ * 原件里多数路径常量带尾随空格（"per_cpu/cpu0/trace_pipe_raw "），是 printf
+ * 名字列留下的；这里保留同样字面量，open 前 trim。
  *
- * 原件完全不提 perf_event_paranoid / vm.max_map_count，那两个是草稿自己加的，已删。
+ * 原件不探测 perf_event_paranoid / vm.max_map_count，那两个是草稿加的，已删。
  */
 #define _GNU_SOURCE 1
 #include <errno.h>
@@ -27,6 +26,7 @@
 #include <sys/socket.h>
 #include <sys/syscall.h>
 #include <sys/un.h>
+#include <linux/aio_abi.h>
 #include <linux/perf_event.h>
 
 static int g_ok, g_fail;
@@ -136,6 +136,18 @@ static int unix_stream_8k(void)
 	return n == (ssize_t)sizeof(chunk) ? 0 : -1;
 }
 
+/* 直接走 syscall：musl 静态下不依赖 libc 的 AIO 包装。 */
+static int aio_setup_probe(void)
+{
+	aio_context_t ctx = 0;
+	long ret = syscall(SYS_io_setup, 1, &ctx);
+	if (ret == 0 && ctx != 0) {
+		syscall(SYS_io_destroy, ctx);
+		return 0;
+	}
+	return -1;
+}
+
 static int thread_timer(void)
 {
 	timer_t timer;
@@ -185,7 +197,8 @@ int main(void)
 	report("kmem_cache_alloc/enable ", can_open(P_KMEM_EN, O_WRONLY, detail, sizeof(detail)), detail);
 	report("kmem/rss_stat/trigger ", can_open(P_RSS_TRIG, O_WRONLY, detail, sizeof(detail)), detail);
 	report("kprobe_events ", can_open(P_KPROBE, O_WRONLY, detail, sizeof(detail)), detail);
-	report("per_cpu/cpu0/trace_pipe_raw ", can_open(P_TRACE_PIPE, O_RDONLY | O_NONBLOCK, detail, sizeof(detail)), detail);
+	report("per_cpu/cpu0/trace_pipe_raw ",
+	       can_open(P_TRACE_PIPE, O_RDONLY | O_NONBLOCK, detail, sizeof(detail)), detail);
 	report("/dev/null", can_open("/dev/null", O_WRONLY, detail, sizeof(detail)), detail);
 	report("/bin/sh", access("/bin/sh", X_OK) == 0 ? 1 : 0, "access ok");
 
@@ -206,7 +219,12 @@ int main(void)
 		report("unix SOCK_STREAM 8KB write", 1, "write ok");
 	}
 
-	report("io_setup (AIO)", 1, "ok");
+	if (aio_setup_probe() != 0) {
+		snprintf(detail, sizeof(detail), "errno=%d (%s)", errno, strerror(errno));
+		report("io_setup (AIO)", 0, detail);
+	} else {
+		report("io_setup (AIO)", 1, "ok");
+	}
 
 	if (thread_timer() != 0) {
 		snprintf(detail, sizeof(detail), "timer_create errno=%d", errno);
