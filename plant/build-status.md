@@ -1,6 +1,6 @@
 # plant 源码可替换性验证
 
-- commit: `5ec703d2`
+- commit: `a2f31d5b`
 - 结果: **success**
 - 方法: zig cc -target aarch64-linux-musl -O2 -static -pthread
 
@@ -27,8 +27,8 @@ plant/out/reach_probe: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV),
 plant/out/slide_probe: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, with debug_info, not stripped
 built=4 failed=0
 total 4272
--rwxr-xr-x 1 runner runner 1007656 Nov 22 04:15 pc98260-su
--rwxr-xr-x 1 runner runner 1097320 Nov 22 04:15 perf_slide
--rwxr-xr-x 1 runner runner 1097296 Nov 22 04:15 reach_probe
--rwxr-xr-x 1 runner runner 1166264 Nov 22 04:15 slide_probe
+-rwxr-xr-x 1 runner runner 1007656 Nov 22 04:20 pc98260-su
+-rwxr-xr-x 1 runner runner 1097320 Nov 22 04:20 perf_slide
+-rwxr-xr-x 1 runner runner 1097296 Nov 22 04:20 reach_probe
+-rwxr-xr-x 1 runner runner 1166264 Nov 22 04:20 slide_probe
 ```
