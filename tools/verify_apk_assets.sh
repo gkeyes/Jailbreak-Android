@@ -3,10 +3,13 @@
 #
 # 只读：用 unzip -p 读 APK 条目算 sha256，不执行任何 payload、不碰 rootd / tracefs / perf。
 #
-# 期望值直接取自 tools/assets-ledger.json（唯一事实来源），不再硬编码：
-#   台账更新后本脚本自动跟随。
+# 期望值直接取自 tools/assets-ledger.json（唯一事实来源），不再硬编码。
 #
 # 用法：tools/verify_apk_assets.sh [包名] [台账路径]
+#
+# 装完包先跑这个：确认 APK 里装的确实是我们编的二进制，再去判断提权结果。
+# 2026-11-22 起 uaf_plant_replay 是 xring_plant_realcred.c 的构建（约 99 KB），
+# 不是早先那个 88 KB 的原件，也不是 115 KB 的 exploit-android-perf 变体。
 
 set -u
 
@@ -22,7 +25,6 @@ if [ ! -f "$LEDGER" ]; then
 	exit 2
 fi
 
-# 从台账抽出 name -> sha256；name 先出现，sha256 在同一对象内随后出现。
 expected() {
 	awk -v want="$1" '
 		/"name": *"/ {
