@@ -4,7 +4,7 @@ name: verify
 #
 # 唯一的写权限是 issues：写，而且**只在失败时**用它把日志尾巴写成一条 issue。
 # 原因很实际：CI 日志只能从网页看，MCP 侧拿不到 Artifact，
-# 失败原因落在 issue 里才能被程序读到——这比让人手抄日志可靠得多。
+# 失败原因落在 issue 里才能被程序读到。
 # 它不碰仓库内容：没有任何 git 写操作。
 
 on:
@@ -36,14 +36,18 @@ jobs:
         run: |
           set -o pipefail
           bash tools/ci_verify.sh 2>&1 | tee "$RUNNER_TEMP/verify.log"
+      # 44 MB 的 debug APK 每次 push 都存一份，很快就把 Artifact 配额吃光
+      # （配额满时 upload-artifact 返回 403，表现成"除脚本外全红"）。
+      # 默认只留日志；要 APK 就在提交信息里写 [apk]，或手动触发。
       - name: Upload APK
         id: upload_apk
-        if: always()
+        if: success() && (github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[apk]'))
         uses: actions/upload-artifact@v4
         with:
           name: lhasa26-debug-apk
           path: app/build/outputs/apk/debug/*.apk
           if-no-files-found: warn
+          retention-days: 2
       - name: Upload logs
         id: upload_logs
         if: always()
@@ -57,6 +61,7 @@ jobs:
             ${{ runner.temp }}/build.log
             ${{ runner.temp }}/assets.log
           if-no-files-found: warn
+          retention-days: 2
       - name: 失败时把日志写进 issue
         if: failure()
         env:
@@ -84,10 +89,6 @@ jobs:
             echo "### verify.sh 输出（结尾）"
             echo '```text'
             tail -c 14000 "$RUNNER_TEMP/verify.log" 2>/dev/null || echo "（无 verify.log）"
-            echo '```'
-            echo "### 构建产物目录"
-            echo '```text'
-            ls -la app/build/outputs/apk/debug/ 2>/dev/null || echo "（目录不存在）"
             echo '```'
           } > "$body"
           gh issue create --title "$title" --body-file "$body" \
