@@ -11,9 +11,11 @@
 #
 # 全程只写 $WORK（默认 /data/local/tmp/gate2），不需要 root、不起监听、不读 tracefs。
 #
-# 用法：
+# 用法（原件目录可用 `pm path` 从旧版本 APK 里 unzip 出来，或事先拷好）：
 #   gate2_pc98260.sh [原件路径] [重建件路径]
 #   默认 /data/local/tmp/plant/orig/pc98260-su 与 .../new/pc98260-su
+#
+# 注意：它只能验证参数解析与连接失败路径。真正跑通还需要闸 3（走 App 真实入口）。
 
 set -u
 
