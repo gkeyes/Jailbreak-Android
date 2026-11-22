@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
-# 全流程检查。顺序刻意排成：plant 交叉编译 -> 接线 -> 单测 -> 编译。
-# plant 不需要 Android SDK，几十秒内就能给出“源码能不能替掉二进制”的结论，
-# 放在最前面，即使后面的 Java 阶段挂掉，这一份证据也已经落到分支上了。
-# 每一步结束都提交一次，不依赖 GitHub 的日志页面。
+# 全流程检查。顺序：plant 交叉编译 → 接线 → 单测 → 编译。
+#
+# 每条铁律：
+#   1. plant 放最前，不需要 Android SDK，尽快回答“源码能不能替掉二进制”；
+#   2. 每个阶段结束写一次 heartbeat 并提交，脚本死在哪一步一眼可见；
+#   3. 提交带 rebase 重试。之前和 ping 工作流抢同一个分支，push 被拒（非 fast-forward）
+#      却只打了一行 warning，而 tag 用 --force 所以看上去正常，造成了“有 tag 无报告”的假象。
 set +e
 cd "$(dirname "$0")/.." || exit 1
 
@@ -11,17 +14,32 @@ TEST=skipped
 COMPILE=skipped
 PLANT=skipped
 COMMIT_CODE=0
+BRANCH="${GITHUB_REF_NAME:-fix/p0-clean-boot-retry}"
+
+push_with_retry() {
+  local i
+  for i in 1 2 3 4 5 6; do
+    git pull --rebase --autostash origin "$BRANCH" >/dev/null 2>&1
+    if git push origin "HEAD:$BRANCH" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 4
+  done
+  echo "::warning::push 重试 6 次仍失败"
+  return 1
+}
 
 commit_now() {
   git config user.name "lhasa-ci"
   git config user.email "lhasa-ci@users.noreply.github.com"
   [ "$COMMIT_CODE" = "1" ] && git add -A app 2>/dev/null
-  git add plant/*.md plant/*.log plant/*.txt 2>/dev/null
+  git add -A plant 2>/dev/null
+  git reset -q -- plant/out >/dev/null 2>&1
   if git diff --cached --quiet; then
     return 0
   fi
-  git commit -m "$1" >/dev/null 2>&1
-  git push >/dev/null 2>&1 || echo "::warning::git push 失败"
+  git commit -m "$1" >/dev/null 2>&1 || return 0
+  push_with_retry
 }
 
 heartbeat() {
