@@ -1,0 +1,138 @@
+name: plant
+
+# plant/ 下的 C 草稿：交叉编译 + 二进制常量扫描。
+#
+# 与旧版的区别（审计 P1）：只读。三个旧工作流（plant.yml / plant-build.yml /
+# plant-analysis.yml）都会 git commit + git push 回分支，其中两个还带
+# contents: write。现在所有结果只作为 Artifact 产出，仓库里不留 CI 生成物。
+
+on:
+  push:
+    branches: [ fix/p0-clean-boot-retry, chore/assets-ledger ]
+    paths:
+      - 'plant/**'
+      - 'app/src/main/assets/**'
+      - 'tools/plant_build.sh'
+      - '.github/workflows/plant.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compile:
+    name: 交叉编译 plant/*.c
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 资产台账
+        run: python3 tools/check_assets.py
+
+      - name: 安装 zig
+        run: |
+          set -e
+          curl -fsSL https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz -o "$RUNNER_TEMP/zig.tar.xz"
+          tar -xf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/zig-linux-x86_64-0.13.0" >> "$GITHUB_PATH"
+
+      - name: 编译
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=(plant/*.c)
+          mkdir -p "$RUNNER_TEMP/out"
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "plant/ 下还没有源码。"
+            exit 0
+          fi
+          for src in "${files[@]}"; do
+            out="$RUNNER_TEMP/out/$(basename "${src%.c}")"
+            echo "== zig cc $src -> $out"
+            zig cc -target aarch64-linux-musl -O2 -static -pthread "$src" -o "$out"
+            file "$out"
+          done
+
+      - name: 上传产物
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: plant-binaries
+          path: ${{ runner.temp }}/out/*
+          if-no-files-found: ignore
+
+  scan:
+    name: 现有 payload 常量扫描
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 扫描 64 位内核立即数与日志标记
+        run: |
+          python3 - <<'PY'
+          import collections, pathlib, re, os
+
+          # lhasa_profile.txt 里已知的链接期地址，用来给扫到的值打标签。
+          KNOWN = {
+              0xffffffc08042aa68: "profile timer (alloc_posix_timer+0x30)",
+              0xffffffc08026c02c: "profile cred (prepare_creds+0x2c)",
+              0xffffffc082959630: "profile selinux",
+              0xffffffc0826d10d8: "profile userns",
+              0xffffffc0826d1388: "profile rootuser",
+              0xffffffc0826d2a48: "profile groups",
+              0xffffffc0826d2f08: "profile ucounts",
+              0xffffffc0801f2ec8: "profile task_site (copy_process+0x138)",
+          }
+          LO, HI = 0xffffff8000000000, 0xffffffff00000000
+          BASE = pathlib.Path("app/src/main/assets")
+          TARGETS = ["uaf_plant_replay", "perf_slide", "slide_probe", "pc98260-su", "reach_probe"]
+          KEYWORDS = ("zombie", "leak", "selinux", "cred", "slide", "uid=0",
+                      "holding", "perf", "ring", "pipe", "rootd", "cap")
+
+          out = ["# payload 常量扫描", "",
+                 "由 CI 从 `app/src/main/assets/` 的二进制直接扫描得出，未执行任何代码。", ""]
+
+          for name in TARGETS:
+              path = BASE / name
+              if not path.exists():
+                  out += [f"## {name}", "", "资产不存在。", ""]
+                  continue
+              data = path.read_bytes()
+              hits = collections.OrderedDict()
+              for off in range(0, len(data) - 8, 4):
+                  value = int.from_bytes(data[off:off + 8], "little")
+                  if LO <= value < HI:
+                      if value in hits:
+                          hits[value][1] += 1
+                      else:
+                          hits[value] = [off, 1]
+
+              rows = sorted(hits.items(), key=lambda kv: -kv[1][1])
+              shown = rows[:220]
+              out += [f"## {name}", "", f"`{len(data)}` bytes，内核地址立即数 `{len(hits)}` 个。", ""]
+              if not hits:
+                  out += ["无匹配（位置无关或运行时计算）。", ""]
+              else:
+                  out += ["| addr | off | hits | note |", "|---|---|---|---|"]
+                  for value, (off, count) in shown:
+                      out.append(f"| `0x{value:016x}` | `0x{off:x}` | {count} | {KNOWN.get(value, '')} |")
+                  if len(rows) > len(shown):
+                      out += ["", f"其余 {len(rows) - len(shown)} 项省略。"]
+                  out.append("")
+
+              strings = [s.decode("ascii", "replace") for s in re.findall(rb"[ -~]{6,}", data)]
+              marks = [s for s in strings if any(k in s.lower() for k in KEYWORDS)]
+              if marks:
+                  out += ["日志标记 / 关键字：", "", "```text", *marks[:80], "```", ""]
+
+          dest = pathlib.Path(os.environ["RUNNER_TEMP"]) / "analysis-report.md"
+          dest.write_text("\n".join(out) + "\n")
+          print(f"wrote {dest} ({len(out)} lines)")
+          PY
+
+      - name: 上传扫描报告
+        uses: actions/upload-artifact@v4
+        with:
+          name: payload-analysis
+          path: ${{ runner.temp }}/analysis-report.md
+          if-no-files-found: warn
