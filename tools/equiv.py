@@ -4,12 +4,11 @@
 两种模式，按「这个资产有没有归档基线」自动切换：
 
   报告模式（plant/equiv/<名字>.json 还不存在）
-      源码还在草稿阶段，重建物与原件必然有差距。只把差距列出来，不判失败——
-      这份差距清单就是补 .c 的路线图。
+      源码还在草稿阶段，重建物与原件必然有差距。只把差距列出来，不判失败。
 
   严格模式（plant/equiv/<名字>.json 已归档）
-      该资产已经被自有源码替换，基线是当年原件的指纹。此后每次构建都必须
-      通过硬门槛，否则就是回归。
+      该资产已经被自有源码替换，基线是**第一次替换前原件**的指纹。
+      此后每次构建都必须通过硬门槛，否则就是回归。
 
 硬门槛：ELF/64 位/aarch64、原件日志锚点齐全、内核目标常量仍在、体积 0.5x~3x。
 提示项：字符串与立即数的增删。
@@ -17,7 +16,7 @@
 用法：
   python3 tools/equiv.py check <名字> <重建物路径>
   python3 tools/equiv.py check-dir <目录>
-  python3 tools/equiv.py baseline --out 目录    # 归档当前原件指纹（替换时用）
+  python3 tools/equiv.py baseline [--force]     # 归档当前原件指纹（替换时用）
 """
 
 from __future__ import annotations
@@ -33,7 +32,7 @@ ASSETS = ROOT / "app" / "src" / "main" / "assets"
 BASELINE_DIR = ROOT / "plant" / "equiv"
 
 ANCHOR_HINTS = (
-    "必需项全部通过", "必需接口不可用", "OK", "FAIL",
+    "必需项全部通过", "必需接口不可用", " OK ", "FAIL",
     "slide=", "calc=", "site=",
     "listening", "rootd", "zombie", "leak", "selinux", "cred",
     "uid=0", "holding", "cap", "pipe",
@@ -183,24 +182,30 @@ def cmd_check_dir(directory: str) -> int:
     return 1 if failures else 0
 
 
-def cmd_baseline(out_dir: pathlib.Path | None) -> int:
+def cmd_baseline(force: bool, out_dir: pathlib.Path | None) -> int:
     dest = out_dir or BASELINE_DIR
     dest.mkdir(parents=True, exist_ok=True)
     names = ["uaf_plant_replay", "reach_probe", "slide_probe", "perf_slide", "pc98260-su"]
-    written = 0
+    written = skipped = 0
     for name in names:
         asset = ASSETS / name
         if not asset.exists():
             print(f"SKIP {name}（资产不存在）")
             continue
+        target = dest / f"{name}.json"
+        if target.exists() and not force:
+            # 基线一旦归档就代表「替换前的原件」，不能被后续的自有产物覆盖
+            print(f"KEEP {target}（已存在，不覆盖；需要重建请加 --force）")
+            skipped += 1
+            continue
         payload = fingerprint(name, asset.read_bytes())
-        (dest / f"{name}.json").write_text(
+        target.write_text(
             json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
         )
-        print(f"WROTE {dest.name}/{name}.json  markers={len(payload['markers'])} "
+        print(f"WROTE {target}  markers={len(payload['markers'])} "
               f"constants={payload['constantCount']}")
         written += 1
-    print(f"\n归档 {written} 份 → {dest}")
+    print(f"\n归档 {written} 份，保留 {skipped} 份 → {dest}")
     return 0
 
 
@@ -215,8 +220,9 @@ def main() -> int:
     if cmd == "check-dir" and len(argv) >= 2:
         return cmd_check_dir(argv[1])
     if cmd == "baseline":
+        force = "--force" in argv
         out = pathlib.Path(argv[argv.index("--out") + 1]) if "--out" in argv else None
-        return cmd_baseline(out)
+        return cmd_baseline(force, out)
     print(__doc__)
     return 2
 
