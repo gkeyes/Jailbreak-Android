@@ -77,15 +77,16 @@
     {
       "name": "slide_probe",
       "path": "app/src/main/assets/slide_probe",
-      "size": 35352,
-      "gitBlobSha1": "09742d64ce2a94de40f5199ee3b0deb578abfe32",
-      "sha256": "8b3681cbd2966eefe5a800b8964e58253ff338b37bffe997b4d891933c8c9e3c",
-      "origin": "rebuilt-from-source",
-      "sourceDraft": "plant/slide_probe.c",
+      "size": 1169368,
+      "gitBlobSha1": "9ce260c0235c1de6f12a6a15f73e81f52be1a309",
+      "sha256": "d720831c064377e8e5149c296a316758b8c26db7b499eb5111e5a2299e46ed15",
+      "origin": "upstream-source",
+      "sourceDraft": "Lw5959/xring-cve-2026-98260@8b404774/src/xr98260_slide_probe.c",
       "inApk": true,
       "usedBy": "core/AssetDeployer.RUNTIME_ASSETS（tracefs 触发器测 KASLR 位移）",
-      "status": "rebuilt",
-      "action": "2026-11-22 由 plant/slide_probe.c 交叉编译后替换"
+      "status": "upstream-built",
+      "action": "2026-11-22 由上游 MIT 源码编译后替换（见 tools/xring.lock.properties）",
+      "license": "MIT"
     },
     {
       "name": "perf_slide",
@@ -103,15 +104,16 @@
     {
       "name": "pc98260-su",
       "path": "app/src/main/assets/pc98260-su",
-      "size": 26616,
-      "gitBlobSha1": "99f2323ab4af1d6798567c1fb07c86f3b04f9a88",
-      "sha256": "231cf185d2808b66c9fd7cc45c00ab5a0fa4b7fa588f96e06587af8ee390fdd2",
-      "origin": "rebuilt-from-source",
-      "sourceDraft": "plant/pc98260-su.c",
+      "size": 1017552,
+      "gitBlobSha1": "dfdd30e2472429663437b2030775ae4299a89daf",
+      "sha256": "d43c06eea8f4864da871017bc9733751183d2bd03ceedec99dcddc7c8fd742ae",
+      "origin": "upstream-source",
+      "sourceDraft": "Lw5959/xring-cve-2026-98260@8b404774/src/pc98260_su.c",
       "inApk": true,
       "usedBy": "core/AssetDeployer.RUNTIME_ASSETS（连 rootd 执行命令）",
-      "status": "rebuilt",
-      "action": "2026-11-22 由 plant/pc98260-su.c 交叉编译后替换"
+      "status": "upstream-built",
+      "action": "2026-11-22 由上游 MIT 源码编译后替换（见 tools/xring.lock.properties）",
+      "license": "MIT"
     },
     {
       "name": "lhasa_profile.txt",
