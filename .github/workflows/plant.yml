@@ -2,7 +2,8 @@ name: plant
 
 # plant/ 下的自有 C 源码：交叉编译 + 与原件/基线的等价性验证。
 #
-# 默认全只读。唯一会写仓库的是 publish job：提交信息里带 [publish] 才会跑。
+# 默认只读。唯一会写仓库的是 publish job：提交信息里带 [publish] 才会跑。
+# publish 自己编译，不依赖 Artifact 存储（配额满时 upload 会静默失败）。
 
 on:
   push:
@@ -84,7 +85,7 @@ jobs:
             ${{ runner.temp }}/equiv.log
             ${{ runner.temp }}/compile.log
           if-no-files-found: ignore
-          retention-days: 7
+          retention-days: 3
 
       - name: 失败时把日志写进 issue
         if: failure()
@@ -115,17 +116,31 @@ jobs:
   publish:
     name: 替换 assets
     if: contains(github.event.head_commit.message, '[publish]')
-    needs: compile
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      issues: write
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/download-artifact@v4
-        with:
-          name: plant-binaries
-          path: "${{ runner.temp }}/plant"
+      - name: 安装 zig
+        run: |
+          set -e
+          curl -fsSL https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz -o "$RUNNER_TEMP/zig.tar.xz"
+          tar -xf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/zig-linux-x86_64-0.13.0" >> "$GITHUB_PATH"
+
+      - name: 编译
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/out"
+          CFLAGS=(-target aarch64-linux-musl -O2 -static -s
+                  -ffunction-sections -fdata-sections -Wl,--gc-sections
+                  -fno-asynchronous-unwind-tables -fno-unwind-tables -pthread)
+          for name in reach_probe slide_probe perf_slide pc98260-su; do
+            zig cc "${CFLAGS[@]}" "plant/$name.c" -o "$RUNNER_TEMP/out/$name"
+            ls -l "$RUNNER_TEMP/out/$name"
+          done
 
       - name: 归档原件基线
         run: |
@@ -137,19 +152,12 @@ jobs:
         run: |
           set -e
           for name in reach_probe slide_probe perf_slide pc98260-su; do
-            src="$RUNNER_TEMP/plant/out/$name"
-            [ -f "$src" ] || src="$RUNNER_TEMP/plant/$name"
-            if [ ! -f "$src" ]; then
-              echo "::error::缺少产物 $name"
-              find "$RUNNER_TEMP/plant" -maxdepth 3 -type f | head -20
-              exit 1
-            fi
-            cp "$src" "app/src/main/assets/$name"
+            cp "$RUNNER_TEMP/out/$name" "app/src/main/assets/$name"
             chmod 755 "app/src/main/assets/$name"
             ls -l "app/src/main/assets/$name"
           done
 
-      - name: 同步台账
+      - name: 同步台账并自检
         run: |
           python3 - <<'PY'
           import hashlib, json, pathlib, subprocess, datetime
@@ -206,10 +214,11 @@ jobs:
           {
             echo "commit: \`$GITHUB_SHA\`"
             echo
-            echo "publish job 失败，现场："
+            echo "publish job 失败。产物目录："
             echo '```text'
-            ls -R "$RUNNER_TEMP/plant" 2>/dev/null | head -40 || true
+            ls -lR "$RUNNER_TEMP/out" 2>/dev/null || echo "（无产物）"
             echo '```'
+            echo "工作树状态："
             echo '```text'
             git status --short 2>/dev/null | head -20 || true
             echo '```'
