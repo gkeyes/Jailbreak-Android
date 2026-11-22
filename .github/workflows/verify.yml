@@ -31,7 +31,9 @@ jobs:
           java-version: '17'
       - name: Assets ledger, tests and assemble
         id: verify
-        run: bash tools/ci_verify.sh
+        run: |
+          set -o pipefail
+          bash tools/ci_verify.sh 2>&1 | tee "$RUNNER_TEMP/verify.log"
       - name: Upload APK
         if: always()
         uses: actions/upload-artifact@v4
@@ -45,6 +47,7 @@ jobs:
         with:
           name: lhasa26-build-logs
           path: |
+            ${{ runner.temp }}/verify.log
             ${{ runner.temp }}/verify-report.md
             ${{ runner.temp }}/test.log
             ${{ runner.temp }}/build.log
@@ -61,21 +64,17 @@ jobs:
           {
             echo "commit: \`$GITHUB_SHA\`"
             echo
-            echo "### build.log 尾部"
+            echo "### verify.sh 输出（结尾）"
             echo '```text'
-            tail -c 9000 "$RUNNER_TEMP/build.log" 2>/dev/null || echo "（无 build.log）"
+            tail -c 16000 "$RUNNER_TEMP/verify.log" 2>/dev/null || echo "（无 verify.log）"
             echo '```'
-            echo "### test.log 尾部"
+            echo "### verify-report.md"
             echo '```text'
-            tail -c 6000 "$RUNNER_TEMP/test.log" 2>/dev/null || echo "（无 test.log）"
+            tail -c 4000 "$RUNNER_TEMP/verify-report.md" 2>/dev/null || echo "（无报告）"
             echo '```'
-            echo "### assets.log 尾部"
+            echo "### 构建产物目录"
             echo '```text'
-            tail -c 3000 "$RUNNER_TEMP/assets.log" 2>/dev/null || echo "（无 assets.log）"
-            echo '```'
-            echo "### 失败注解"
-            echo '```text'
-            grep -E "error:|FAILED|warning:.*\[-W" "$RUNNER_TEMP/build.log" "$RUNNER_TEMP/test.log" 2>/dev/null | head -40 || true
+            ls -la app/build/outputs/apk/debug/ 2>/dev/null || echo "（目录不存在）"
             echo '```'
           } > "$body"
           gh issue create --title "$title" --body-file "$body" \
