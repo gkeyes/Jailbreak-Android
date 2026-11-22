@@ -5,24 +5,24 @@
 #
 # 用法：tools/verify_apk_assets.sh [包名]
 #
-# 期望值来自 tools/assets-ledger.json。改动 assets 后要同步这里的常量。
+# 期望值必须与 tools/assets-ledger.json 保持一致；改动 assets 后要同步这里。
 
 set -u
 
 PKG="${1:-com.gkeyes.lhasa26}"
 
-# 台账登记值（2026-11-22 第二次替换后）
+# 台账现值（2026-11-22，第二次替换 + perf_slide 两轮修复之后）
+#   perf_slide    37376  be977d32…  软件事件回退 + --duration 按秒 + profile 投票
+#   slide_probe   35352  8b3681cb…  先开 trace 再 timer_create
 #   reach_probe   45664  0938f6b6…
-#   slide_probe   35352  8b3681cb…
-#   perf_slide    37296  356ae757…
 #   pc98260-su    26616  231cf185…
-#   ksud        4990848  4f7d5fd6…（上游原件）
-#   uaf_plant_replay 88488（无源码，保持原件）
+#   ksud        4990848  4f7d5fd6…  上游原件（KernelSU v3.3.1 的 libksud.so）
+#   uaf_plant_replay 88488（无源码，保持原件，台账里记为不可重建）
 expect_sha() {
 	case "$1" in
-		reach_probe) echo 0938f6b6f873665db0fc03e17bf0555f30327605c6cf2e9b9661ea67b3d16d10 ;;
+		perf_slide)  echo be977d32d3def2fe6673403f4fd92626af8fe68eb1439f7d5fca49f723d89aca ;;
 		slide_probe) echo 8b3681cbd2966eefe5a800b8964e58253ff338b37bffe997b4d891933c8c9e3c ;;
-		perf_slide)  echo 356ae7578eaa63811ceaec9967bd44d195d9057e4f5106c3159a2a6c05e86798 ;;
+		reach_probe) echo 0938f6b6f873665db0fc03e17bf0555f30327605c6cf2e9b9661ea67b3d16d10 ;;
 		pc98260-su)  echo 231cf185d2808b66c9fd7cc45c00ab5a0fa4b7fa588f96e06587af8ee390fdd2 ;;
 		ksud)        echo 4f7d5fd65631915ea579ff406bd9cbe58217f2c91dac6527f5b2f28ad4508171 ;;
 		*)           echo "" ;;
@@ -41,7 +41,7 @@ mkdir -p "$work" || exit 1
 trap 'rm -rf "$work"' EXIT
 
 fail=0
-for name in reach_probe slide_probe perf_slide pc98260-su ksud uaf_plant_replay; do
+for name in perf_slide slide_probe reach_probe pc98260-su ksud uaf_plant_replay; do
 	if ! unzip -p "$apk_path" "assets/$name" > "$work/$name" 2>/dev/null || [ ! -s "$work/$name" ]; then
 		echo "缺失 assets/$name"
 		fail=1
