@@ -1,31 +1,20 @@
 #!/usr/bin/env python3
 """把 BootGuard / DeployGate 接到 WorkflowEngine 的真实入口。
 
-不用 patch / diff：hunk 行号与行数太容易写错，git apply 会整份拒绝。
-锚点式替换，每处断言“恰好命中一次”，不命中就报错退出。
+两次失败的教训：
+  - git apply 对 hunk 行数校验严格，手写 diff 的数字写错就整份拒绝；
+  - 多行精确字符串做锚点，文件一旦被改过一次就再也匹配不上。
 
-幂等判断必须“先看结果、再看锚点”。
-反例：常量那条的锚点（CLEAN_SKIP_AVAILABLE_KB 那一行）在替换后仍然存在，
-如果先看锚点就会每次都再揥一次，造成变量重复定义。
+所以部署相关三处改用正则做结构性替换（能同时适配基线、旧接线、新接线三种形态），
+其余不需要变化的小改动继续用精确字符串。每条改动都断言“命中一次”。
 """
 from __future__ import annotations
 
 import pathlib
+import re
 import sys
 
 TARGET = pathlib.Path("app/src/main/java/com/gkeyes/lhasa26/core/WorkflowEngine.java")
-
-THREAD_OLD = (
-    '        final java.util.concurrent.atomic.AtomicReference<Exception> deployError =\n'
-    '                new java.util.concurrent.atomic.AtomicReference<>();\n'
-    '        Thread deploy = new Thread(() -> {\n'
-    '            try {\n'
-    '                deployer.stageAll();\n'
-    '            } catch (Exception error) {\n'
-    '                deployError.set(error);\n'
-    '            }\n'
-    '        }, "lhasa-deploy");\n'
-)
 
 THREAD_NEW = (
     '        final DeployGate deployGate = new DeployGate(DEPLOY_TIMEOUT_MS);\n'
@@ -36,34 +25,33 @@ THREAD_NEW = (
     '            } catch (Throwable error) {\n'
     '                deployGate.fail(error);\n'
     '            }\n'
-    '        }, "lhasa-deploy");\n'
-)
-
-GATE_BASELINE = (
-    '        deploy.join(8000L);\n'
-    '        if (deployError.get() != null) {\n'
-    '            throw deployError.get();\n'
-    '        }\n'
-)
-
-GATE_OLD_WIRED = (
-    '        DeployGate.Result deployResult = new DeployGate(DEPLOY_TIMEOUT_MS)\n'
-    '                .await(deploy, deployError);\n'
+    '        }, "lhasa-deploy");'
 )
 
 GATE_NEW = '        DeployGate.Result deployResult = deployGate.await(deploy);\n'
 
-CHANGES: list[tuple[str, list[str], str]] = [
-    (
-        "DEPLOY_TIMEOUT_MS 常量",
-        [
-            '    private static final long CLEAN_SKIP_AVAILABLE_KB = 3000000L;\n'
-            '    private static final Pattern RUNNING_PAYLOAD'
-        ],
-        '    private static final long CLEAN_SKIP_AVAILABLE_KB = 3000000L;\n'
-        '    private static final long DEPLOY_TIMEOUT_MS = 8000L;\n'
-        '    private static final Pattern RUNNING_PAYLOAD',
-    ),
+THREAD_RE = re.compile(
+    r'        final java\.util\.concurrent\.atomic\.AtomicReference<Exception> deployError =\n'
+    r'.*?\}, "lhasa-deploy"\);',
+    re.S,
+)
+
+GATE_JOIN_RE = re.compile(
+    r'        deploy\.join\(8000L\);\n'
+    r'        if \(deployError\.get\(\) != null\) \{\n'
+    r'            throw deployError\.get\(\);\n'
+    r'        \}\n'
+)
+
+GATE_TWO_ARG_RE = re.compile(
+    r'        DeployGate\.Result deployResult = .*?;\n',
+    re.S,
+)
+
+CONST_RE = re.compile(r'(    private static final long CLEAN_SKIP_AVAILABLE_KB = 3000000L;\n)')
+CONST_LINE = '    private static final long DEPLOY_TIMEOUT_MS = 8000L;\n'
+
+STR_CHANGES: list[tuple[str, list[str], str]] = [
     (
         "内核不匹配警告",
         [
@@ -75,8 +63,6 @@ CHANGES: list[tuple[str, list[str], str]] = [
         '            append(BootGuard.kernelWarning(kernel));\n'
         '        }\n',
     ),
-    ("部署线程改为显式回报", [THREAD_OLD], THREAD_NEW),
-    ("部署闸门调用", [GATE_BASELINE, GATE_OLD_WIRED], GATE_NEW),
     (
         "runPayload 调用点",
         ['        if (!runPayload(addressArgument)) {\n'],
@@ -121,25 +107,6 @@ CHANGES: list[tuple[str, list[str], str]] = [
         '                if (outcome == BootGuard.Outcome.RETRY_SAFE) {\n',
     ),
     (
-        "删除两个旧标记方法",
-        [
-            '    private boolean containsSuccessMarker(String tail) {\n'
-            '        return tail.contains("[child-cred] uid=0")\n'
-            '                || tail.contains("[cred] rooted")\n'
-            '                || tail.contains("holding pages")\n'
-            '                || tail.contains("[selinux] already permissive");\n'
-            '    }\n'
-            '\n'
-            '    private boolean containsRetryMarker(String tail) {\n'
-            '        return tail.contains("holding zombie")\n'
-            '                || tail.contains("leak failed")\n'
-            '                || tail.contains("[selinux] attempt 2/");\n'
-            '    }\n'
-            '\n'
-        ],
-        '',
-    ),
-    (
         "stopPayload 改为进程组信号",
         ['        run("pkill -f uaf_plant_replay 2>/dev/null; killall uaf_plant_replay 2>/dev/null; true", true);\n'],
         '        run(BootGuard.killCommand(), true);\n',
@@ -173,51 +140,64 @@ CHANGES: list[tuple[str, list[str], str]] = [
 
 def main() -> int:
     source = TARGET.read_text(encoding="utf-8")
-    applied = 0
-    skipped = 0
-    failures: list[str] = []
+    log: list[str] = []
 
-    for label, needles, replacement in CHANGES:
-        # 先看结果：已经改过的位置直接跳过，避免带前缀性质的锚点被重复揥入。
+    # 1) 常量：单次插入，已有就不动。
+    if "DEPLOY_TIMEOUT_MS" not in source:
+        source, n = CONST_RE.subn(lambda m: m.group(1) + CONST_LINE, source, count=1)
+        log.append(f"常量插入 {n}")
+    else:
+        log.append("常量已存在")
+
+    # 2) 部署线程：基线（带 AtomicReference）或旧接线都能匹配。
+    if "markCompleted" not in source:
+        source, n = THREAD_RE.subn(lambda m: THREAD_NEW, source, count=1)
+        log.append(f"部署线程替换 {n}")
+    else:
+        log.append("部署线程已是显式回报")
+
+    # 3) 闸门调用：基线的 join 块，或旧接线的两参数 await。
+    if "deployGate.await(deploy)" not in source:
+        source, n = GATE_JOIN_RE.subn(lambda m: GATE_NEW, source, count=1)
+        log.append(f"闸门（基线）替换 {n}")
+        if n == 0:
+            source, n = GATE_TWO_ARG_RE.subn(lambda m: GATE_NEW, source, count=1)
+            log.append(f"闸门（旧接线）替换 {n}")
+    else:
+        log.append("闸门已是 deployGate.await")
+
+    # 4) 其余小改动（精确字符串，已改过的跳过）。
+    for label, needles, replacement in STR_CHANGES:
         if replacement and replacement in source:
-            skipped += 1
+            log.append(f"{label}: 已应用")
             continue
-        hit = None
-        for needle in needles:
-            if source.count(needle) == 1:
-                hit = needle
-                break
+        hit = next((n for n in needles if source.count(n) == 1), None)
         if hit is not None:
             source = source.replace(hit, replacement)
-            applied += 1
+            log.append(f"{label}: 已替换")
             continue
         if not replacement:
-            skipped += 1
+            log.append(f"{label}: 无需")
             continue
-        counts = ", ".join(str(source.count(n)) for n in needles)
-        failures.append(f"{label}: 候选锚点命中次数 [{counts}]，均不为 1")
-
-    if failures:
-        for line in failures:
-            print(f"::error::{line}")
+        log.append(f"{label}: 锚点命中 {[source.count(n) for n in needles]}")
+        for line in log:
+            print(line)
+        print(f"::error::{label} 无法定位")
         return 1
 
-    TARGET.write_text(source, encoding="utf-8")
-    print(f"applied={applied} skipped={skipped}")
-    for marker in ("BootGuard.classify", "DeployGate", "markCompleted", "DEPLOY_TIMEOUT_MS",
-                   "deployError", "containsSuccessMarker", "containsRetryMarker",
-                   "pkill -f uaf_plant_replay", "killall uaf_plant_replay"):
-        print(f"{marker}: {source.count(marker)}")
+    for line in log:
+        print(line)
 
-    problems = []
-    if source.count("DEPLOY_TIMEOUT_MS") > 2:
-        problems.append("DEPLOY_TIMEOUT_MS 重复定义")
-    for leftover in ("containsSuccessMarker", "containsRetryMarker", "deployError",
+    TARGET.write_text(source, encoding="utf-8")
+    problems: list[str] = []
+    if source.count("DEPLOY_TIMEOUT_MS") != 2:
+        problems.append(f"DEPLOY_TIMEOUT_MS 出现 {source.count('DEPLOY_TIMEOUT_MS')} 次（应为 2）")
+    if source.count("markCompleted") != 1:
+        problems.append(f"markCompleted 出现 {source.count('markCompleted')} 次（应为 1）")
+    for leftover in ("deployError", "containsSuccessMarker", "containsRetryMarker",
                      "pkill -f uaf_plant_replay", "killall uaf_plant_replay"):
         if source.count(leftover):
             problems.append(f"仍残留 {leftover}")
-    if source.count("markCompleted") != 1:
-        problems.append(f"markCompleted 出现 {source.count('markCompleted')} 次")
 
     if problems:
         for line in problems:
