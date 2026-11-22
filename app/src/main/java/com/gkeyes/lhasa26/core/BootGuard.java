@@ -35,6 +35,15 @@ public final class BootGuard {
     public static final String PID_FILE = "/data/local/tmp/.lhasa_pid";
 
     /**
+     * 阶段面包屑：每个会碰内核的动作开跑前写一次，成功后清空。
+     * 下次启动时若这行还在，就说明上一次运行停在了那个阶段——重启之后再也不用猜是谁弄的。
+     */
+    public static final String STAGE_FILE = "/data/local/tmp/.lhasa_stage";
+
+    /** timeout(1) 被触发时的退出码，用来把"卡死"和"程序自己返回失败"区分开。 */
+    public static final int TIMEOUT_EXIT = 124;
+
+    /**
      * Payload prefixes that mean the kernel heap is already dirty. Checked before the success markers
      * because a tail containing both still left a dangling node behind.
      */
@@ -99,6 +108,68 @@ public final class BootGuard {
     public static String kernelWarning(String kernel) {
         return "（警告）内核不在已验证 profile 表：" + kernel
                 + " · 将按现有 offsets 继续尝试；若失败或内核异常，请重启后再试，不要在本次开机重复点击";
+    }
+
+    /**
+     * 给单次探测命令套上硬超时。
+     *
+     * 采样器（perf_slide）和 tracefs 探测在异常内核上可能永远不返回；没有 timeout 时它们会
+     * 以 root 身份常驻，把设备拖进 soft lockup，最后表现成"用一次就重启一次"。
+     * timeout 是 toybox 自带，Android 9 以后都在。
+     */
+    public static String withTimeout(int seconds, String command) {
+        return "timeout " + seconds + " " + command;
+    }
+
+    /** 记下"接下来要碰内核了"；失败或重启后靠它定位。 */
+    public static String markCommand(String stage) {
+        return "echo '" + sanitize(stage) + " " + System.currentTimeMillis() + "' > " + STAGE_FILE;
+    }
+
+    /** 成功走完后清掉面包屑。 */
+    public static String clearStageCommand() {
+        return "rm -f " + STAGE_FILE;
+    }
+
+    /**
+     * 把上一次残留的阶段读成一句人话；没有残留就返回空串。
+     * timestamp 用于判断是不是本次开机的事。
+     */
+    public static String leftoverStageHint(String stageFileContent) {
+        if (stageFileContent == null || stageFileContent.trim().isEmpty()) {
+            return "";
+        }
+        String[] parts = stageFileContent.trim().split("\\s+");
+        String stage = parts[0];
+        String label;
+        switch (stage) {
+            case "payload":
+                label = "主利用（uaf_plant_replay）";
+                break;
+            case "ksu":
+                label = "KernelSU late-load（加载内核模块）";
+                break;
+            case "probe-perf":
+                label = "perf_slide 采样";
+                break;
+            case "probe-slide":
+                label = "slide_probe 测量";
+                break;
+            case "diagnose":
+                label = "reach_probe 诊断";
+                break;
+            default:
+                label = stage;
+                break;
+        }
+        return "上次运行停在「" + label + "」阶段，没有正常结束——如果是重启造成的，那就是这个阶段把设备带走的。";
+    }
+
+    private static String sanitize(String stage) {
+        if (stage == null) {
+            return "unknown";
+        }
+        return stage.replaceAll("[^A-Za-z0-9_.-]", "_");
     }
 
     /**
