@@ -1,6 +1,12 @@
 package com.gkeyes.lhasa26.core;
 
 import java.io.IOException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.FutureTask;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 public interface CommandExecutor {
     CommandResult run(String command, boolean quiet) throws Exception;
@@ -12,80 +18,88 @@ public interface CommandExecutor {
     /** Returned by waitWithTimeout when the bounded wait expired. */
     int TIMEOUT = Integer.MIN_VALUE;
 
+    /**
+     * 共享守护线程池。
+     *
+     * 之前每次 run() 都新建 3 个线程（等待 + 两条流 drain），一轮完整流程会产生上千个线程，
+     * 在 UAF 堆布局敏感的窗口里制造调度噪声。
+     */
+    ExecutorService ASYNC_POOL = Executors.newCachedThreadPool(r -> {
+        Thread thread = new Thread(r, "lhasa-exec");
+        thread.setDaemon(true);
+        return thread;
+    });
+
     /** Stops whatever remote process is currently running, if any. */
     default void kill() {
+    }
+
+    /** 调用方用完某个 open() 出来的进程后注销它，避免集合里长期残留。 */
+    default void release(Process process) {
     }
 
     /**
      * Waits for a Shizuku-backed process without calling exitValue(). The remote implementation keeps
      * its own exited flag, so the default waitFor(long, TimeUnit) reports completion early and the
-     * follow-up exitValue() throws "process hasn't exited".
+     * timeout would never fire; a plain waitFor() on a worker thread is the only reliable option.
      */
     static int waitWithTimeout(Process process, long seconds) throws InterruptedException {
-        final java.util.concurrent.FutureTask<Integer> task =
-                new java.util.concurrent.FutureTask<>(() -> process.waitFor());
-        Thread thread = new Thread(task, "lhasa-wait");
-        thread.setDaemon(true);
-        thread.start();
+        final FutureTask<Integer> task = new FutureTask<>(() -> process.waitFor());
+        ASYNC_POOL.execute(task);
         try {
-            return task.get(seconds, java.util.concurrent.TimeUnit.SECONDS);
-        } catch (java.util.concurrent.TimeoutException timeout) {
+            return task.get(seconds, TimeUnit.SECONDS);
+        } catch (TimeoutException timeout) {
             task.cancel(true);
             try {
                 process.destroy();
-            } catch (Throwable ignored) {
-                // Remote process may already be gone.
-            }
-            try {
                 process.destroyForcibly();
             } catch (Throwable ignored) {
-                // Nothing else to do.
+                // Nothing else to do for a stuck remote process.
             }
             return TIMEOUT;
         } catch (java.util.concurrent.ExecutionException failure) {
-            return TIMEOUT;
+            return -1;
         }
     }
 
     static String readProcessOutput(Process process) throws IOException, InterruptedException {
         StringBuilder output = new StringBuilder();
-        Thread stdout = new Thread(() -> drain(process.getInputStream(), output), "lhasa-stdout");
-        Thread stderr = new Thread(() -> drain(process.getErrorStream(), output), "lhasa-stderr");
-        stdout.start();
-        stderr.start();
+        Future<?> stdout = ASYNC_POOL.submit(() -> drain(process.getInputStream(), output));
+        Future<?> stderr = ASYNC_POOL.submit(() -> drain(process.getErrorStream(), output));
         int exitCode = waitWithTimeout(process, 120L);
-        joinQuietly(stdout);
-        joinQuietly(stderr);
+        awaitFuture(stdout);
+        awaitFuture(stderr);
         if (exitCode == TIMEOUT) {
             throw new IOException("命令超时（120 秒）");
         }
-        if (exitCode != 0 && output.length() == 0) {
-            output.append("命令退出码 ").append(exitCode);
+        synchronized (output) {
+            return output.toString();
         }
-        return output.toString();
     }
 
-    static void drain(java.io.InputStream input, StringBuilder output) {
-        try (java.io.InputStream stream = input) {
+    static void drain(java.io.InputStream stream, StringBuilder sink) {
+        try (java.io.InputStream input = stream) {
             byte[] buffer = new byte[8192];
             int count;
-            while ((count = stream.read(buffer)) >= 0) {
+            while ((count = input.read(buffer)) >= 0) {
                 if (count > 0) {
-                    synchronized (output) {
-                        output.append(new String(buffer, 0, count, java.nio.charset.StandardCharsets.UTF_8));
+                    synchronized (sink) {
+                        sink.append(new String(buffer, 0, count));
                     }
                 }
             }
         } catch (Exception ignored) {
-            // The command result is still useful when a stream closes during process teardown.
+            // The command result is still useful when a stream closes during teardown.
         }
     }
 
-    static void joinQuietly(Thread thread) {
+    static void awaitFuture(Future<?> future) {
         try {
-            thread.join(8000L);
+            future.get(8000L, TimeUnit.MILLISECONDS);
         } catch (InterruptedException interrupted) {
             Thread.currentThread().interrupt();
+        } catch (Exception ignored) {
+            // Best-effort drain completion.
         }
     }
 }
