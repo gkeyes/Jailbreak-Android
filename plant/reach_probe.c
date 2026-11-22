@@ -11,9 +11,12 @@
 #define _GNU_SOURCE 1
 #include <errno.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 #include <sys/syscall.h>
 #include <linux/perf_event.h>
@@ -30,11 +33,6 @@ static void report(const char *name, int ok, const char *detail)
 		g_failures++;
 	printf("[probe] %-30s %s%s%s\n", name, ok ? "OK" : "FAIL",
 	       (detail && *detail) ? "  " : "", (detail && *detail) ? detail : "");
-}
-
-static void report_required(const char *name, int ok, const char *detail)
-{
-	report(name, ok, detail);
 }
 
 static int perf_open(uint32_t type, uint64_t config)
@@ -113,50 +111,50 @@ int main(void)
 	char detail[160];
 
 	detail[0] = '\0';
-	report_required("tracefs (trace_pipe_raw)", check_tracefs(detail, sizeof(detail)), detail);
+	report("tracefs (trace_pipe_raw)", check_tracefs(detail, sizeof(detail)), detail);
 
 	int software = perf_event_open_software();
 	if (software < 0)
 		snprintf(detail, sizeof(detail), "errno=%d (%s)", errno, strerror(errno));
 	else
 		snprintf(detail, sizeof(detail), "PERF_COUNT_SW_CPU_CLOCK");
-	report_required("perf_event_open (software)", software == 0, detail);
+	report("perf_event_open (software)", software == 0, detail);
 
 	int hardware = perf_event_open_hardware();
 	if (hardware < 0)
 		snprintf(detail, sizeof(detail), "errno=%d (%s)", errno, strerror(errno));
 	else
 		snprintf(detail, sizeof(detail), "PERF_COUNT_HW_CPU_CYCLES");
-	report_required("perf_event_open (hardware)", hardware == 0, detail);
+	report("perf_event_open (hardware)", hardware == 0, detail);
 
-	int timer_ok = check_timer(detail, sizeof(detail));
-	report_required("timer_create (thread cpu)", timer_ok, detail);
+	report("timer_create (thread cpu)", check_timer(detail, sizeof(detail)), detail);
 
 	long max_map = read_long("/proc/sys/vm/max_map_count");
 	snprintf(detail, sizeof(detail), "max_map_count=%ld（门槛 %ld）", max_map, MAX_MAP_COUNT_MIN);
-	report_required("vm.max_map_count", max_map >= MAX_MAP_COUNT_MIN, detail);
+	report("vm.max_map_count", max_map >= MAX_MAP_COUNT_MIN, detail);
 
 	long paranoid = read_long("/proc/sys/kernel/perf_event_paranoid");
 	snprintf(detail, sizeof(detail), "perf_event_paranoid=%ld", paranoid);
 	report("perf_event_paranoid", paranoid <= 1, detail);
 
-	char enforce[16] = {0};
-	int fd = open("/sys/fs/selinux/enforce", O_RDONLY | O_CLOEXEC);
+	char enforce[16];
+	memset(enforce, 0, sizeof(enforce));
 	int selinux_ok = 0;
+	int fd = open("/sys/fs/selinux/enforce", O_RDONLY | O_CLOEXEC);
 	if (fd >= 0) {
 		ssize_t n = read(fd, enforce, sizeof(enforce) - 1);
 		close(fd);
 		selinux_ok = n > 0;
 	}
 	snprintf(detail, sizeof(detail), "enforce=%s", selinux_ok ? enforce : "?");
-	report_required("/sys/fs/selinux/enforce", selinux_ok, detail);
+	report("/sys/fs/selinux/enforce", selinux_ok, detail);
 
 	printf("\n");
-	if (g_failures == 0)
+	if (g_failures == 0) {
 		printf("必需项全部通过\n");
-	else {
-		printf("必需接口不可用：%d 项失败\n", g_failures);
-		printf("提示：上面标记 FAIL 的行就是缺失的能力，先解决它们再跑主利用。\n");
+		return 0;
 	}
-	return g_failures == 0 ? 0 : 1;
+	printf("必需接口不可用：%d 项失败\n", g_failures);
+	printf("提示：上面标记 FAIL 的行就是缺失的能力，先解决它们再跑主利用。\n");
+	return 1;
 }

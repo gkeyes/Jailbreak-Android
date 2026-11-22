@@ -1,8 +1,8 @@
 /*
  * slide_probe — perf 不可用时的后备：从 tracefs 的原始环形缓冲里捞内核指针，投票反解 slide。
  *
- * 与 perf_slide 共用同一套投票思路（text 段跨度只有十个左右 2MB 页，一个真指针只能由少数候选
- * slide 落入窗口），但数据源改成 /sys/kernel/tracing/per_cpu/cpuN/trace_pipe_raw。
+ * 与 perf_slide 共用同一套投票思路（text 段跨度只有十个左右 2MB 页，一个真指针只能由少数
+ * 候选 slide 落入窗口），但数据源改成 /sys/kernel/tracing/per_cpu/cpuN/trace_pipe_raw。
  *
  * 局限：这条路径依赖 tracefs 对本进程可读，而且需要前面已经有 kprobe/事件在产生记录。
  * 拿不到任何指针时会直接报告失败，不会编造地址。
@@ -12,10 +12,12 @@
 #define _GNU_SOURCE 1
 #include <errno.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 #include <sys/utsname.h>
 
@@ -87,10 +89,8 @@ static size_t read_cpu(int cpu)
 	size_t total = 0;
 	ssize_t n;
 	while ((n = read(fd, buffer, sizeof(buffer))) > 0) {
-		if (n > 0) {
-			scan_bytes(buffer, (size_t)n);
-			total += (size_t)n;
-		}
+		scan_bytes(buffer, (size_t)n);
+		total += (size_t)n;
 		if (total > 4 * 1024 * 1024)
 			break;
 	}
@@ -99,7 +99,7 @@ static size_t read_cpu(int cpu)
 	if (total > 0)
 		printf("[slide] raw cpu%d bytes=%zu hits=%zu\n", cpu, total, g_pointer_count);
 	else
-		printf("[slide] cpu%d %s\n", cpu, "无数据（tracefs 未产生记录）");
+		printf("[slide] cpu%d 无数据（tracefs 未产生记录）\n", cpu);
 	return total;
 }
 
