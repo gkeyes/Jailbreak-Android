@@ -1,7 +1,7 @@
 # 验收结果
 
-- commit: `282acb8e`
-- plant: failure
+- commit: `5f7810ee`
+- plant: success
 - 接线: success
 - 单测: failure
 - 编译: failure
@@ -53,6 +53,6 @@ You can use '--warning-mode all' to show the individual deprecation warnings and
 
 For more on this, please refer to https://docs.gradle.org/9.9.1/userguide/command_line_interface.html#sec:command_line_warnings in the Gradle documentation.
 
-BUILD FAILED in 38s
+BUILD FAILED in 26s
 15 actionable tasks: 15 executed
 ```
