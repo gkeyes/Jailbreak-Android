@@ -144,7 +144,7 @@ static void parse_args(int argc, char **argv, struct config *cfg)
 		cfg->period = 1000;
 }
 
-/* 采样一段时间，返回样本数；成功返回 0。 */
+/* 采样一段时间，返回 0 表示成功。 */
 static int sample(uint32_t type, uint64_t config, struct config *cfg,
                   int *samples_out, int *kernel_frames_out)
 {
@@ -239,7 +239,7 @@ int main(int argc, char **argv)
 	} else {
 		printf("[perf] hardware cycles open failed errno=%d (%s)\n",
 		       -hw_err, strerror(-hw_err));
-		/* 软件事件在 shell 身份下是允许的（硬件 PMU 被 SELinux 挡），换它对采样 */
+		/* 软件事件在 shell 身份下允许（硬件 PMU 被 SELinux 挡），换它对采样 */
 		int sw_err = sample(PERF_TYPE_SOFTWARE, PERF_COUNT_SW_CPU_CLOCK, &cfg,
 		                    &samples, &kernel_frames);
 		if (sw_err != 0) {
