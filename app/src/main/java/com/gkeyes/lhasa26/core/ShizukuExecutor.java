@@ -7,6 +7,11 @@ import java.io.InputStream;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 
 /** Small, testable wrapper around the official Shizuku process API. */
 public final class ShizukuExecutor implements CommandExecutor {
@@ -16,7 +21,16 @@ public final class ShizukuExecutor implements CommandExecutor {
             "HOME=/data/local/tmp",
             "TMPDIR=/data/local/tmp"
     };
-    private volatile Process active;
+
+    /**
+     * 所有在跑的远端进程。
+     *
+     * 之前是单个 `volatile Process active`：部署线程（stageAll → open）和工作线程
+     * （waitForIdle → run → 结尾 active = null）会互相覆盖，于是 DeployGate 超时时
+     * kill() 拿不到真正卡住的那个进程，被覆盖的另一条还会泄漏。
+     */
+    private final Set<Process> active =
+            Collections.newSetFromMap(new ConcurrentHashMap<Process, Boolean>());
 
     @Override
     public boolean isAvailable() {
@@ -36,24 +50,30 @@ public final class ShizukuExecutor implements CommandExecutor {
         if (process == null) {
             throw new IllegalStateException("Shizuku 拒绝启动 shell 进程");
         }
-        active = process;
+        active.add(process);
         return process;
     }
 
     @Override
     public void kill() {
-        Process current = active;
-        active = null;
-        if (current == null) {
+        List<Process> snapshot = new ArrayList<>(active);
+        active.clear();
+        for (Process process : snapshot) {
+            destroy(process);
+        }
+    }
+
+    private static void destroy(Process process) {
+        if (process == null) {
             return;
         }
         try {
-            current.destroy();
+            process.destroy();
         } catch (Throwable ignored) {
             // The remote process may already be gone.
         }
         try {
-            current.destroyForcibly();
+            process.destroyForcibly();
         } catch (Throwable ignored) {
             // Nothing else to do.
         }
@@ -85,27 +105,31 @@ public final class ShizukuExecutor implements CommandExecutor {
     @Override
     public CommandResult run(String command, boolean quiet) throws Exception {
         Process process = open(command);
-        ByteArrayOutputStream stdout = new ByteArrayOutputStream();
-        ByteArrayOutputStream stderr = new ByteArrayOutputStream();
-        Thread outThread = drainAsync(process.getInputStream(), stdout);
-        Thread errThread = drainAsync(process.getErrorStream(), stderr);
-        int exitCode = CommandExecutor.waitWithTimeout(process, 120L);
-        if (exitCode == CommandExecutor.TIMEOUT) {
-            kill();
-            outThread.join(2000L);
-            errThread.join(2000L);
-            return new CommandResult(-1, "命令超时（120 秒）：" + command);
+        try {
+            ByteArrayOutputStream stdout = new ByteArrayOutputStream();
+            ByteArrayOutputStream stderr = new ByteArrayOutputStream();
+            Thread outThread = drainAsync(process.getInputStream(), stdout);
+            Thread errThread = drainAsync(process.getErrorStream(), stderr);
+            int exitCode = CommandExecutor.waitWithTimeout(process, 120L);
+            if (exitCode == CommandExecutor.TIMEOUT) {
+                // 只销毁这一次调用的进程，不要把部署线程里的进程一起带走。
+                destroy(process);
+                outThread.join(2000L);
+                errThread.join(2000L);
+                return new CommandResult(-1, "命令超时（120 秒）：" + command);
+            }
+            outThread.join(8000L);
+            errThread.join(8000L);
+            String out = stdout.toString(StandardCharsets.UTF_8.name());
+            String err = stderr.toString(StandardCharsets.UTF_8.name());
+            String combined = err.isEmpty() ? out : out + (out.isEmpty() ? "" : "\n") + err;
+            if (!quiet && exitCode != 0 && combined.trim().isEmpty()) {
+                combined = "命令退出码 " + exitCode;
+            }
+            return new CommandResult(exitCode, combined);
+        } finally {
+            active.remove(process);
         }
-        outThread.join(8000L);
-        errThread.join(8000L);
-        String out = stdout.toString(StandardCharsets.UTF_8.name());
-        String err = stderr.toString(StandardCharsets.UTF_8.name());
-        String combined = err.isEmpty() ? out : out + (out.isEmpty() ? "" : "\n") + err;
-        if (!quiet && exitCode != 0 && combined.trim().isEmpty()) {
-            combined = "命令退出码 " + exitCode;
-        }
-        active = null;
-        return new CommandResult(exitCode, combined);
     }
 
     private static Thread drainAsync(InputStream input, ByteArrayOutputStream target) {
