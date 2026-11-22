@@ -1,7 +1,11 @@
 name: verify
 
 # 只读校验：资产台账 + 单测 + 组装 debug APK，产物作为运行附件上传。
-# 本工作流对仓库没有任何写权限（contents: read），验收结果与本次 SHA 一一对应。
+#
+# 唯一的写权限是 issues：写，而且**只在失败时**用它把日志尾巴写成一条 issue。
+# 原因很实际：CI 日志只能从网页看，MCP 侧拿不到 Artifact，
+# 失败原因落在 issue 里才能被程序读到——这比让人手抄日志可靠得多。
+# 它不碰仓库内容：没有任何 git 写操作。
 
 on:
   push:
@@ -10,6 +14,7 @@ on:
 
 permissions:
   contents: read
+  issues: write
 
 concurrency:
   group: verify-${{ github.ref }}
@@ -25,6 +30,7 @@ jobs:
           distribution: temurin
           java-version: '17'
       - name: Assets ledger, tests and assemble
+        id: verify
         run: bash tools/ci_verify.sh
       - name: Upload APK
         if: always()
@@ -44,3 +50,33 @@ jobs:
             ${{ runner.temp }}/build.log
             ${{ runner.temp }}/assets.log
           if-no-files-found: warn
+      - name: 失败时把日志写进 issue
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          title="ci: verify 失败 ${GITHUB_SHA:0:8}"
+          body="$RUNNER_TEMP/ci-failure.md"
+          {
+            echo "commit: \`$GITHUB_SHA\`"
+            echo
+            echo "### build.log 尾部"
+            echo '```text'
+            tail -c 9000 "$RUNNER_TEMP/build.log" 2>/dev/null || echo "（无 build.log）"
+            echo '```'
+            echo "### test.log 尾部"
+            echo '```text'
+            tail -c 6000 "$RUNNER_TEMP/test.log" 2>/dev/null || echo "（无 test.log）"
+            echo '```'
+            echo "### assets.log 尾部"
+            echo '```text'
+            tail -c 3000 "$RUNNER_TEMP/assets.log" 2>/dev/null || echo "（无 assets.log）"
+            echo '```'
+            echo "### 失败注解"
+            echo '```text'
+            grep -E "error:|FAILED|warning:.*\[-W" "$RUNNER_TEMP/build.log" "$RUNNER_TEMP/test.log" 2>/dev/null | head -40 || true
+            echo '```'
+          } > "$body"
+          gh issue create --title "$title" --body-file "$body" \
+            --repo "${{ github.repository }}" || echo "::warning::写 issue 失败，日志只在 Artifact 里"
