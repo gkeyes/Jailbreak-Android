@@ -3,20 +3,14 @@ package com.gkeyes.lhasa26.core;
 /**
  * Boot-scoped retry policy for the lhasa26 temporary-root workflow.
  *
- * The payload can fail in three structurally different ways and the difference decides whether the
- * same boot may be retried at all:
+ * Failures are structurally different and the difference decides whether the same boot may be
+ * retried at all:
  *
- *  - a clean leak failure, where nothing was planted and the heap is still untouched;
+ *  - a clean leak failure, where nothing was planted;
  *  - a planted-node failure ("holding zombie"), where the timerqueue node stays linked in the live
- *    task's posix_cputimers rbtree. Running the payload again makes release_task() erase the same
- *    freed node a second time, which faults the kernel instead of returning an error. This must be
- *    blocked for the rest of the boot, regardless of the current SELinux mode;
+ *    task's posix_cputimers rbtree. Running again makes release_task() erase the same freed node a
+ *    second time and faults the kernel. Blocked for the rest of the boot, whatever SELinux says;
  *  - a SELinux-only failure, where the first phase landed but the cred phase did not.
- *
- * Treating them all as "retry" is why a failed boot can end in a panic.
- *
- * Everything here is pure logic plus the exact shell strings the workflow needs, so it can be
- * exercised without a device.
  */
 public final class BootGuard {
 
@@ -30,11 +24,8 @@ public final class BootGuard {
 
     /** What the recorded failure of this boot allows. */
     public enum Retry {
-        /** No failure recorded for the running boot. */
         ALLOWED,
-        /** SELinux already went Permissive, so only the cred stage has to be retried. */
         PERMISSIVE_RETRY,
-        /** A node was left linked, or the kernel already faulted: never retry in this boot. */
         BLOCKED
     }
 
@@ -42,8 +33,8 @@ public final class BootGuard {
      * Written by the launch wrapper as `&lt;pgid&gt;:&lt;boot_id&gt;`.
      *
      * The boot id is essential: /data/local/tmp survives reboots, and a stale pgid can be reused by
-     * an unrelated shell-uid process. Note that a payload which already elevated itself runs as
-     * uid=0, which a uid=2000 shell cannot signal — kill/alive are best-effort evidence only.
+     * an unrelated shell-uid process. A payload that already elevated itself runs as uid=0, which a
+     * uid=2000 shell cannot signal — EPERM therefore means "still alive", not "gone".
      */
     public static final String PID_FILE = "/data/local/tmp/.lhasa_pid";
 
@@ -59,10 +50,6 @@ public final class BootGuard {
     private static final char BOOT_SEP = ':';
     private static final String BOOT_ID_READ = "$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)";
 
-    /**
-     * Payload prefixes that mean the kernel heap is already dirty. Checked before the success markers
-     * because a tail containing both still left a dangling node behind.
-     */
     private static final String[] ABORT_MARKERS = {
             "holding zombie",
             "Kernel panic",
@@ -71,18 +58,16 @@ public final class BootGuard {
             "Internal error"
     };
 
-    /** Markers that are only emitted once the cred stage actually landed. */
     private static final String[] SUCCESS_MARKERS = {
             "[child-cred] uid=0",
             "[cred] rooted"
     };
 
     /**
-     * Failures that leave nothing planted, so the same boot can run the payload again.
+     * Failures that leave nothing planted.
      *
-     * Deliberately does NOT contain "[selinux] attempt ": that line is emitted while the chain is
-     * still progressing normally (attempt 1/6 happens right at the start), and treating it as a retry
-     * signal killed a healthy run and restarted it.
+     * Deliberately does NOT contain "[selinux] attempt ": that line appears while the chain is still
+     * progressing normally (attempt 1/6 happens right at the start).
      */
     private static final String[] RETRY_MARKERS = {
             "leak failed",
@@ -109,7 +94,6 @@ public final class BootGuard {
         return Outcome.CONTINUE;
     }
 
-    /** True when the running kernel string has a line in lhasa_profile.txt. */
     public static boolean isSupportedKernel(String kernel) {
         return KernelSupport.isSupported(kernel);
     }
@@ -132,10 +116,6 @@ public final class BootGuard {
         return "rm -f " + STAGE_FILE;
     }
 
-    /**
-     * 记录本次开机的失败。abort=true 表示节点已经挂进 rbtree（或内核已报错），
-     * 这种情况**无论 SELinux 状态如何都不允许重跑**。
-     */
     public static String recordFailureCommand(String bootId, boolean abort, boolean permissive) {
         if (bootId == null || bootId.isEmpty()) {
             return "true";
@@ -148,11 +128,7 @@ public final class BootGuard {
         return "rm -f " + FAILED_FILE;
     }
 
-    /**
-     * 解析失败记录并给出本次开机是否还能重试。
-     *
-     * 兼容旧格式（`<boot_id> 0|1`）：0 视作 permissive、1 视作 enforcing。
-     */
+    /** 解析失败记录；兼容旧格式 `<boot_id> 0|1`。 */
     public static Retry parseFailure(String content, String currentBootId) {
         if (content == null || content.trim().isEmpty()) {
             return Retry.ALLOWED;
@@ -162,7 +138,6 @@ public final class BootGuard {
             return Retry.BLOCKED;
         }
         if (currentBootId != null && !currentBootId.isEmpty() && !currentBootId.equals(parts[0])) {
-            // 记录属于上一次开机，与本次无关
             return Retry.ALLOWED;
         }
         String kind = parts[1];
@@ -209,10 +184,7 @@ public final class BootGuard {
         return value.replaceAll("[^A-Za-z0-9_.-]", "_");
     }
 
-    /**
-     * Starts the payload in its own session so the whole group can be signalled later, and records
-     * `&lt;pgid&gt;:&lt;boot_id&gt;` to {@link #PID_FILE}.
-     */
+    /** Launches the payload in its own session and records `&lt;pgid&gt;:&lt;boot_id&gt;`. */
     public static String launchCommand(String binary, String arguments, String logPath) {
         return "toybox setsid sh -c '" + binary + " " + arguments
                 + " > " + logPath + " 2>&1 < /dev/null & echo \"$$" + BOOT_SEP + "\""
@@ -221,9 +193,10 @@ public final class BootGuard {
     }
 
     /**
-     * Signals the recorded process group — but only when the record belongs to the running boot.
-     * A payload that already elevated itself runs as uid=0, which this uid=2000 shell cannot signal;
-     * the call is therefore best-effort and its failure must not be treated as "nothing running".
+     * Signals the recorded process group, but only when the record belongs to the running boot.
+     *
+     * A payload that already elevated itself cannot be signalled by this uid=2000 shell; the call is
+     * best-effort and must not be treated as "nothing running".
      */
     public static String killCommand() {
         return "if [ -s " + PID_FILE + " ]; then "
@@ -237,17 +210,26 @@ public final class BootGuard {
 
     /**
      * Prints 1 when the recorded process group still exists in this boot, 0 otherwise.
-     * EPERM (the payload已升权) is reported as 1: still alive, just unsignalable.
+     *
+     * `kill -0` fails with EPERM for a live process owned by another uid (which is exactly what an
+     * elevated payload looks like), and with ESRCH when it is really gone. Treating every failure as
+     * "alive" made the early-exit check useless, so the two cases are separated here.
      */
     public static String aliveCommand() {
         return "if [ -s " + PID_FILE + " ]; then "
                 + "rec=$(cat " + PID_FILE + " 2>/dev/null); "
                 + "p=${rec%%" + BOOT_SEP + "*}; b=${rec##*" + BOOT_SEP + "}; "
                 + "now=" + BOOT_ID_READ + "; "
-                + "if [ -n \"$now\" ] && [ \"$b\" = \"$now\" ]; then "
-                + "kill -0 -$p 2>/dev/null && echo 1 || { "
-                + "  kill -KILL -$p 2>/dev/null; echo 1; }; "
-                + "else rm -f " + PID_FILE + "; echo 0; fi; "
+                + "if [ -n \"$now\" ] && [ ! \"$b\" = \"$now\" ]; then rm -f " + PID_FILE + "; echo 0; "
+                + "elif [ -z \"$p\" ]; then rm -f " + PID_FILE + "; echo 0; "
+                + "elif kill -0 -$p 2>/dev/null; then echo 1; "
+                + "else "
+                + "  msg=$(kill -0 -$p 2>&1); "
+                + "  case \"$msg\" in "
+                + "    *ermitted*) echo 1 ;; "
+                + "    *) rm -f " + PID_FILE + "; echo 0 ;; "
+                + "  esac; "
+                + "fi; "
                 + "else echo 0; fi";
     }
 
