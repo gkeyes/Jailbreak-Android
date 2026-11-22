@@ -1,19 +1,20 @@
 /*
- * slide_probe — 用 tracefs 里的 kmem 事件把 KASLR 位移量测出来。
+ * slide_probe — 用 tracefs 里的 kmem 事件观察 posix timer 的 slab 分配。
  *
- * 按真机实测输出对齐（原件的实际打印，2026-11-22 在 6.18.21 上跑出来的）：
+ * 与原件同条件对比后修正（2026-11-22，shell 身份，同一台机）：
  *
- *   [slide] cpu0    SensorService-15180   [000] .....  1405.055564: kmem_cache_alloc: call_site=alloc_skb_with_frags+0x88/0x510 ptr=00000000ea05806f name=skbuff_head_cache bytes_req=248 bytes_alloc=256 ...
- *   [slide] lines=22
- *   [slide] raw cpu0 bytes=4096 hits=0
- *   ...
+ *   原件：  [slide] lines=15，其中 15 行都是 kmem_cache_alloc，
+ *           含 name=posix_timers_cache bytes_req=384（它自己 timer_create 产生的）
+ *   旧版：  [slide] lines=30，全是 rss_stat，kmem_cache_alloc 一行没有
  *
- * 也就是说：它把 trace 里每一行原样打出来（前缀 `[slide] cpu%d `），
- * 然后统计总行数，再逐 CPU 读 raw 管道给出 bytes/hits。
- * 命中的判定不是 "site=/ptr="（那是我上一版凭空想的），
- * 而是看 slab 名字——目标对象是 posix_timers_cache（bytes_req=384）。
+ * 差异根因是**顺序**：必须先开 tracefs 事件，再 timer_create，
+ * 那条 posix_timers_cache 分配才落在观测窗口内。旧版把 timer_create 放在最前面，
+ * 目标分配发生在开启之前，颗粒无收。
  *
- * 原件里还带 LINUX_2.6.39 这个符号表版本标记。
+ * 另外 lines 只统计 kmem_cache_* 行（原件口径），rss_stat 行不计数也不打印。
+ *
+ * 符号表版本标记 LINUX_2.6.39 与目标 slab 判定（posix_timers_cache / bytes_req=384）
+ * 沿用原件。
  */
 #define _GNU_SOURCE 1
 #include <errno.h>
@@ -37,10 +38,7 @@
 #define ON_KMEM   "!enable_event:kmem:kmem_cache_alloc"
 #define OFF_KMEM  "!disable_event:kmem:kmem_cache_alloc"
 
-/* 符号表版本标记：原件里带着它，表明这份 offsets 对应哪一代符号表。 */
 static const char *KERNEL_SYMBOL_VERSION = "LINUX_2.6.39";
-
-/* 目标 slab：posix_timers_cache，对象大小 384。命中判定就看这两样。 */
 static const char *TARGET_SLAB = "posix_timers_cache";
 static const char *TARGET_SIZE_MARKER = "bytes_req=384";
 
@@ -76,12 +74,23 @@ static int parse_cpu(const char *line)
 	return atoi(digits);
 }
 
+/* 原件只统计 kmem_cache_* 事件行。 */
+static int is_kmem_line(const char *line)
+{
+	return strstr(line, "kmem_cache_alloc") != NULL
+		|| strstr(line, "kmem_cache_free") != NULL;
+}
+
 static int is_target_line(const char *line)
 {
 	return strstr(line, TARGET_SLAB) != NULL || strstr(line, TARGET_SIZE_MARKER) != NULL;
 }
 
-static int thread_timer(void)
+/*
+ * 目标分配的产生方式：在事件已开启之后创建并销毁一个 posix timer，
+ * 内核就会走 alloc_posix_timer() → 分配 posix_timers_cache 对象。
+ */
+static int poke_timer(void)
 {
 	timer_t timer;
 	struct sigevent sev;
@@ -89,7 +98,7 @@ static int thread_timer(void)
 	sev.sigev_notify = SIGEV_SIGNAL;
 	sev.sigev_signo = SIGUSR1;
 	if (timer_create(CLOCK_THREAD_CPUTIME_ID, &sev, &timer) != 0)
-		return -1;
+		return -errno;
 	timer_delete(timer);
 	return 0;
 }
@@ -98,11 +107,7 @@ int main(void)
 {
 	int failures = 0;
 
-	if (thread_timer() != 0) {
-		printf("[slide] timer_create errno=%d\n", errno);
-		failures++;
-	}
-
+	/* 1. 先把观测打开 */
 	if (write_file(BUFFER_SIZE_KB, "4096") != 0) {
 		printf("[slide] cpu%d %s\n", 0, "buffer_size_kb");
 		failures++;
@@ -120,16 +125,22 @@ int main(void)
 		failures++;
 	}
 
-	/* 给内核一点时间记账，然后读汇总视图。 */
+	/* 2. 再制造目标分配（顺序不能反） */
+	int poke = poke_timer();
+	if (poke != 0) {
+		printf("[slide] timer_create errno=%d\n", -poke);
+		failures++;
+	}
 	usleep(200 * 1000);
 
+	/* 3. 读汇总视图，只统计 kmem_cache_* 行 */
 	int lines = 0;
 	int target_hits = 0;
 	uint64_t last_ptr = 0;
 
 	int fd = open(TRACE_ALL, O_RDONLY | O_CLOEXEC);
 	if (fd >= 0) {
-		char buffer[131072];
+		char buffer[262144];
 		ssize_t n = read(fd, buffer, sizeof(buffer) - 1);
 		close(fd);
 		if (n > 0) {
@@ -139,7 +150,7 @@ int main(void)
 			     line = strtok_r(NULL, "\n", &save)) {
 				if (line[0] == '#')
 					continue;
-				if (!strstr(line, "kmem_cache_alloc") && !strstr(line, "rss_stat"))
+				if (!is_kmem_line(line))
 					continue;
 				int cpu = parse_cpu(line);
 				if (cpu < 0)
@@ -157,7 +168,7 @@ int main(void)
 	}
 	printf("[slide] lines=%d\n", lines);
 
-	/* 逐 CPU 读原始管道，报出每次读到的字节数与命中数。 */
+	/* 4. 逐 CPU 原始视图（原件同样会把 0 字节的 CPU 也列出来） */
 	for (int cpu = 0; cpu < 8; cpu++) {
 		char path[192];
 		snprintf(path, sizeof(path), PERCPU_RAW, cpu);
@@ -166,8 +177,10 @@ int main(void)
 			snprintf(path, sizeof(path), PERCPU_TRACE, cpu);
 			rf = open(path, O_RDONLY | O_CLOEXEC);
 		}
-		if (rf < 0)
+		if (rf < 0) {
+			printf("[slide] raw cpu%d bytes=0 hits=0\n", cpu);
 			continue;
+		}
 		char raw[65536];
 		ssize_t got = read(rf, raw, sizeof(raw) - 1);
 		close(rf);
@@ -195,7 +208,7 @@ int main(void)
 	write_file(TRACING_ON, "0");
 
 	if (target_hits > 0) {
-		/* site 只有在内核符号表里定位到才谈得上；这里只报指针，别造假地址。 */
+		/* 只报实际读到的哈希化指针；真正的 site（内核地址）需要符号表权限，不臆造。 */
 		printf("[slide] raw cpu%d ptr=%#llx\n", 0, (unsigned long long)last_ptr);
 	}
 
