@@ -1,10 +1,10 @@
 name: plant
 
-# plant/ 下的 C 草稿：交叉编译 + 二进制常量扫描。
+# plant/ 下的自有 C 源码：交叉编译 + 与预编译件的等价性验证。
 #
-# 与旧版的区别（审计 P1）：只读。三个旧工作流（plant.yml / plant-build.yml /
-# plant-analysis.yml）都会 git commit + git push 回分支，其中两个还带
-# contents: write。现在所有结果只作为 Artifact 产出，仓库里不留 CI 生成物。
+# 只读：所有结果作为 Artifact 产出，仓库里不留 CI 生成物。
+# 基线的建立（equiv.py baseline）是显式动作，产物需人工提交到 plant/equiv/，
+# 这样「标准答案」永远在版本库里、可 review，不会由 CI 自己写出来。
 
 on:
   push:
@@ -13,6 +13,7 @@ on:
       - 'plant/**'
       - 'app/src/main/assets/**'
       - 'tools/plant_build.sh'
+      - 'tools/equiv.py'
       - '.github/workflows/plant.yml'
   workflow_dispatch:
 
@@ -21,7 +22,7 @@ permissions:
 
 jobs:
   compile:
-    name: 交叉编译 plant/*.c
+    name: 编译 + 等价性验证
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -36,7 +37,7 @@ jobs:
           tar -xf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP"
           echo "$RUNNER_TEMP/zig-linux-x86_64-0.13.0" >> "$GITHUB_PATH"
 
-      - name: 编译
+      - name: 编译 plant/*.c
         run: |
           set -euo pipefail
           shopt -s nullglob
@@ -53,13 +54,38 @@ jobs:
             file "$out"
           done
 
+      - name: 等价性验证
+        run: |
+          set -uo pipefail
+          python3 tools/equiv.py check-dir "$RUNNER_TEMP/out" 2>&1 | tee "$RUNNER_TEMP/equiv.log"
+          exit "${PIPESTATUS[0]}"
+
       - name: 上传产物
-        if: success()
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: plant-binaries
-          path: ${{ runner.temp }}/out/*
+          path: |
+            ${{ runner.temp }}/out/*
+            ${{ runner.temp }}/equiv.log
           if-no-files-found: ignore
+
+  baseline:
+    name: 生成等价性基线（需人工提交）
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 从现有预编译件提取基线
+        run: python3 tools/equiv.py baseline --out "$RUNNER_TEMP/baseline"
+
+      - name: 上传基线
+        uses: actions/upload-artifact@v4
+        with:
+          name: plant-baselines
+          path: ${{ runner.temp }}/baseline
+          if-no-files-found: error
 
   scan:
     name: 现有 payload 常量扫描
@@ -72,7 +98,6 @@ jobs:
           python3 - <<'PY'
           import collections, pathlib, re, os
 
-          # lhasa_profile.txt 里已知的链接期地址，用来给扫到的值打标签。
           KNOWN = {
               0xffffffc08042aa68: "profile timer (alloc_posix_timer+0x30)",
               0xffffffc08026c02c: "profile cred (prepare_creds+0x2c)",
