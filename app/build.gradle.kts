@@ -17,12 +17,21 @@ android {
 
     signingConfigs {
         create("release") {
+            // 签名材料只从环境变量来（本地导出或 CI Secrets），仓库和构建脚本里不留口令。
             val keystoreFile = rootProject.file(System.getenv("LHASA_KEYSTORE") ?: "keystore/lhasa26.jks")
-            if (keystoreFile.exists()) {
+            val storePassword = System.getenv("LHASA_STORE_PASSWORD")
+            val keyAlias = System.getenv("LHASA_KEY_ALIAS")
+            val keyPassword = System.getenv("LHASA_KEY_PASSWORD") ?: storePassword
+
+            if (keystoreFile.exists() && !storePassword.isNullOrEmpty()) {
                 storeFile = keystoreFile
-                storePassword = System.getenv("LHASA_STORE_PASSWORD") ?: "lhasa26pass"
-                keyAlias = System.getenv("LHASA_KEY_ALIAS") ?: "lhasa26"
-                keyPassword = System.getenv("LHASA_KEY_PASSWORD") ?: "lhasa26pass"
+                this.storePassword = storePassword
+                this.keyAlias = keyAlias ?: "lhasa26"
+                this.keyPassword = keyPassword
+            } else if (keystoreFile.exists()) {
+                logger.lifecycle(
+                    "LHASA_STORE_PASSWORD 未设置，release 构建不走签名（照常产出未签名 APK）。"
+                )
             }
         }
     }
