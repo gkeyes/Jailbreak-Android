@@ -60,12 +60,20 @@ public final class KernelSupport {
         return matcher.find() ? matcher.group(1) : null;
     }
 
+    /**
+     * C 侧打印的是 64 位无符号十六进制，高位为 1 时用有符号解析会抛异常，
+     * 因此这里必须用无符号解析。
+     */
     public static long parseHex(String value) {
-        if (value == null || !value.toLowerCase(Locale.US).startsWith("0x")) {
+        if (value == null) {
+            return -1L;
+        }
+        String text = value.trim().toLowerCase(Locale.US);
+        if (!text.startsWith("0x")) {
             return -1L;
         }
         try {
-            return Long.parseLong(value.substring(2), 16);
+            return Long.parseUnsignedLong(text.substring(2), 16);
         } catch (NumberFormatException ignored) {
             return -1L;
         }
