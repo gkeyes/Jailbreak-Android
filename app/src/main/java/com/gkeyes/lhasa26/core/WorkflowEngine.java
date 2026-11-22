@@ -24,6 +24,7 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
     private static final long IDLE_AVAILABLE_KB = 1500000L;
     /** Above this much available memory the force-stop of chat apps buys nothing. */
     private static final long CLEAN_SKIP_AVAILABLE_KB = 3000000L;
+    private static final long DEPLOY_TIMEOUT_MS = 8000L;
     private static final Pattern RUNNING_PAYLOAD = Pattern.compile("uaf_plant_replay");
     private static final String RUN_MARKER = "/data/local/tmp/.lhasa_run";
     private static final String FAILED_MARKER = "/data/local/tmp/.lhasa_failed_boot";
@@ -203,8 +204,8 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
         status("核对内核");
         String kernel = run("uname -r", false).output.trim();
         append("uname -r = " + kernel);
-        if (!KernelSupport.isSupported(kernel)) {
-            append("（警告）当前内核不在已验证列表，仍继续，风险自负。");
+        if (!BootGuard.isSupportedKernel(kernel)) {
+            append(BootGuard.kernelWarning(kernel));
         }
         if (payloadProcessCount() > 0) {
             throw new IllegalStateException("上次运行的进程仍在运行，请重启设备后重试。");
@@ -238,9 +239,11 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
         }, "lhasa-deploy");
         deploy.start();
         waitForIdle();
-        deploy.join(8000L);
-        if (deployError.get() != null) {
-            throw deployError.get();
+        DeployGate.Result deployResult = new DeployGate(DEPLOY_TIMEOUT_MS)
+                .await(deploy, deployError);
+        if (deployResult != DeployGate.Result.READY) {
+            recordFailedBoot(boot);
+            throw new IllegalStateException("部署未完成（" + deployResult + "）· 请重启后重试");
         }
 
         step(2);
@@ -252,7 +255,7 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
 
         step(4);
         status("提权执行中，请稍候");
-        if (!runPayload(addressArgument)) {
+        if (!runPayload(addressArgument, boot)) {
             stopPayload();
             recordFailedBoot(boot);
             throw new IllegalStateException("提权失败 · 请重启设备");
@@ -447,18 +450,26 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
         throw new IllegalStateException("未能读取 KASLR 偏移，请确认 perf / tracefs 可用。");
     }
 
-    private boolean runPayload(String addressArgument) throws Exception {
+    private boolean runPayload(String addressArgument, String boot) throws Exception {
         for (int attempt = 1; attempt <= 3; attempt++) {
-            run("rm -f /data/local/tmp/uaf_replay.log; toybox setsid sh -c '/data/local/tmp/uaf_plant_replay "
-                    + addressArgument + " > /data/local/tmp/uaf_replay.log 2>&1 < /dev/null' >/dev/null 2>&1 & echo STARTED", true);
+            run("rm -f /data/local/tmp/uaf_replay.log; " + BootGuard.launchCommand(
+                    "/data/local/tmp/uaf_plant_replay",
+                    addressArgument,
+                    "/data/local/tmp/uaf_replay.log"), true);
             Thread.sleep(1500L);
             for (int poll = 0; poll < 200; poll++) {
                 String tail = run("tail -n 24 /data/local/tmp/uaf_replay.log 2>/dev/null", true).output;
                 if (!tail.trim().isEmpty()) {
                     callbacks.onTail(tail);
                 }
-                if (containsSuccessMarker(tail)) {
+                BootGuard.Outcome outcome = BootGuard.classify(tail);
+                if (outcome == BootGuard.Outcome.SUCCESS) {
                     return true;
+                }
+                if (outcome == BootGuard.Outcome.ABORT_BOOT) {
+                    recordFailedBoot(boot);
+                    throw new IllegalStateException(
+                            "payload 报告节点已挂树（holding zombie）· 本次开机终止，请重启设备");
                 }
                 if (poll % 5 == 4) {
                     CommandResult verify = run("/data/local/tmp/pc98260-su -c 'id'", true);
@@ -466,7 +477,7 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
                         return true;
                     }
                 }
-                if (containsRetryMarker(tail)) {
+                if (outcome == BootGuard.Outcome.RETRY_SAFE) {
                     break;
                 }
                 Thread.sleep(800L);
@@ -480,21 +491,8 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
         return isRoot(run("/data/local/tmp/pc98260-su -c 'id'", true).output);
     }
 
-    private boolean containsSuccessMarker(String tail) {
-        return tail.contains("[child-cred] uid=0")
-                || tail.contains("[cred] rooted")
-                || tail.contains("holding pages")
-                || tail.contains("[selinux] already permissive");
-    }
-
-    private boolean containsRetryMarker(String tail) {
-        return tail.contains("holding zombie")
-                || tail.contains("leak failed")
-                || tail.contains("[selinux] attempt 2/");
-    }
-
     private void stopPayload() throws Exception {
-        run("pkill -f uaf_plant_replay 2>/dev/null; killall uaf_plant_replay 2>/dev/null; true", true);
+        run(BootGuard.killCommand(), true);
     }
 
     /**
@@ -502,13 +500,7 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
      * rootd socket is the only reliable sign that an earlier payload is still alive.
      */
     private int payloadProcessCount() throws Exception {
-        String output = run("ps -A 2>/dev/null | grep -c '[u]af_plant_replay'", true).output.trim();
-        int count;
-        try {
-            count = Integer.parseInt(output);
-        } catch (NumberFormatException ignored) {
-            count = RUNNING_PAYLOAD.matcher(output).find() ? 1 : 0;
-        }
+        int count = Integer.parseInt(run(BootGuard.aliveCommand(), true).output.trim());
         if (count > 0) {
             return count;
         }
