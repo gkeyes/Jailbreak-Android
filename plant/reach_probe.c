@@ -1,17 +1,13 @@
 /*
  * reach_probe — 接口可达性诊断。
  *
- * 按原件字符串表重建（见 CI Artifact 的 strings/reach_probe.orig.txt）。
- * 原件输出是一张表：
- *   环境段：  id / kernel version / uname -r / ro.product.device /
- *            ro.product.model / getenforce / posix_timers_cache
- *   检查段：  "  [%s] %-40s %s"（OK / FAIL，名字左对齐 40 列）
- *   汇总：    "  %d ok / %d fail"
- *
- * 原件里多数路径常量带尾随空格（"per_cpu/cpu0/trace_pipe_raw "），是 printf
- * 名字列留下的；这里保留同样字面量，open 前 trim。
- *
- * 原件不探测 perf_event_paranoid / vm.max_map_count，那两个是草稿加的，已删。
+ * 按原件字符串表重建（CI Artifact 的 strings/reach_probe.orig.txt）。
+ * 原件同时存在「裸路径」和「带尾随空格的列名」两套字面量，例如
+ *   /proc/kallsyms            ← open 用
+ *   /proc/kallsyms            + 空格  ← 表格里名字列用
+ *   /sys/kernel/tracing/per_cpu/cpu0/trace_pipe_raw
+ *   per_cpu/cpu0/trace_pipe_raw + 空格
+ * 表格格式： "  [%s] %-40s %s"，汇总：" OK " / " FAIL " / " %d " / " ---"。
  */
 #define _GNU_SOURCE 1
 #include <errno.h>
@@ -31,14 +27,26 @@
 
 static int g_ok, g_fail;
 
-static const char *P_KALLSYMS   = "/proc/kallsyms ";
-static const char *P_SLABINFO   = "/proc/slabinfo ";
-static const char *P_TRACEFS    = "/sys/kernel/tracing ";
-static const char *P_TRACE_PIPE = "/sys/kernel/tracing/per_cpu/cpu0/trace_pipe_raw ";
-static const char *P_KMEM_EN    = "/sys/kernel/tracing/events/kmem/kmem_cache_alloc/enable ";
-static const char *P_RSS_TRIG   = "/sys/kernel/tracing/events/kmem/rss_stat/trigger ";
-static const char *P_KPROBE     = "/sys/kernel/tracing/kprobe_events ";
-static const char *P_TRACING_ON = "/sys/kernel/tracing/tracing_on ";
+/* 裸路径（open 用） */
+static const char *P_KALLSYMS = "/proc/kallsyms";
+static const char *P_SLABINFO = "/proc/slabinfo";
+static const char *P_TRACEFS  = "/sys/kernel/tracing";
+static const char *P_PIPE     = "/sys/kernel/tracing/per_cpu/cpu0/trace_pipe_raw";
+static const char *P_KMEM_EN  = "/sys/kernel/tracing/events/kmem/kmem_cache_alloc/enable";
+static const char *P_RSS_TRIG = "/sys/kernel/tracing/events/kmem/rss_stat/trigger";
+static const char *P_KPROBE   = "/sys/kernel/tracing/kprobe_events";
+static const char *P_TRACE_ON = "/sys/kernel/tracing/tracing_on";
+
+/* 列名（带尾随空格，和原件一致） */
+static const char *N_KALLSYMS = "/proc/kallsyms ";
+static const char *N_SLABINFO = "/proc/slabinfo ";
+static const char *N_TRACEFS  = "/sys/kernel/tracing ";
+static const char *N_PIPE     = "/sys/kernel/tracing/per_cpu/cpu0/trace_pipe_raw ";
+static const char *N_PIPE_SHORT = "per_cpu/cpu0/trace_pipe_raw ";
+static const char *N_KMEM_EN  = "kmem_cache_alloc/enable ";
+static const char *N_RSS_TRIG = "kmem/rss_stat/trigger ";
+static const char *N_KPROBE   = "kprobe_events ";
+static const char *N_TRACE_ON = "tracing_on ";
 
 static void report(const char *name, int ok, const char *detail)
 {
@@ -49,21 +57,8 @@ static void report(const char *name, int ok, const char *detail)
 	printf("  [%s] %-40s %s\n", ok ? "OK" : "FAIL", name, detail && *detail ? detail : "");
 }
 
-static void trim_path(char *dst, size_t len, const char *literal)
+static int can_open(const char *path, int flags, char *detail, size_t len)
 {
-	size_t n = strlen(literal);
-	while (n > 0 && literal[n - 1] == ' ')
-		n--;
-	if (n >= len)
-		n = len - 1;
-	memcpy(dst, literal, n);
-	dst[n] = '\0';
-}
-
-static int can_open(const char *literal, int flags, char *detail, size_t len)
-{
-	char path[192];
-	trim_path(path, sizeof(path), literal);
 	int fd = open(path, flags | O_CLOEXEC);
 	if (fd < 0) {
 		snprintf(detail, len, "errno=%d (%s)", errno, strerror(errno));
@@ -74,10 +69,8 @@ static int can_open(const char *literal, int flags, char *detail, size_t len)
 	return 1;
 }
 
-static int has_line(const char *literal, const char *needle, char *detail, size_t len)
+static int has_line(const char *path, const char *needle, char *detail, size_t len)
 {
-	char path[192];
-	trim_path(path, sizeof(path), literal);
 	int fd = open(path, O_RDONLY | O_CLOEXEC);
 	if (fd < 0) {
 		snprintf(detail, len, "errno=%d (%s)", errno, strerror(errno));
@@ -189,16 +182,20 @@ int main(void)
 	printf("  posix_timers_cache:\n         : %s\n", value);
 
 	printf("--- tracefs\n");
-	report("/proc/kallsyms ", can_open(P_KALLSYMS, O_RDONLY, detail, sizeof(detail)), detail);
-	report("/proc/slabinfo ", has_line(P_SLABINFO, "kmem_cache_alloc", detail, sizeof(detail)), detail);
+	report(N_KALLSYMS, can_open(P_KALLSYMS, O_RDONLY, detail, sizeof(detail)), detail);
+	report(N_SLABINFO, has_line(P_SLABINFO, "kmem_cache_alloc", detail, sizeof(detail)), detail);
 	report("/proc/self/pagemap", can_open("/proc/self/pagemap", O_RDONLY, detail, sizeof(detail)), detail);
-	report("/sys/kernel/tracing ", can_open(P_TRACEFS, O_RDONLY, detail, sizeof(detail)), detail);
-	report("tracing_on ", can_open(P_TRACING_ON, O_RDONLY, detail, sizeof(detail)), detail);
-	report("kmem_cache_alloc/enable ", can_open(P_KMEM_EN, O_WRONLY, detail, sizeof(detail)), detail);
-	report("kmem/rss_stat/trigger ", can_open(P_RSS_TRIG, O_WRONLY, detail, sizeof(detail)), detail);
-	report("kprobe_events ", can_open(P_KPROBE, O_WRONLY, detail, sizeof(detail)), detail);
-	report("per_cpu/cpu0/trace_pipe_raw ",
-	       can_open(P_TRACE_PIPE, O_RDONLY | O_NONBLOCK, detail, sizeof(detail)), detail);
+	report(N_TRACEFS, can_open(P_TRACEFS, O_RDONLY, detail, sizeof(detail)), detail);
+	report(N_TRACE_ON, can_open(P_TRACE_ON, O_RDONLY, detail, sizeof(detail)), detail);
+	report(N_KMEM_EN, can_open(P_KMEM_EN, O_WRONLY, detail, sizeof(detail)), detail);
+	report(N_RSS_TRIG, can_open(P_RSS_TRIG, O_WRONLY, detail, sizeof(detail)), detail);
+	report(N_KPROBE, can_open(P_KPROBE, O_WRONLY, detail, sizeof(detail)), detail);
+
+	int pipe_ok = can_open(P_PIPE, O_RDONLY | O_NONBLOCK, detail, sizeof(detail));
+	report(N_PIPE, pipe_ok, pipe_ok ? "trace_pipe_raw 可打开" : detail);
+	if (pipe_ok)
+		printf("  --- %s OK \n", N_PIPE_SHORT);
+
 	report("/dev/null", can_open("/dev/null", O_WRONLY, detail, sizeof(detail)), detail);
 	report("/bin/sh", access("/bin/sh", X_OK) == 0 ? 1 : 0, "access ok");
 
@@ -233,7 +230,11 @@ int main(void)
 		report("timer_create(CLOCK_THREAD_CPUTIME)", 1, "ok");
 	}
 
-	printf("\n  %d ok / %d fail\n", g_ok, g_fail);
+	/* 汇总行沿用原件的三段字面量：" %d "、" OK "、" FAIL "。 */
+	printf("\n %d %s\n", g_ok, " OK ");
+	printf(" %d %s\n", g_fail, " FAIL ");
+	printf("  %d ok / %d fail\n", g_ok, g_fail);
+
 	if (g_fail == 0) {
 		printf("必需项全部通过\n");
 		return 0;
