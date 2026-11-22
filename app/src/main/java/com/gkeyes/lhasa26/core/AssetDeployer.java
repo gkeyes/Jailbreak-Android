@@ -7,9 +7,14 @@ import java.io.OutputStream;
 
 /** Copies the supplied device-specific payloads through the already-authorized shell. */
 public final class AssetDeployer {
+    /**
+     * Payloads needed before the exploit runs. `ksud` is deliberately absent: it is 4.9 MB, is only
+     * used by the KernelSU step (which stages it on demand after root is established), and pulling it
+     * through the Shizuku pipe inside the pre-exploit window costs both time and heap churn.
+     */
     public static final String[] RUNTIME_ASSETS = {
             "reach_probe", "slide_probe", "uaf_plant_replay", "pc98260-su",
-            "perf_slide", "ksud", "lhasa_profile.txt"
+            "perf_slide", "lhasa_profile.txt"
     };
 
     private final AssetManager assets;
