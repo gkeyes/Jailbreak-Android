@@ -2,19 +2,31 @@
 
 ## 现状（2026-11-22 晚）
 
-| 资产 | 源码 | 许可 |
-|---|---|---|
-| `reach_probe` | `plant/reach_probe.c` | 自有 |
-| `slide_probe` | 上游 `src/xr98260_slide_probe.c` | MIT |
-| `pc98260-su` | 上游 `src/pc98260_su.c` | MIT |
-| `uaf_plant_replay` | 上游 `src/exploit-android-perf.c` | MIT |
-| `ksud` | KernelSU v3.3.1 `libksud.so` | GPL-3.0 |
+| 资产 | 源码 | 许可 | 说明 |
+|---|---|---|---|
+| `reach_probe` | `plant/reach_probe.c` | 自有 | 唯一仍由我们重写的探针 |
+| `slide_probe` | 上游 `src/xr98260_slide_probe.c` | MIT | 扫 `trace_pipe_raw` 二进制记录求 slide |
+| `pc98260-su` | 上游 `src/pc98260_su.c` | MIT | 先写 uint32 长度、再写命令 |
+| `uaf_plant_replay` | 上游 `src/exploit-android-perf.c` | MIT | CLI 仍为 `--slide/--site/--timer` |
+| `ksud` | KernelSU v3.3.1 `libksud.so` | GPL-3.0 | 上游预编译，钉版本 + 双层哈希 |
 
-上游 = `Lw5959/xring-cve-2026-98260`，版本锚定在 `tools/xring.lock.properties`
+上游 = `Lw5959/xring-cve-2026-98260`，锚定在 `tools/xring.lock.properties`
 （commit + tarball sha256），由 `tools/build_xring.sh` 下载校验后交叉编译。
 
 `perf_slide` 已移除：本 ROM 的 SELinux 对 `u:r:shell:s0` 拒绝
 `perf_event` 的 `{ kernel }` 权限，perf 内核采样在此环境不可用。
+
+## 协议要点（来自上游源码）
+
+- `pc98260_su`：`write(uint32 len)` → `write(cmd bytes)` → 读回显。
+  长度 0 时进入 stdin ↔ socket 全双工模式（无 `-c` 参数时）。
+  `connect` 失败才输出 `perror("connect root daemon")`。
+- `xr98260_slide_probe`：pin cpu0 → 开 `kmem:kmem_cache_alloc` 触发器 →
+  建 64 个 posix timer → 扫每 CPU 的 `trace_pipe_raw`，找
+  `call_site - profile.alloc_timer_site` 为 2 MiB 对齐且 `bytes_req == kitimer_bytes`
+  的记录 → 输出 `site=0x… slide=0x…`。
+- `exploit-android-perf`：拿 `--slide` 后按 profile 加出 timer/cred/selinux/task
+  的运行时地址，做 order-1 页复用 + cred 植入，最后起 rootd。
 
 ## 两条分发通道
 
@@ -27,17 +39,6 @@ timeout 10 /data/local/tmp/<名字>
 ```
 
 **B. 装 APK**：提交信息带 `[release]` 才出包，只在验 App 调度时需要。
-
-## 上游的关键实现（我们重写时踩过的坑）
-
-- **slide 来源**：扫 `per_cpu/cpuN/trace_pipe_raw` 的**二进制记录**，从
-  `call_site - profile.alloc_timer_site` 得到 2 MiB 对齐的 slide。
-  我们之前的文本解析永远拿不到 `call_site`。
-- **su 协议**：`uint32 长度前缀 + 命令`；长度 0 时进入 stdin↔socket 交互模式。
-  少了前缀就和真 rootd 对不上。
-- **载体**：用 AF_UNIX `SOCK_STREAM` 写 8192 字节命中 order-1 的
-  `posix_timers_cache`（pipe/AIO 这类 order-0 分配很难命中 8 KiB slab）。
-- **命中判据**：victim `cpu_timer.node` 所在 4 KiB 半页的 pfn，再 `& ~1`。
 
 ## 真机踩过的坑
 
@@ -53,4 +54,3 @@ timeout 10 /data/local/tmp/<名字>
 
 - `--slide`：`运行时 - 链接期` 的差值，2 MiB 对齐（`KernelSupport.isSlideValid`）。
 - `reach_probe` 有失败时退出码是 **2**（原件行为）。
-- `slide_probe` 输出 `site=0x… slide=0x…`，并带 `timers=` / `raw_bytes=` 行。
