@@ -5,7 +5,6 @@ import android.content.res.AssetManager;
 import java.util.Locale;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.regex.Pattern;
 
 /**
  * Owns the long-running workflow. UI code only receives immutable events and never runs shell work.
@@ -26,7 +25,6 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
     private static final long CLEAN_SKIP_AVAILABLE_KB = 3000000L;
     private static final long DEPLOY_TIMEOUT_MS = 8000L;
     private static final String RUN_MARKER = "/data/local/tmp/.lhasa_run";
-    private static final String FAILED_MARKER = "/data/local/tmp/.lhasa_failed_boot";
     private static final String ROOTD_SOCKET = "/data/local/tmp/pc98260-root.sock";
     private static final String EXPLOIT_BINARIES = "uaf_plant_replay slide_probe reach_probe";
     /** 单次探测的硬上限（秒）。超出就 kill，绝不允许探针以 root 常驻。 */
@@ -140,11 +138,6 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
         void run() throws Exception;
     }
 
-    /**
-     * Serializes every background operation behind one busy flag. The owning workflows change the
-     * public state; diagnosis and maintenance keep it untouched and only report a closing event so the
-     * UI can end its timer without rewriting the recorded result.
-     */
     private boolean start(String operation, WorkflowTask action, boolean ownsState) {
         synchronized (this) {
             if (busy) {
@@ -192,7 +185,6 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
             } finally {
                 busy = false;
                 if (ownsState) {
-                    // KernelSU took over (COMPLETE) means the temporary channel is no longer needed.
                     cleanupBinaries(state == State.ROOTED || state == State.KSU_PENDING);
                 }
             }
@@ -209,28 +201,29 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
         if (!BootGuard.isSupportedKernel(kernel)) {
             append(BootGuard.kernelWarning(kernel));
         }
+        String boot = bootId();
         if (payloadProcessCount() > 0) {
             throw new IllegalStateException("上次运行的进程仍在运行，请重启设备后重试。");
         }
-        String boot = bootId();
         writeRunMarker(boot);
-        // 上次是不是被重启打断的？面包屑还在就说明是。
         String leftover = run("cat " + BootGuard.STAGE_FILE + " 2>/dev/null", true).output;
         String hint = BootGuard.leftoverStageHint(leftover);
         if (!hint.isEmpty()) {
             append("[上次] " + hint);
         }
-        String failed = run("cat " + FAILED_MARKER + " 2>/dev/null", true).output.trim();
-        if (!boot.isEmpty() && !failed.isEmpty()) {
-            String[] parts = failed.split("\\s+");
-            if (boot.equals(parts[0])) {
-                boolean permissive = parts.length > 1 && "0".equals(parts[1]);
-                if (!permissive) {
-                    throw new IllegalStateException("本次开机已失败且 SELinux 仍为 Enforcing，请重启后重试。");
-                }
-                append("（提示）本次开机已为 Permissive，将直接重试 cred 阶段。");
-            }
+
+        // 本次开机能不能重跑，只由失败记录决定：abort 一律禁止，与 SELinux 状态无关。
+        String recorded = run("cat " + BootGuard.FAILED_FILE + " 2>/dev/null", true).output.trim();
+        BootGuard.Retry retry = BootGuard.parseFailure(recorded, boot);
+        if (retry == BootGuard.Retry.BLOCKED) {
+            throw new IllegalStateException(
+                    "本次开机已发生节点挂树（holding zombie）或内核报错，禁止重跑——重跑会对已释放节点二次 rb_erase，"
+                            + "直接 panic。请重启设备后再试。");
         }
+        if (retry == BootGuard.Retry.PERMISSIVE_RETRY) {
+            append("（提示）本次开机已为 Permissive，将直接重试 cred 阶段。");
+        }
+
         captureBaseline();
         cleanMemory();
 
@@ -249,7 +242,7 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
         waitForIdle();
         DeployGate.Result deployResult = deployGate.await(deploy);
         if (deployResult != DeployGate.Result.READY) {
-            recordFailedBoot(boot);
+            recordFailedBoot(boot, false);
             throw new IllegalStateException("部署未完成（" + deployResult + "）· 请重启后重试");
         }
 
@@ -263,9 +256,13 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
         step(4);
         status("提权执行中，请稍候");
         run(BootGuard.markCommand("payload"), true);
-        if (!runPayload(addressArgument, boot)) {
+        String failureReason = runPayload(addressArgument, boot);
+        if (failureReason != null) {
             stopPayload();
-            recordFailedBoot(boot);
+            if (!failureReason.isEmpty()) {
+                throw new IllegalStateException(failureReason);
+            }
+            recordFailedBoot(boot, false);
             throw new IllegalStateException("提权失败 · 请重启设备");
         }
 
@@ -274,10 +271,10 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
         CommandResult verify = run("/data/local/tmp/pc98260-su -c 'id; getenforce; grep CapEff /proc/self/status'", false);
         append(verify.output);
         if (!isRoot(verify.output)) {
-            recordFailedBoot(boot);
+            recordFailedBoot(boot, false);
             throw new IllegalStateException("rootd 无响应 · 请重启设备");
         }
-        run("rm -f " + FAILED_MARKER, true);
+        run(BootGuard.clearFailureCommand(), true);
         clearRunMarker();
         run(BootGuard.clearStageCommand(), true);
         state = State.ROOTED;
@@ -289,8 +286,6 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
                 : "开始时检查进程为 shell（未持有 root），结束时获得 uid=0")
                 + " · SELinux " + (enforceBeforeRun.isEmpty() ? "?" : enforceBeforeRun)
                 + " → " + selinuxAfterRoot);
-        // KernelSU 接管会 late-load 内核模块，是整条链里最容易把设备带走的一步，
-        // 所以不再自动执行：按钮会变成「重试 KernelSU 接管」，由用户决定何时做。
         append("[下一步] 需要 KernelSU 常驻时，再点一次主按钮执行接管（会加载内核模块，可能重启）。");
         callbacks.onState(State.ROOTED,
                 "已获得临时 ROOT · 需要常驻再点一次加载 KernelSU · SELinux " + selinuxAfterRoot);
@@ -301,6 +296,7 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
     private void runDiagnosis() throws Exception {
         status("正在诊断");
         deployer.stage("reach_probe");
+        deployer.stage("slide_probe");
         run(BootGuard.markCommand("diagnose"), true);
         CommandResult result = run(BootGuard.withTimeout(DIAGNOSE_TIMEOUT_S,
                 "/data/local/tmp/reach_probe > /data/local/tmp/diag.log 2>&1"), true);
@@ -315,36 +311,21 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
         run("echo '!enable_event:kmem:kmem_cache_alloc' > /sys/kernel/tracing/events/kmem/rss_stat/trigger 2>/dev/null; echo 0 > /sys/kernel/tracing/tracing_on 2>/dev/null", true);
         run(BootGuard.clearStageCommand(), true);
         String patch = run("getprop ro.build.version.security_patch", true).output.trim();
-        append("[诊断] security_patch=" + patch + (patch.compareTo("2026-10-06") < 0
+        append("[诊断] security_patch=" + (patch.isEmpty() ? "未知" : patch)
+                + (patch.isEmpty() ? "" : (patch.compareTo("2026-10-06") < 0
                 ? " · 未修补窗口"
-                : " · 可能已回补"));
-        // reach_probe 报告 perf_error_open 失败时，用真正求 slide 的 slide_probe 复核：
-        // 本 ROM 的 SELinux 只允许用户态 perf，所以 probe 的 FAIL 不代表环境不可用。
-        if (report.contains("perf_event_open") && report.contains("FAIL")) {
-            deployer.stage("slide_probe");
-            CommandResult probe = run(BootGuard.withTimeout(SLIDE_PROBE_TIMEOUT_S,
-                    "/data/local/tmp/slide_probe"), true);
-            String slide = KernelSupport.extractSlide(probe.output);
-            boolean usable = slide != null && KernelSupport.isSlideValid(KernelSupport.parseHex(slide));
-            append("[诊断] 覆盖：" + (usable
-                    ? "slide_probe 实测可用（slide=" + slide + "），perf_event_open 一项为 shell 域权限限制"
-                    : "slide_probe 也拿不到 slide，该项按真实失败处理"));
-            if (usable) {
-                String message = "诊断通过 · 环境可用（perf 项由 slide_probe 覆盖）";
-                append("[诊断] 通过 · 除 perf_event_open 探针项外全部达标");
-                status(message);
-                callbacks.onState(state, message);
-                return;
-            }
-        }
-        String message;
-        if (report.contains("必需项全部通过")) {
-            message = "诊断通过 · 环境可用";
-            append("[诊断] 通过 · 环境可用");
-        } else {
-            message = "诊断未通过 · 详见日志";
-            append(report.contains("必需接口不可用") ? "[诊断] 失败 · 有必需项未通过" : "[诊断] 未完成 · 详见日志");
-        }
+                : " · 可能已回补")));
+        // 本 ROM 对 shell 关掉了 perf 内核采样、kallsyms、kprobe，reach_probe 必然标 FAIL。
+        // 只要 slide_probe 能真的拿到 slide，就说明这条链需要的能力是可用的。
+        CommandResult probe = run(BootGuard.withTimeout(SLIDE_PROBE_TIMEOUT_S,
+                "/data/local/tmp/slide_probe"), true);
+        append(filterProbe(probe.output));
+        String slide = KernelSupport.extractSlide(probe.output);
+        boolean usable = slide != null && KernelSupport.isSlideValid(KernelSupport.parseHex(slide));
+        append("[诊断] " + (usable
+                ? "slide_probe 实测可用（slide=" + slide + "）——环境可用于提权"
+                : "slide_probe 未拿到 slide，环境当前不可用"));
+        String message = usable ? "诊断通过 · 环境可用" : "诊断未通过 · 详见日志";
         status(message);
         callbacks.onState(state, message);
     }
@@ -442,12 +423,9 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
     /**
      * 测量本次开机的内核地址。
      *
-     * 只有一条来源：slide_probe（上游实现，扫 trace_pipe_raw 的二进制记录，
+     * 只有一条来源：slide_probe（扫 trace_pipe_raw 的二进制记录，
      * 用 call_site − profile.alloc_timer_site 得到 2 MiB 对齐的 slide）。
-     * 之前的 perf_slide 已删除——本 ROM 的 SELinux 对 u:r:shell:s0 拒绝
-     * perf_event 的 { kernel } 权限，那条路在这里永远走不通。
-     *
-     * 拿不到时：打印明确原因，返回空参数，让 uaf_plant_replay 用 profile 自行判定。
+     * 拿不到时打印原因并返回空参数，让 payload 用 profile 自行判定。
      */
     private String measureAddress() throws Exception {
         run(BootGuard.markCommand("probe-slide"), true);
@@ -474,7 +452,13 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
         return "";
     }
 
-    private boolean runPayload(String addressArgument, String boot) throws Exception {
+    /**
+     * Runs the payload up to three times.
+     *
+     * @return null on success; otherwise a message to show. An empty message means "plain failure"
+     *         (the caller records it), a non-empty one is a fatal condition already recorded here.
+     */
+    private String runPayload(String addressArgument, String boot) throws Exception {
         String args = addressArgument == null ? "" : addressArgument.trim();
         if (!args.isEmpty()) {
             append("[payload] 参数：" + args);
@@ -487,6 +471,7 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
                     args,
                     "/data/local/tmp/uaf_replay.log"), true);
             Thread.sleep(1500L);
+            boolean exited = false;
             for (int poll = 0; poll < 200; poll++) {
                 String tail = run("tail -n 24 /data/local/tmp/uaf_replay.log 2>/dev/null", true).output;
                 if (!tail.trim().isEmpty()) {
@@ -494,17 +479,22 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
                 }
                 BootGuard.Outcome outcome = BootGuard.classify(tail);
                 if (outcome == BootGuard.Outcome.SUCCESS) {
-                    return true;
+                    return null;
                 }
                 if (outcome == BootGuard.Outcome.ABORT_BOOT) {
-                    recordFailedBoot(boot);
-                    throw new IllegalStateException(
-                            "payload 报告节点已挂树（holding zombie）· 本次开机终止，请重启设备");
+                    // 节点已挂树：本次开机永久禁止重跑，必须重启。
+                    run(BootGuard.recordFailureCommand(boot, true, false), true);
+                    return "payload 报告节点已挂树（holding zombie）· 本次开机禁止重跑，请重启设备";
                 }
                 if (poll % 5 == 4) {
                     CommandResult verify = run("/data/local/tmp/pc98260-su -c 'id'", true);
                     if (isRoot(verify.output)) {
-                        return true;
+                        return null;
+                    }
+                    // 进程已经退出且没有成功标记 → 没必要再等满 200 轮。
+                    if (Integer.parseInt(run(BootGuard.aliveCommand(), true).output.trim()) == 0) {
+                        exited = true;
+                        break;
                     }
                 }
                 if (outcome == BootGuard.Outcome.RETRY_SAFE) {
@@ -512,23 +502,27 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
                 }
                 Thread.sleep(800L);
             }
+            if (exited) {
+                String tail = run("tail -n 6 /data/local/tmp/uaf_replay.log 2>/dev/null", true).output.trim();
+                append("[payload] 进程已退出但没有成功标记" + (tail.isEmpty() ? "" : "，最后输出："));
+                if (!tail.isEmpty()) {
+                    append(tail);
+                }
+                return "payload 提前退出（未进入提权阶段）· 详见上方输出";
+            }
             if (attempt < 3) {
                 append("[重试] 第 " + attempt + " 次未命中，重启 payload 再试（" + (attempt + 1) + "/3）");
                 stopPayload();
                 Thread.sleep(1200L);
             }
         }
-        return isRoot(run("/data/local/tmp/pc98260-su -c 'id'", true).output);
+        return isRoot(run("/data/local/tmp/pc98260-su -c 'id'", true).output) ? null : "";
     }
 
     private void stopPayload() throws Exception {
         run(BootGuard.killCommand(), true);
     }
 
-    /**
-     * /proc is mounted with hidepid=invisible here, so ps cannot see other processes; the leftover
-     * rootd socket is the only reliable sign that an earlier payload is still alive.
-     */
     private int payloadProcessCount() throws Exception {
         int count = Integer.parseInt(run(BootGuard.aliveCommand(), true).output.trim());
         if (count > 0) {
@@ -541,28 +535,32 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
     /**
      * Removes the world-executable exploit binaries from /data/local/tmp once the workflow is over.
      * Logs stay for debugging. While a temporary root is the only way up, its client and socket stay;
-     * once KernelSU has taken over they are dead weight and are removed too.
+     * once KernelSU has taken over they are dead weight and removed too.
      */
     private void cleanupBinaries(boolean keepRootClient) {
         try {
             if (!keepRootClient) {
                 run(BootGuard.killCommand(), true);
             }
-            String targets = EXPLOIT_BINARIES + (keepRootClient ? "" : " pc98260-su pc98260-root.sock");
+            String targets = EXPLOIT_BINARIES
+                    + (keepRootClient ? "" : " pc98260-su pc98260-root.sock ksud");
             run("cd /data/local/tmp 2>/dev/null; rm -f " + targets + "; true", true);
-            append("[清理] 已移除 " + targets + (keepRootClient
-                    ? "（保留 pc98260-su 与 rootd socket，临时 ROOT 仍在用）"
-                    : "（KernelSU 已接管，临时通道一并移除）"));
+            String reason;
+            if (keepRootClient) {
+                reason = state == State.ROOTED || state == State.KSU_PENDING
+                        ? "（保留 pc98260-su 与 rootd socket，临时 ROOT 仍在用）"
+                        : "（保留 pc98260-su 与 rootd socket）";
+            } else if (state == State.COMPLETE) {
+                reason = "（KernelSU 已接管，临时通道一并移除）";
+            } else {
+                reason = "（本次运行未成功，临时产物一并移除）";
+            }
+            append("[清理] 已移除 " + targets + reason);
         } catch (Exception ignored) {
             // Cleanup is best effort and must not change the workflow result.
         }
     }
 
-    /**
-     * Runs a maintenance command through the same busy gate as the exploit workflow.
-     * /proc is hidepid=invisible, so "pidof system_server" returns nothing and the old soft-reboot
-     * command silently did nothing; it is replaced by an init restart of zygote, which needs su.
-     */
     public boolean runMaintenance(String command) {
         return start("maint", () -> {
             boolean canElevate = "yes".equals(run("test -x /system/bin/su && echo yes || echo no", true).output.trim());
@@ -589,7 +587,6 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
         return executor.run(command, quiet);
     }
 
-    /** Boot id of the running kernel; empty when the value cannot be read. */
     private String bootId() {
         try {
             return run("cat /proc/sys/kernel/random/boot_id 2>/dev/null", true).output.trim();
@@ -617,30 +614,26 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
         }
     }
 
-    /**
-     * Records the failed boot so a second attempt inside the same boot can be gated exactly like the
-     * original tool: SELinux already permissive means the first phase landed, so only the cred stage
-     * has to be retried; still Enforcing means the kernel state is polluted and a reboot is required.
-     */
-    private void recordFailedBoot(String boot) {
+    /** Records the failed boot; abort=true blocks any retry in this boot. */
+    private void recordFailedBoot(String boot, boolean abort) {
         if (boot == null || boot.isEmpty()) {
             return;
         }
         try {
             boolean permissive = "Permissive".equalsIgnoreCase(run("getenforce 2>/dev/null", true).output.trim());
-            run("echo '" + boot + " " + (permissive ? 0 : 1) + "' > " + FAILED_MARKER, true);
-            append(permissive
-                    ? "已记录本次失败：SELinux 已 Permissive，可直接重试 cred 阶段（无需重启）。"
-                    : "已记录本次失败：SELinux 仍 Enforcing，请重启后重试，切勿重复点击。");
+            run(BootGuard.recordFailureCommand(boot, abort, permissive), true);
+            if (abort) {
+                append("已记录：本次开机节点已挂树，禁止重跑，请重启设备后再试。");
+            } else {
+                append(permissive
+                        ? "已记录本次失败：SELinux 已 Permissive，可直接重试 cred 阶段（无需重启）。"
+                        : "已记录本次失败：SELinux 仍 Enforcing，请重启后重试，切勿重复点击。");
+            }
         } catch (Exception ignored) {
             // Recording the failure must never mask the original error.
         }
     }
 
-    /**
-     * Frees memory before the exploit runs, but only when it is actually short: on a 16 GB phone with
-     * several GB available the force-stop of chat apps costs more than it buys.
-     */
     private void cleanMemory() {
         try {
             long[] before = memoryState();
@@ -659,7 +652,6 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
         }
     }
 
-    /** {MemFree, MemAvailable} in kB, -1 when unreadable. */
     private long[] memoryState() {
         try {
             String out = run("grep -E '^(MemFree|MemAvailable):' /proc/meminfo 2>/dev/null", true).output.trim();
@@ -682,10 +674,6 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
         }
     }
 
-    /**
-     * Records what the device already looked like before any exploit step, so a later "uid=0" can be
-     * attributed: pre-existing root, patch level of the running firmware, and a live rootd socket.
-     */
     private void captureBaseline() {
         try {
             String id = oneLine(run("id 2>/dev/null", true).output);
@@ -694,9 +682,10 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
             String suProbe = run("/system/bin/su -c id 2>/dev/null", true).output;
             String socket = run("ls -l " + ROOTD_SOCKET + " 2>/dev/null", true).output.trim();
             append("[基线] id=" + id + " · SELinux=" + enforceBeforeRun);
-            append("[基线] security_patch=" + patch + (patch.compareTo("2026-10-06") < 0
+            append("[基线] security_patch=" + (patch.isEmpty() ? "未知" : patch)
+                    + (patch.isEmpty() ? "" : (patch.compareTo("2026-10-06") < 0
                     ? "（早于上游修复 2026-10-06，处于未修补窗口）"
-                    : "（不早于上游修复 2026-10-06，固件可能已回补，失败需先怀疑此处）"));
+                    : "（不早于上游修复 2026-10-06，固件可能已回补，失败需先怀疑此处）")));
             append("[基线] /system/bin/su=" + (suProbe.trim().isEmpty() ? "无" : oneLine(suProbe)));
             append("[基线] rootd socket=" + (socket.isEmpty() ? "无" : "已存在（本次开机可能已 root 过）"));
             rootBeforeRun = suProbe.contains("uid=0") || id.contains("uid=0");
