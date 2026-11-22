@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# 从上游（MIT）源码构建 slide_probe 与 pc98260-su。
+# 从上游（MIT）源码构建 slide_probe、pc98260-su 与 uaf_plant_replay。
 #
 # 用法：tools/build_xring.sh <输出目录>
 #
-# 流程：按 tools/xring.lock.properties 下载 tarball → 校验 sha256 →
-#       解包 → 用 zig cc 交叉编译 → 产物写到 <输出目录>/slide_probe、pc98260-su。
+# 流程：按 tools/xring.lock.properties 下载 tarball → 校验 sha256 → 解包 →
+#       用 zig cc 交叉编译 → 产物写到 <输出目录>/。
 #
 # 只做本地编译，不接触设备。
 set -euo pipefail
@@ -64,5 +64,11 @@ zig cc "${CFLAGS[@]}" \
   "$SRC/src/pc98260_su.c" \
   -o "$OUT/pc98260-su"
 
-ls -l "$OUT/slide_probe" "$OUT/pc98260-su"
-sha256sum "$OUT/slide_probe" "$OUT/pc98260-su"
+echo "== uaf_plant_replay（早期单文件变体，CLI 与 App 现有调用一致）"
+zig cc "${CFLAGS[@]}" \
+  "$SRC/src/exploit-android-perf.c" \
+  "$SRC/src/xr98260_profiles.c" \
+  -o "$OUT/uaf_plant_replay"
+
+ls -l "$OUT"/
+sha256sum "$OUT"/*
