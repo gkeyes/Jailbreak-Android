@@ -33,9 +33,9 @@
     {
       "name": "uaf_plant_replay",
       "path": "app/src/main/assets/uaf_plant_replay",
-      "size": 115952,
-      "gitBlobSha1": "9d693a8dfcf094ec085ace6f91fc90344bf63cc7",
-      "sha256": "25c967b8d7811272c34401194fc062c44487211fff3db7a4709996e4551456ab",
+      "size": 99048,
+      "gitBlobSha1": "de95b39544b6b0ca10e6bdc919b7de8868fca133",
+      "sha256": "d854aa21b4a367145a0f77454de9090f1110c09befd2cc6ab2dd34ff78f591ee",
       "origin": "upstream-source",
       "sourceDraft": "Lw5959/xring-cve-2026-98260@8b404774/src/exploit-android-perf.c",
       "license": "MIT",
