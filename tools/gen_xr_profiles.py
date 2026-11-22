@@ -1,19 +1,17 @@
 #!/usr/bin/env python3
 """从 lhasa_profile.txt 生成上游 CVE-2026-98260 源码所需的 profile 表。
 
-上游 src/xr98260_profiles.c 是编译期常量表，只包含作者手上的两条内核
-（g1d099fcb35e0 / g284297031c53），遇到别的 OTA 会 fail-fast（exit 2）。
-这里改成由我们唯一的常量文件生成，产物与原件（uaf_plant_replay）共用同一数据源。
+上游 src/xr98260_profiles.c 是编译期常量表（只含作者手上两条内核），且遇到
+未知 uname 会 exit(2)。本项目把它换成由唯一常量文件生成，并且**不设硬门槛**：
+匹配不到就退回表中最新的那条 profile，只打警告。
 
 用法：
   tools/gen_xr_profiles.py <lhasa_profile.txt> <输出 .c>
 
-输出实现了上游头文件声明的三个符号：
+输出实现上游头文件声明的三个符号：
   const struct xr_kernel_profile *xr_profile(void);
   const struct xr_kernel_profile *xr_profile_by_id(const char *id);
   const char *xr_profile_id(void);
-
-选择顺序与上游一致：XR98260_KERNEL=<id> 覆盖 → uname -r 子串匹配 → 失败退出。
 """
 
 from __future__ import annotations
@@ -23,7 +21,6 @@ import re
 import sys
 
 # 结构体偏移：上游注释称两份内核一致，这里沿用其值。
-# kitimer 尺寸/节点偏移用于 slide_probe 的命中判据。
 OFFSETS = {
     "kitimer_bytes": 0x180,
     "kitimer_node": 0xE0,
@@ -64,7 +61,6 @@ def parse(path: pathlib.Path) -> list:
         if missing:
             print(f"跳过 {release}：缺字段 {missing}", file=sys.stderr)
             continue
-        # 用 release 里 -5- 之后的部分作为匹配子串（与上游 match 语义一致）
         match = re.sub(r"^.*-5-", "", release)
         entries.append({"release": release, "match": match, "fields": fields})
     return entries
@@ -113,14 +109,12 @@ def emit(entries: list) -> str:
     out.append("")
     out.append("static const struct xr_kernel_profile *g_xr_profile;")
     out.append("")
-    out.append("static void xr_profile_fail(const char *reason, const char *detail)")
+    out.append("static void xr_list_supported(void)")
     out.append("{")
-    out.append('\tfprintf(stderr, "[kernel] %s: %s\\n[kernel] supported builds:\\n",')
-    out.append('\t\treason, detail ? detail : "(none)");')
+    out.append('\tfprintf(stderr, "[kernel] known profiles:\\n");')
     out.append("\tfor (size_t i = 0; i < XR_NPROFILES; i++)")
     out.append('\t\tfprintf(stderr, "  %-3s %s\\n", xr_profiles[i].id, xr_profiles[i].display);')
-    out.append('\tfprintf(stderr, "[kernel] set XR98260_KERNEL=<id> to override\\n");')
-    out.append("\texit(2);")
+    out.append('\tfprintf(stderr, "[kernel] override with XR98260_KERNEL=<id>\\n");')
     out.append("}")
     out.append("")
     out.append("const struct xr_kernel_profile *xr_profile_by_id(const char *id)")
@@ -142,11 +136,12 @@ def emit(entries: list) -> str:
     out.append("\t\treturn g_xr_profile;")
     out.append("\tif (env && *env) {")
     out.append("\t\tconst struct xr_kernel_profile *p = xr_profile_by_id(env);")
-    out.append("\t\tif (!p)")
-    out.append("\t\t\txr_profile_fail(\"unknown XR98260_KERNEL\", env);")
-    out.append("\t\tg_xr_profile = p;")
-    out.append('\t\tfprintf(stderr, "[kernel] profile=%s (env) %s\\n", p->id, p->display);')
-    out.append("\t\treturn p;")
+    out.append("\t\tif (p) {")
+    out.append("\t\t\tg_xr_profile = p;")
+    out.append('\t\t\tfprintf(stderr, "[kernel] profile=%s (env) %s\\n", p->id, p->display);')
+    out.append("\t\t\treturn p;")
+    out.append("\t\t}")
+    out.append('\t\tfprintf(stderr, "[kernel] WARN 未知 XR98260_KERNEL=%s，忽略该覆盖\\n", env);')
     out.append("\t}")
     out.append("\tif (uname(&uts)) {")
     out.append("\t\tperror(\"uname\");")
@@ -160,8 +155,13 @@ def emit(entries: list) -> str:
     out.append("\t\t\treturn g_xr_profile;")
     out.append("\t\t}")
     out.append("\t}")
-    out.append("\txr_profile_fail(\"unsupported kernel\", uts.release);")
-    out.append("\treturn NULL;")
+    out.append("\t/* 不设硬门槛：退回表中最后一条（最新内核），只警告。 */")
+    out.append("\tg_xr_profile = &xr_profiles[XR_NPROFILES - 1];")
+    out.append('\tfprintf(stderr, "[kernel] WARN 未匹配到内核 %s，退回 profile %s\\n",')
+    out.append("\t\tuts.release, g_xr_profile->display);")
+    out.append('\tfprintf(stderr, "[kernel] WARN 常量可能不匹配，失败时请先更新 lhasa_profile.txt\\n");')
+    out.append("\txr_list_supported();")
+    out.append("\treturn g_xr_profile;")
     out.append("}")
     out.append("")
     out.append("const char *xr_profile_id(void)")
