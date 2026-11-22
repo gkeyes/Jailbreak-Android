@@ -1,0 +1,110 @@
+{
+  "schemaVersion": 1,
+  "updatedAt": "2026-11-22",
+  "project": "Lhasa26-Android",
+  "scope": "app/src/main/assets/",
+  "rule": "凡是会被打进 APK 的文件都必须在此登记。未登记文件由 tools/check_assets.py 报警（--strict 下为失败）。",
+  "legacyIdentifiers": {
+    "note": "sha256 尚未在本机计算（仓库为私有，取不到字节）。在 CI 跑 tools/check_assets.py --update 可一次性补齐；在此之前用 size + gitBlobSha1 作为内容标识，二者都能从 git 对象直接复核。",
+    "blobSha1": "git 对象内容的 SHA-1（等价于 `git hash-object <file>`），与文件内容一一对应"
+  },
+  "assets": [
+    {
+      "name": "ksud",
+      "path": "app/src/main/assets/ksud",
+      "size": 4990848,
+      "gitBlobSha1": "5b3b8d4a0bf749d23306995666c66fc159195d31",
+      "sha256": null,
+      "origin": "upstream-prebuilt-unverified",
+      "upstream": {
+        "repo": "tiann/KernelSU",
+        "tag": null,
+        "asset": null,
+        "note": "当前提交的 4,990,848 字节产物与上游 v3.3.1 的 ksud-aarch64-linux-android（6,402,736 字节）不一致，无法对接到任何官方 Release"
+      },
+      "license": "GPL-3.0",
+      "inApk": true,
+      "usedBy": "core/WorkflowEngine.java — KernelSU 接管步骤按需投放，不在 RUNTIME_ASSETS 预置清单里",
+      "status": "unverified",
+      "action": "按 tools/ksud.lock.properties 换成锁定的上游官方产物，仓库不再存该二进制"
+    },
+    {
+      "name": "uaf_plant_replay",
+      "path": "app/src/main/assets/uaf_plant_replay",
+      "size": 88488,
+      "gitBlobSha1": "4e8fa96f280c832dc185818c9dda6bf15f280165",
+      "sha256": null,
+      "origin": "prebuilt-no-source",
+      "sourceDraft": null,
+      "inApk": true,
+      "usedBy": "core/AssetDeployer.RUNTIME_ASSETS（主利用）",
+      "status": "black-box",
+      "action": "plant/ 下没有对应源码。要么补 .c 并交叉编译 + 等价性验证，要么在 README 里明确标注为不可重建产物"
+    },
+    {
+      "name": "reach_probe",
+      "path": "app/src/main/assets/reach_probe",
+      "size": 51368,
+      "gitBlobSha1": "673fd33c7a4dfa749742e56b944dc857fd40eb6b",
+      "sha256": null,
+      "origin": "prebuilt-with-draft-source",
+      "sourceDraft": "plant/reach_probe.c",
+      "inApk": true,
+      "usedBy": "core/AssetDeployer.RUNTIME_ASSETS（接口可达性诊断）",
+      "status": "draft-source-unlinked",
+      "action": "接入 app 构建（plant.yml 产物 → assets），替换后加等价性验证"
+    },
+    {
+      "name": "slide_probe",
+      "path": "app/src/main/assets/slide_probe",
+      "size": 44776,
+      "gitBlobSha1": "022326460fb7ab31f6c0af7ccd34cccf37b276eb",
+      "sha256": null,
+      "origin": "prebuilt-with-draft-source",
+      "sourceDraft": "plant/slide_probe.c",
+      "inApk": true,
+      "usedBy": "core/AssetDeployer.RUNTIME_ASSETS（KASLR 位移）",
+      "status": "draft-source-unlinked",
+      "action": "同上"
+    },
+    {
+      "name": "perf_slide",
+      "path": "app/src/main/assets/perf_slide",
+      "size": 31840,
+      "gitBlobSha1": "9aec90ed6e3fb91af5ea4800ab1895b9f87d9072",
+      "sha256": null,
+      "origin": "prebuilt-with-draft-source",
+      "sourceDraft": "plant/perf_slide.c",
+      "inApk": true,
+      "usedBy": "core/AssetDeployer.RUNTIME_ASSETS",
+      "status": "draft-source-unlinked",
+      "action": "同上"
+    },
+    {
+      "name": "pc98260-su",
+      "path": "app/src/main/assets/pc98260-su",
+      "size": 28416,
+      "gitBlobSha1": "4c37dd5341b15daf1f9f159da7ccbeb853b6b7d1",
+      "sha256": null,
+      "origin": "prebuilt-with-draft-source",
+      "sourceDraft": "plant/pc98260-su.c",
+      "inApk": true,
+      "usedBy": "core/AssetDeployer.RUNTIME_ASSETS（提权后连 root 服务的客户端）",
+      "status": "draft-source-unlinked",
+      "action": "同上"
+    },
+    {
+      "name": "lhasa_profile.txt",
+      "path": "app/src/main/assets/lhasa_profile.txt",
+      "size": 2046,
+      "gitBlobSha1": "343cec0c23fea175237a5b9ceabc134baeccf229",
+      "sha256": null,
+      "origin": "in-repo-data",
+      "sourceDraft": null,
+      "inApk": true,
+      "usedBy": "core/AssetDeployer.RUNTIME_ASSETS（内核特征数据）",
+      "status": "data",
+      "action": "保持；若含设备指纹需在导出日志时脱敏"
+    }
+  ]
+}
