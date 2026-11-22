@@ -1,7 +1,7 @@
 {
   "name": "pc98260-su",
-  "size": 28416,
-  "sha256": "c8a1646cc56cff58caae7fff2aa27bbb7e9456b5ec798625898b592927a6737e",
+  "size": 26616,
+  "sha256": "231cf185d2808b66c9fd7cc45c00ab5a0fa4b7fa588f96e06587af8ee390fdd2",
   "elf": {
     "elf": true,
     "class64": true,
@@ -15,7 +15,6 @@
   "targetConstants": [],
   "strings": [
     "(null)",
-    "-+   0X0x",
     "-0X+0X 0X-0x+0x 0x",
     ".comment",
     ".eh_frame",
@@ -26,6 +25,10 @@
     "/data/local/tmp/pc98260-root.sock",
     "/dev/null",
     "0123456789ABCDEF",
+    ": option requires an argument: ",
+    ": unrecognized option: ",
+    "=-+   0X0x",
+    "@9H=(7",
     "Address family not supported by protocol",
     "Address in use",
     "Address not available",
@@ -65,7 +68,7 @@
     "Key has expired",
     "Key was rejected by service",
     "Link has been severed",
-    "Linker: LLD 21.1.0",
+    "Linker: LLD 18.1.6",
     "Message too large",
     "Multihop attempted",
     "Network is down",
@@ -116,16 +119,16 @@
     "Stale file handle",
     "State not recoverable",
     "Symbolic link loop",
-    "T*?@8)",
-    "THik8,ik8m",
+    "T)@@Q)}",
     "Text file busy",
+    "Tj?@8)",
     "Too many links",
     "Too many open files in system",
     "Value too large for data type",
     "Wrong medium type",
-    "clang version 21.1.0",
+    "_8(hn8",
+    "clang version 18.1.6 (https://github.com/ziglang/zig-bootstrap 98bc6bf4fc4009888d33941daf6b600d20a42a56)",
     "connect root daemon",
-    "ji8jj)8)",
     "usage: %s [-c command]"
   ]
 }

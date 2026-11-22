@@ -1,7 +1,7 @@
 {
   "name": "perf_slide",
-  "size": 31840,
-  "sha256": "b34db55930af89557a94ff01ea4b96c6c673224089b238ee0924508b47ffa85e",
+  "size": 27144,
+  "sha256": "89705ef467342d6af11bbcc21289f988bc4953de7d2ac2df14eb8843a5cb6d1f",
   "elf": {
     "elf": true,
     "class64": true,
@@ -14,18 +14,16 @@
     "site=0x%llx",
     "slide=0x%llx"
   ],
-  "constantCount": 1,
-  "constants": {
-    "0xffffffd400000a29": 1
-  },
+  "constantCount": 0,
+  "constants": {},
   "targetConstants": [],
   "strings": [
     "(null)",
-    "-+   0X0x",
     "--duration",
     "--etext",
     "--period",
     "--stext",
+    "--stext/--etext",
     "--timer",
     "-0X+0X 0X-0x+0x 0x",
     ".comment",
@@ -36,6 +34,7 @@
     ".shstrtab",
     "/dev/null",
     "0123456789ABCDEF",
+    "=-+   0X0x",
     "Address family not supported by protocol",
     "Address in use",
     "Address not available",
@@ -76,7 +75,7 @@
     "Key was rejected by service",
     "LINUX_2.6.39",
     "Link has been severed",
-    "Linker: LLD 21.1.0",
+    "Linker: LLD 18.1.6",
     "Message too large",
     "Multihop attempted",
     "Network is down",
@@ -126,6 +125,7 @@
     "Stale file handle",
     "State not recoverable",
     "Symbolic link loop",
+    "T)@@Q)}",
     "T*?@8)",
     "Text file busy",
     "Too many links",
@@ -140,9 +140,8 @@
     "[perf] no slide candidate",
     "[perf] no usable hardware PMU errno=%d",
     "[perf] samples=%d kernel_frames=%d",
-    "__kernel_clock_gettime",
-    "clang version 21.1.0",
-    "hj8(hj8J",
+    "_8(hn8",
+    "clang version 18.1.6 (https://github.com/ziglang/zig-bootstrap 98bc6bf4fc4009888d33941daf6b600d20a42a56)",
     "site=0x%llx",
     "slide=0x%llx"
   ]
