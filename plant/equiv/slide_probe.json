@@ -1,7 +1,7 @@
 {
   "name": "slide_probe",
-  "size": 35336,
-  "sha256": "e9830ee4f058f82c3b455eb1611e58b4771e8995f23c0adf3926c9c5b64b63b5",
+  "size": 35352,
+  "sha256": "8b3681cbd2966eefe5a800b8964e58253ff338b37bffe997b4d891933c8c9e3c",
   "elf": {
     "elf": true,
     "class64": true,
@@ -37,7 +37,6 @@
     "/sys/kernel/tracing/trace",
     "/sys/kernel/tracing/tracing_on",
     "0123456789ABCDEF",
-    "6_M+9(",
     "Address family not supported by protocol",
     "Address in use",
     "Address not available",
@@ -146,7 +145,7 @@
     "_i=8Iih8)",
     "bytes_req=384",
     "clang version 18.1.6 (https://github.com/ziglang/zig-bootstrap 98bc6bf4fc4009888d33941daf6b600d20a42a56)",
-    "posix_timers_cache",
-    "rss_stat"
+    "kmem_cache_free",
+    "posix_timers_cache"
   ]
 }

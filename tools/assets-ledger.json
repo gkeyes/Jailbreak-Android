@@ -90,9 +90,9 @@
     {
       "name": "perf_slide",
       "path": "app/src/main/assets/perf_slide",
-      "size": 37296,
-      "gitBlobSha1": "b420eba8435c8670d42e584d65d1bda5ba4ebcce",
-      "sha256": "356ae7578eaa63811ceaec9967bd44d195d9057e4f5106c3159a2a6c05e86798",
+      "size": 37376,
+      "gitBlobSha1": "f2055fa09c0d3838dc1a9ad8175fc169fac35dd7",
+      "sha256": "be977d32d3def2fe6673403f4fd92626af8fe68eb1439f7d5fca49f723d89aca",
       "origin": "rebuilt-from-source",
       "sourceDraft": "plant/perf_slide.c",
       "inApk": true,
