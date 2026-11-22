@@ -5,17 +5,16 @@
 # 去连它发命令 = 复用不稳定的内核状态，实测会让设备 panic 重启（2026-11-22）。
 # 所以这个客户端只比「连接失败」与「参数解析」两条路径：
 #
-#   用例 1  PC98260_SOCK 指向不存在的 socket + -c id  → 两边的提示与退出码必须一致
-#   用例 2  不带参数                                  → usage 行必须一致
-#   用例 3  -h                                        → usage 行必须一致
+#   用例 1  PC98260_SOCK 指向不存在的 socket + -c id
+#   用例 2  不带参数            → usage 行
+#   用例 3  -h                  → usage 行
 #
 # 全程只写 $WORK（默认 /data/local/tmp/gate2），不需要 root、不起监听、不读 tracefs。
 #
-# 用法（原件目录可用 `pm path` 从旧版本 APK 里 unzip 出来，或事先拷好）：
-#   gate2_pc98260.sh [原件路径] [重建件路径]
+# 用法：gate2_pc98260.sh [原件路径] [重建件路径]
 #   默认 /data/local/tmp/plant/orig/pc98260-su 与 .../new/pc98260-su
 #
-# 注意：它只能验证参数解析与连接失败路径。真正跑通还需要闸 3（走 App 真实入口）。
+# 注意：它只验证参数解析与连接失败路径；真正跑通还要走 App 的真实入口。
 
 set -u
 
@@ -30,7 +29,6 @@ for bin in "$ORIG" "$NEW"; do
 	[ -x "$bin" ] || { echo "缺少可执行文件：$bin"; exit 2; }
 done
 
-# 每次都不一样、且不携带语义的东西归一化掉。
 normalize() {
 	sed -E \
 		-e 's/pid=[0-9]+/pid=PID/g' \
@@ -86,13 +84,8 @@ run_case() {
 
 fail=0
 
-# 用例 1：套接字不存在 → 两边都应该在 connect 前打出同一条提示并以同一码退出
 run_case connect-fail "$ORIG" "$NEW" -c 'id' || fail=1
-
-# 用例 2：无参数 → usage
 run_case usage-noargs "$ORIG" "$NEW" || fail=1
-
-# 用例 3：-h → usage
 run_case usage-help "$ORIG" "$NEW" -h || fail=1
 
 echo
