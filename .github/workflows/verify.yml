@@ -1,6 +1,6 @@
 name: verify
 
-# 只读校验：资产台账 + 单测 + 组装 debug APK，产物作为运行附件上传。
+# 只读校验：资产台账 + 单测 + 组装 debug APK。
 #
 # 唯一的写权限是 issues：写，而且**只在失败时**用它把日志尾巴写成一条 issue。
 # 原因很实际：CI 日志只能从网页看，MCP 侧拿不到 Artifact，
@@ -9,7 +9,7 @@ name: verify
 
 on:
   push:
-    branches: [ fix/p0-clean-boot-retry, chore/assets-ledger ]
+    branches: [ next ]
   workflow_dispatch:
 
 permissions:
@@ -25,7 +25,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        id: checkout
       - uses: actions/setup-java@v4
+        id: java
         with:
           distribution: temurin
           java-version: '17'
@@ -35,6 +37,7 @@ jobs:
           set -o pipefail
           bash tools/ci_verify.sh 2>&1 | tee "$RUNNER_TEMP/verify.log"
       - name: Upload APK
+        id: upload_apk
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -42,6 +45,7 @@ jobs:
           path: app/build/outputs/apk/debug/*.apk
           if-no-files-found: warn
       - name: Upload logs
+        id: upload_logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -57,6 +61,11 @@ jobs:
         if: failure()
         env:
           GH_TOKEN: ${{ github.token }}
+          OUT_CHECKOUT: ${{ steps.checkout.outcome }}
+          OUT_JAVA: ${{ steps.java.outcome }}
+          OUT_VERIFY: ${{ steps.verify.outcome }}
+          OUT_UPLOAD_APK: ${{ steps.upload_apk.outcome }}
+          OUT_UPLOAD_LOGS: ${{ steps.upload_logs.outcome }}
         run: |
           set -uo pipefail
           title="ci: verify 失败 ${GITHUB_SHA:0:8}"
@@ -64,13 +73,17 @@ jobs:
           {
             echo "commit: \`$GITHUB_SHA\`"
             echo
+            echo "### 各步结果"
+            echo '```text'
+            echo "checkout      = ${OUT_CHECKOUT}"
+            echo "setup-java    = ${OUT_JAVA}"
+            echo "verify.sh     = ${OUT_VERIFY}"
+            echo "upload APK    = ${OUT_UPLOAD_APK}"
+            echo "upload logs   = ${OUT_UPLOAD_LOGS}"
+            echo '```'
             echo "### verify.sh 输出（结尾）"
             echo '```text'
-            tail -c 16000 "$RUNNER_TEMP/verify.log" 2>/dev/null || echo "（无 verify.log）"
-            echo '```'
-            echo "### verify-report.md"
-            echo '```text'
-            tail -c 4000 "$RUNNER_TEMP/verify-report.md" 2>/dev/null || echo "（无报告）"
+            tail -c 14000 "$RUNNER_TEMP/verify.log" 2>/dev/null || echo "（无 verify.log）"
             echo '```'
             echo "### 构建产物目录"
             echo '```text'
