@@ -1,13 +1,16 @@
 name: verify
 
-# 把待合并的补丁真正接到入口（WorkflowEngine.java），在入口上跑模拟任务验收，
+# 把待合并的改动真正接到入口（WorkflowEngine.java），在入口上跑模拟任务验收，
 # 把结果写回分支并把结果绑定到一个 tag 上。
+#
+on: 推送到分支
+# 先跑 tools/wire_workflow.py（锚点式，幂等），再跑单测与 release 编译。
 on:
   push:
     branches: [ fix/p0-clean-boot-retry ]
     paths:
       - 'app/**'
-      - 'docs/patch/**'
+      - 'tools/**'
       - '.github/workflows/verify.yml'
   workflow_dispatch:
 
@@ -23,20 +26,8 @@ jobs:
       - name: Wire the patch into WorkflowEngine
         id: wire
         run: |
-          set +e
-          if git apply --check docs/patch/p0-workflow-engine.diff 2>/dev/null; then
-            git apply docs/patch/p0-workflow-engine.diff
-            echo "applied=yes" >> "$GITHUB_OUTPUT"
-            echo "补丁已应用。"
-          elif git apply --check -R docs/patch/p0-workflow-engine.diff 2>/dev/null; then
-            echo "applied=already" >> "$GITHUB_OUTPUT"
-            echo "补丁已经嵌入源码，跳过。"
-          else
-            echo "applied=conflict" >> "$GITHUB_OUTPUT"
-            echo "::error::补丁无法应用，源码已偏离补丁基线"
-            exit 1
-          fi
-          git diff --stat
+          set -o pipefail
+          python3 tools/wire_workflow.py 2>&1 | tee wire.log
 
       - uses: actions/setup-java@v4
         with:
@@ -65,26 +56,33 @@ jobs:
 
       - name: Compile wired sources
         id: compile
-        if: success()
+        if: always()
         run: |
+          set +e
           set -o pipefail
           ./gradlew --no-daemon :app:compileReleaseJavaWithJavac 2>&1 | tee -a test.log
+          exit $?
 
       - name: Record result and commit
         if: always()
         env:
           TEST: ${{ steps.test.outcome }}
           COMPILE: ${{ steps.compile.outcome }}
-          APPLIED: ${{ steps.wire.outputs.applied }}
         run: |
           set +e
           {
             echo "# 验收结果"
             echo
             echo "- commit: \`${GITHUB_SHA:0:8}\`"
-            echo "- 补丁接线：${APPLIED}"
+            echo "- 接线：${{ steps.wire.outcome }}"
             echo "- 单测：${TEST}"
             echo "- 编译：${COMPILE}"
+            echo
+            echo "## 接线日志"
+            echo
+            echo '```text'
+            cat wire.log 2>/dev/null
+            echo '```'
             echo
             echo "## 用例"
             echo
@@ -96,11 +94,14 @@ jobs:
             done
             echo '```'
             echo
-            echo "## WorkflowEngine 是否已接线"
+            echo "## 入口是否真的调用防护"
             echo
             echo '```text'
-            grep -c 'BootGuard.classify' app/src/main/java/com/gkeyes/lhasa26/core/WorkflowEngine.java 2>/dev/null || echo 0
-            grep -c 'DeployGate' app/src/main/java/com/gkeyes/lhasa26/core/WorkflowEngine.java 2>/dev/null || echo 0
+            wf=app/src/main/java/com/gkeyes/lhasa26/core/WorkflowEngine.java
+            echo "BootGuard.classify  x$(grep -c 'BootGuard.classify' "$wf" 2>/dev/null || echo 0)"
+            echo "DeployGate           x$(grep -c 'DeployGate' "$wf" 2>/dev/null || echo 0)"
+            echo "DEPLOY_TIMEOUT_MS    x$(grep -c 'DEPLOY_TIMEOUT_MS' "$wf" 2>/dev/null || echo 0)"
+            echo "旧 pkill 路径       x$(grep -c 'pkill -f uaf_plant_replay' "$wf" 2>/dev/null || echo 0)"
             echo '```'
             echo
             echo "## 日志尾部"
@@ -112,7 +113,7 @@ jobs:
 
           git config user.name "lhasa-ci"
           git config user.email "lhasa-ci@users.noreply.github.com"
-          git add -A app docs plant/verify-report.md 2>/dev/null
+          git add -A app plant/verify-report.md 2>/dev/null
           if git diff --cached --quiet; then
             echo "nothing to commit"
           else
@@ -125,6 +126,7 @@ jobs:
         env:
           TEST: ${{ steps.test.outcome }}
           COMPILE: ${{ steps.compile.outcome }}
+          WIRE: ${{ steps.wire.outcome }}
         run: |
           set +e
           git config user.name "lhasa-ci"
@@ -132,7 +134,7 @@ jobs:
           git ls-remote --tags origin | awk '{print $2}' | grep -v '\^{}' \
             | grep -E '^refs/tags/verify-' \
             | while read -r ref; do git push origin ":$ref"; done
-          if [ "$TEST" = "success" ] && [ "$COMPILE" = "success" ]; then
+          if [ "$TEST" = "success" ] && [ "$COMPILE" = "success" ] && [ "$WIRE" = "success" ]; then
             tag="verify-ok-${GITHUB_SHA:0:8}"
           else
             tag="verify-fail-${GITHUB_SHA:0:8}"
