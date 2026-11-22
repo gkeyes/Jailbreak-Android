@@ -1,17 +1,18 @@
 name: build-apk
 
-# main 的发布构建。只做两件事：构建、按需发布。
+# next 的发布构建。只做两件事：构建、按需发布。
 #
-# 与旧版的区别（审计 P1）：
-#   - 不再把签名口令写死在 workflow 里（原来 env 里是 lhasa26pass）；
-#   - 不再在 CI 里生成 keystore 并 commit 回仓库；
-#   - 不再「发现 ksud 不对就用 curl 拉一份覆盖并提交」，改为按锁文件校验，不合格就失败；
-#   - 不再往分支推 build-state / design-state 之类的状态 tag；
-#   - 权限按 job 拆开：build 只读，release 才给 contents: write。
+# 签名策略（简单版）：
+#   - 钥匙就一把：keystore/lhasa26.jks，它在历史里，工作树里不常驻；
+#   - 口令在 keystore/keystore.properties（私有仓库，单人使用）；
+#   - 不依赖任何 Actions Secrets。想以后搬去 Secrets 时，代码不用改，
+#     只要设了同名环境变量就会优先用环境变量。
+#
+# 其它与前几轮保持一致：只读为主，review 之外的写操作只有发布 job 和 tag。
 
 on:
   push:
-    branches: [ main ]
+    branches: [ next ]
     paths:
       - 'app/**'
       - 'design/**'
@@ -20,6 +21,7 @@ on:
       - 'gradle/**'
       - 'gradlew'
       - 'tools/**'
+      - 'keystore/**'
       - '.github/workflows/build.yml'
   workflow_dispatch:
 
@@ -33,6 +35,9 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v4
+        with:
+          # 需要历史才能把 jks 从旧提交里取回来
+          fetch-depth: 0
 
       - uses: actions/setup-java@v4
         with:
@@ -58,29 +63,18 @@ jobs:
       - name: 校验 ksud（不匹配即失败，不再自动覆盖）
         run: bash tools/fetch_ksud.sh
 
-      - name: 准备签名材料
-        env:
-          KEYSTORE_B64: ${{ secrets.LHASA_KEYSTORE_B64 }}
+      - name: 恢复签名钥匙
         run: |
-          if [ -n "$KEYSTORE_B64" ]; then
-            mkdir -p keystore
-            printf '%s' "$KEYSTORE_B64" | base64 -d > keystore/lhasa26.jks
-            echo "签名材料已从 Secrets 还原"
-          elif [ -f keystore/lhasa26.jks ] && [ -n "${{ secrets.LHASA_STORE_PASSWORD }}" ]; then
-            echo "使用仓库内已有的 keystore + Secrets 口令"
-          elif [ "${{ contains(github.event.head_commit.message, '[release]') }}" = "true" ]; then
-            echo "::error::这次提交要求发布正式包，但签名材料与口令 Secrets 未配置"
-            exit 1
+          set -e
+          if [ -f keystore/lhasa26.jks ]; then
+            echo "工作树里已有 keystore"
           else
-            echo "::warning::未配置签名 Secrets，本次 release APK 未签名"
+            echo "从历史恢复 keystore/lhasa26.jks"
+            git show 535ee09ab2aa2c9bd8cc6e76b2159f6c4e1cef4e:keystore/lhasa26.jks > keystore/lhasa26.jks
           fi
+          ls -l keystore/lhasa26.jks keystore/keystore.properties
 
       - name: Gradle build
-        env:
-          LHASA_KEYSTORE: keystore/lhasa26.jks
-          LHASA_STORE_PASSWORD: ${{ secrets.LHASA_STORE_PASSWORD }}
-          LHASA_KEY_ALIAS: ${{ secrets.LHASA_KEY_ALIAS }}
-          LHASA_KEY_PASSWORD: ${{ secrets.LHASA_KEY_PASSWORD }}
         run: |
           chmod +x gradlew
           set -o pipefail
@@ -97,34 +91,47 @@ jobs:
             echo "::error::APK 里的 assets/ksud 与锁文件不符：$actual != $want"
             exit 1
           fi
-          size=$(stat -c%s "$apk")
-          sha=$(sha256sum "$apk" | awk '{print $1}')
-          echo "APK $size bytes sha256=$sha" >> "$GITHUB_STEP_SUMMARY"
 
           apksigner=$(ls "$ANDROID_SDK_ROOT"/build-tools/*/apksigner 2>/dev/null | tail -1)
-          if [ -n "$apksigner" ]; then
-            if "$apksigner" verify --print-certs "$apk" > /tmp/certs.txt 2>&1; then
-              cat /tmp/certs.txt >> "$GITHUB_STEP_SUMMARY"
-            else
-              echo "::warning::APK 未签名或签名无效（未配置签名 Secrets 时属预期）"
-            fi
+          if [ -z "$apksigner" ]; then
+            echo "::error::找不到 apksigner，无法校验签名"
+            exit 1
           fi
+          "$apksigner" verify --print-certs "$apk" > /tmp/certs.txt 2>&1 || {
+            echo "::error::APK 签名无效"
+            cat /tmp/certs.txt
+            exit 1
+          }
+          cat /tmp/certs.txt
+
+          size=$(stat -c%s "$apk")
+          sha=$(sha256sum "$apk" | awk '{print $1}')
+          cert=$(grep -m1 'SHA-256 digest' /tmp/certs.txt | awk '{print $NF}')
+          {
+            echo "APK $size bytes"
+            echo "sha256: \`$sha\`"
+            echo "signer: \`${cert}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload APK
         if: success()
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: lhasa26-release-apk
           path: app/build/outputs/apk/release/*.apk
           if-no-files-found: error
+          retention-days: 7
 
       - name: Upload build log
         if: failure()
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: build-log
           path: build.log
           if-no-files-found: ignore
+          retention-days: 2
 
   release:
     needs: build
