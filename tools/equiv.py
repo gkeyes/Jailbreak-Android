@@ -1,27 +1,23 @@
 #!/usr/bin/env python3
 """payload 等价性验证：用仓库里的预编译件当参照，检查自有源码重建物是否等价。
 
-参照物默认就是 app/src/main/assets/ 里的原件——它在 git 历史里一直都在，
-替换之后仍可从历史取回，所以不需要另存一份「基线文件」。
+两种模式，按「这个资产有没有归档基线」自动切换：
 
-为什么是「锚点等价」而不是「哈希相等」：
-  重新用 zig cc 编译必然得到不同字节。真正会破坏功能的是**语义骨架**变了——
-  日志格式串没了、内核目标地址改了、平台位数错了。所以验证放在这几条上：
+  报告模式（plant/equiv/<名字>.json 还不存在）
+      源码还在草稿阶段，重建物与原件必然有差距。只把差距列出来，不判失败——
+      这份差距清单就是补 .c 的路线图。
 
-  硬性门槛（不合格即失败）
-    1. ELF / 64 位 / aarch64
-    2. 参照物的所有日志锚点串仍在（Java 侧按字符串判定）
-    3. lhasa_profile 登记的内核目标常量，参照物里有就必须还在
-    4. 体积在参照物 0.5x~3x 之间
+  严格模式（plant/equiv/<名字>.json 已归档）
+      该资产已经被自有源码替换，基线是当年原件的指纹。此后每次构建都必须
+      通过硬门槛，否则就是回归。
 
-  提示项（只报告，不失败）
-    - 新增/缺失的普通字符串
-    - 新增/缺失的内核立即数
+硬门槛：ELF/64 位/aarch64、原件日志锚点齐全、内核目标常量仍在、体积 0.5x~3x。
+提示项：字符串与立即数的增删。
 
 用法：
   python3 tools/equiv.py check <名字> <重建物路径>
-  python3 tools/equiv.py check-dir <目录>      # 目录内按同名逐个比对
-  python3 tools/equiv.py baseline --out 目录   # 可选：把当前原件指纹归档成 Artifact
+  python3 tools/equiv.py check-dir <目录>
+  python3 tools/equiv.py baseline --out 目录    # 归档当前原件指纹（替换时用）
 """
 
 from __future__ import annotations
@@ -97,25 +93,25 @@ def fingerprint(name: str, data: bytes) -> dict:
 
 
 def reference(name: str):
-    """参照物：优先仓库里的原件，其次 plant/equiv 下归档的基线。"""
-    asset = ASSETS / name
-    if asset.exists():
-        return f"assets/{name}", fingerprint(name, asset.read_bytes())
+    """参照物：有归档基线就用基线（严格模式），否则用仓库里的原件（报告模式）。"""
     base = BASELINE_DIR / f"{name}.json"
     if base.exists():
-        return f"plant/equiv/{name}.json", json.loads(base.read_text(encoding="utf-8"))
-    return None, None
+        return f"plant/equiv/{name}.json", json.loads(base.read_text(encoding="utf-8")), True
+    asset = ASSETS / name
+    if asset.exists():
+        return f"assets/{name}", fingerprint(name, asset.read_bytes()), False
+    return None, None, False
 
 
 def compare(name: str, rebuilt_path: str) -> int:
-    source, base = reference(name)
+    source, base, strict = reference(name)
     if base is None:
-        print(f"SKIP {name}（既没有 assets/{name}，也没有 plant/equiv/{name}.json）")
+        print(f"SKIP {name}（既没有基线，也没有 assets/{name}）")
         return 0
     rebuilt = pathlib.Path(rebuilt_path)
     if not rebuilt.exists():
         print(f"FAIL {name}：重建物不存在 {rebuilt}")
-        return 1
+        return 1 if strict else 0
 
     now = fingerprint(name, rebuilt.read_bytes())
     hard, soft = [], []
@@ -131,12 +127,12 @@ def compare(name: str, rebuilt_path: str) -> int:
     have_markers = set(now["markers"])
     for marker in base["markers"]:
         if marker not in have_markers:
-            hard.append(f"丢失日志锚点：{marker!r}")
+            hard.append(f"缺少日志锚点：{marker!r}")
 
     have_consts = set(now["constants"])
     for const in base.get("targetConstants", []):
         if const not in have_consts:
-            hard.append(f"丢失内核目标常量 {const}")
+            hard.append(f"缺少内核目标常量 {const}")
 
     ratio = now["size"] / base["size"] if base["size"] else 0
     if ratio < 0.5 or ratio > 3.0:
@@ -145,20 +141,28 @@ def compare(name: str, rebuilt_path: str) -> int:
     lost = sorted(set(base["strings"]) - set(now["strings"]))
     added = sorted(set(now["strings"]) - set(base["strings"]))
     if lost:
-        soft.append(f"缺少 {len(lost)} 条参照字符串，例如：{lost[:5]}")
+        soft.append(f"缺少 {len(lost)} 条参照字符串：{lost[:8]}")
     if added:
-        soft.append(f"新增 {len(added)} 条字符串，例如：{added[:5]}")
+        soft.append(f"新增 {len(added)} 条字符串：{added[:8]}")
+    lost_consts = sorted(set(base["constants"]) - set(now["constants"]))
+    if lost_consts:
+        soft.append(f"缺少 {len(lost_consts)} 个参照立即数：{lost_consts[:6]}")
 
-    print(f"== {name}（参照：{source}）==")
+    mode = "严格" if strict else "报告"
+    print(f"== {name}（{mode}模式，参照 {source}）==")
     print(f"参照  {base['size']:>8} B  markers={len(base['markers'])}  consts={base['constantCount']}")
     print(f"重建  {now['size']:>8} B  markers={len(now['markers'])}  consts={now['constantCount']}")
     for item in hard:
-        print(f"FAIL {item}")
+        print(f"{'FAIL' if strict else 'GAP '} {item}")
     for item in soft:
         print(f"WARN {item}")
-    if hard:
+
+    if strict and hard:
         print(f"不通过：{len(hard)} 条硬性问题\n")
         return 1
+    if not strict:
+        print(f"报告模式：{len(hard)} 条待补齐、{len(soft)} 条提示\n")
+        return 0
     print(f"通过（{len(soft)} 条提示）\n")
     return 0
 
@@ -170,12 +174,11 @@ def cmd_check_dir(directory: str) -> int:
         return 1
     checked = failures = 0
     for path in sorted(p for p in root.iterdir() if p.is_file()):
-        name = path.name
-        if reference(name)[1] is None:
-            print(f"SKIP {name}（没有参照物）")
+        if reference(path.name)[1] is None:
+            print(f"SKIP {path.name}（没有参照物）")
             continue
         checked += 1
-        failures += 1 if compare(name, str(path)) else 0
+        failures += 1 if compare(path.name, str(path)) else 0
     print(f"共比对 {checked} 项，{failures} 项不通过")
     return 1 if failures else 0
 
