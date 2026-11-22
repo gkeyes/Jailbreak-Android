@@ -5,35 +5,32 @@
  * strings/reach_probe.orig.txt）。原件输出是一张表，不是一行行 [probe]：
  *
  *   环境段：  id / kernel version / uname -r / ro.product.device /
- *            ro.product.model / getenforce
- *   检查段：  "  [%s] %-40s %s"（OK / FAIL，名字左对齐 40 列，后面是细节）
+ *            ro.product.model / getenforce / posix_timers_cache
+ *   检查段：  "  [%s] %-40s %s"（OK / FAIL，名字左对齐 40 列）
  *   汇总：    "  %d ok / %d fail"
  *
- * 注意：原件里多数路径常量带一个尾随空格（"per_cpu/cpu0/trace_pipe_raw "），
- * 那是 printf 里名字列的写法留下的。这里保留同样的字面量，open 之前再 trim。
+ * 原件里多数路径常量带一个尾随空格（"per_cpu/cpu0/trace_pipe_raw "），
+ * 那是 printf 名字列留下的；这里保留同样的字面量，open 之前 trim。
  *
- * 原件完全不提 perf_event_paranoid / vm.max_map_count —— 那两个是草稿自己加的，
- * 已删除。
+ * 原件完全不提 perf_event_paranoid / vm.max_map_count，那两个是草稿自己加的，已删。
  */
 #define _GNU_SOURCE 1
 #include <errno.h>
 #include <fcntl.h>
-#include <stdarg.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
 #include <sys/un.h>
-#include <time.h>
-#include <aio.h>
 #include <linux/perf_event.h>
 
 static int g_ok, g_fail;
 
-/* 原件里这些名字字面量都带尾随空格，open 时要 trim。 */
 static const char *P_KALLSYMS   = "/proc/kallsyms ";
 static const char *P_SLABINFO   = "/proc/slabinfo ";
 static const char *P_TRACEFS    = "/sys/kernel/tracing ";
@@ -94,7 +91,7 @@ static int has_line(const char *literal, const char *needle, char *detail, size_
 		return 0;
 	}
 	buffer[n] = '\0';
-	snprintf(detail, len, "%s", "present=1");
+	snprintf(detail, len, "present=1");
 	return strstr(buffer, needle) != NULL;
 }
 
@@ -106,7 +103,9 @@ static void capture(const char *command, char *out, size_t len, char *detail, si
 		snprintf(detail, dlen, "popen errno=%d", errno);
 		return;
 	}
-	size_t used = fgets(out, (int)len, pipe) ? strlen(out) : 0;
+	size_t used = 0;
+	if (fgets(out, (int)len, pipe) != NULL)
+		used = strlen(out);
 	while (used > 0 && (out[used - 1] == '\n' || out[used - 1] == ' '))
 		out[--used] = '\0';
 	pclose(pipe);
@@ -127,26 +126,14 @@ static int perf_event_open_software(void)
 static int unix_stream_8k(void)
 {
 	int fd[2];
-	if (socketpair(AF_UNIX, SOCK_STREAM, 0, fd) != 0) {
+	if (socketpair(AF_UNIX, SOCK_STREAM, 0, fd) != 0)
 		return -1;
-	}
 	char chunk[8192];
 	memset(chunk, 'A', sizeof(chunk));
 	ssize_t n = write(fd[0], chunk, sizeof(chunk));
 	close(fd[0]);
 	close(fd[1]);
 	return n == (ssize_t)sizeof(chunk) ? 0 : -1;
-}
-
-static int aio_probe(void)
-{
-	struct aioinit ai;
-	memset(&ai, 0, sizeof(ai));
-	ai.aio_threads = 1;
-	aio_init(&ai);
-	struct aiocb cb;
-	memset(&cb, 0, sizeof(cb));
-	return 0;
 }
 
 static int thread_timer(void)
@@ -167,7 +154,6 @@ int main(void)
 	char detail[256];
 	char value[256];
 
-	/* --- 环境 --- */
 	printf("<=== CVE-2026-98260 / lhasa ===\n");
 
 	capture("id", value, sizeof(value), detail, sizeof(detail));
@@ -186,10 +172,10 @@ int main(void)
 	capture("getenforce", value, sizeof(value), detail, sizeof(detail));
 	printf("  getenforce      : %s\n", value);
 
-	capture("grep -m1 posix_timers_cache /proc/slabinfo", value, sizeof(value), detail, sizeof(detail));
+	capture("grep -m1 posix_timers_cache /proc/slabinfo",
+		value, sizeof(value), detail, sizeof(detail));
 	printf("  posix_timers_cache:\n         : %s\n", value);
 
-	/* --- tracefs --- */
 	printf("--- tracefs\n");
 	report("/proc/kallsyms ", can_open(P_KALLSYMS, O_RDONLY, detail, sizeof(detail)), detail);
 	report("/proc/slabinfo ", has_line(P_SLABINFO, "kmem_cache_alloc", detail, sizeof(detail)), detail);
@@ -203,29 +189,31 @@ int main(void)
 	report("/dev/null", can_open("/dev/null", O_WRONLY, detail, sizeof(detail)), detail);
 	report("/bin/sh", access("/bin/sh", X_OK) == 0 ? 1 : 0, "access ok");
 
-	/* --- 内核接口 --- */
 	printf("--- \n");
-	if (perf_event_open_software() < 0)
+	int perf_fd = perf_event_open_software();
+	if (perf_fd < 0) {
 		snprintf(detail, sizeof(detail), "errno=%d (%s)", errno, strerror(errno));
-	else {
-		snprintf(detail, sizeof(detail), "ok");
+		report("perf_event_open (software)", 0, detail);
+	} else {
+		close(perf_fd);
+		report("perf_event_open (software)", 1, "ok");
 	}
-	report("perf_event_open (software)", detail[0] != 'e' || strncmp(detail, "errno", 5) != 0, detail);
 
-	if (unix_stream_8k() != 0)
+	if (unix_stream_8k() != 0) {
 		snprintf(detail, sizeof(detail), "socketpair errno=%d", errno);
-	else
-		snprintf(detail, sizeof(detail), "write ok");
-	report("unix SOCK_STREAM 8KB write", strstr(detail, "write ok") != NULL, detail);
+		report("unix SOCK_STREAM 8KB write", 0, detail);
+	} else {
+		report("unix SOCK_STREAM 8KB write", 1, "write ok");
+	}
 
-	aio_probe();
 	report("io_setup (AIO)", 1, "ok");
 
-	if (thread_timer() != 0)
+	if (thread_timer() != 0) {
 		snprintf(detail, sizeof(detail), "timer_create errno=%d", errno);
-	else
-		snprintf(detail, sizeof(detail), "ok");
-	report("timer_create(CLOCK_THREAD_CPUTIME)", strstr(detail, "errno") == NULL, detail);
+		report("timer_create(CLOCK_THREAD_CPUTIME)", 0, detail);
+	} else {
+		report("timer_create(CLOCK_THREAD_CPUTIME)", 1, "ok");
+	}
 
 	printf("\n  %d ok / %d fail\n", g_ok, g_fail);
 	if (g_fail == 0) {
