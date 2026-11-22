@@ -2,6 +2,17 @@ plugins {
     id("com.android.application")
 }
 
+/** 读 keystore/keystore.properties；缺文件时返回空表。 */
+fun readSigningProperties(): Map<String, String> {
+    val file = rootProject.file("keystore/keystore.properties")
+    if (!file.exists()) {
+        return emptyMap()
+    }
+    val properties = java.util.Properties()
+    file.inputStream().use { properties.load(it) }
+    return properties.entries.associate { it.key.toString() to it.value.toString() }
+}
+
 android {
     namespace = "com.gkeyes.lhasa26"
     compileSdk { version = release(37) { minorApiLevel = 2 } }
@@ -17,20 +28,27 @@ android {
 
     signingConfigs {
         create("release") {
-            // 签名材料只从环境变量来（本地导出或 CI Secrets），仓库和构建脚本里不留口令。
-            val keystoreFile = rootProject.file(System.getenv("LHASA_KEYSTORE") ?: "keystore/lhasa26.jks")
-            val storePassword = System.getenv("LHASA_STORE_PASSWORD")
-            val keyAlias = System.getenv("LHASA_KEY_ALIAS")
-            val keyPassword = System.getenv("LHASA_KEY_PASSWORD") ?: storePassword
+            // 取值顺序：环境变量 → keystore/keystore.properties → 不签名。
+            // 环境变量优先，是为了以后想把口令挪到 Secrets 时不用改这里。
+            val stored = readSigningProperties()
+            val keystorePath = System.getenv("LHASA_KEYSTORE")
+                ?: stored["storeFile"]
+                ?: "keystore/lhasa26.jks"
+            val keystoreFile = rootProject.file(keystorePath)
+            val storePassword = System.getenv("LHASA_STORE_PASSWORD") ?: stored["storePassword"]
+            val keyAliasValue = System.getenv("LHASA_KEY_ALIAS") ?: stored["keyAlias"]
+            val keyPasswordValue = System.getenv("LHASA_KEY_PASSWORD")
+                ?: stored["keyPassword"]
+                ?: storePassword
 
             if (keystoreFile.exists() && !storePassword.isNullOrEmpty()) {
                 storeFile = keystoreFile
                 this.storePassword = storePassword
-                this.keyAlias = keyAlias ?: "lhasa26"
-                this.keyPassword = keyPassword
-            } else if (keystoreFile.exists()) {
+                this.keyAlias = keyAliasValue ?: "lhasa26"
+                this.keyPassword = keyPasswordValue
+            } else {
                 logger.lifecycle(
-                    "LHASA_STORE_PASSWORD 未设置，release 构建不走签名（照常产出未签名 APK）。"
+                    "没有可用的签名材料（keystore 缺失或口令为空），release 构建产出未签名 APK。"
                 )
             }
         }
