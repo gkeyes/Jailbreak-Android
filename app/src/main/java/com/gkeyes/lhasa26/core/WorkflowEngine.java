@@ -5,12 +5,12 @@ import android.content.res.AssetManager;
 import java.util.Locale;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
  * Owns the long-running workflow. UI code only receives immutable events and never runs shell work.
- * The supplied native payloads remain opaque assets; orchestration and state handling are our code.
+ * The supplied native payloads are built from upstream (MIT) or in-repo sources; orchestration and
+ * state handling are our code.
  */
 public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
     public enum State { IDLE, RUNNING, ROOTED, KSU_PENDING, COMPLETE, FAILED }
@@ -25,16 +25,11 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
     /** Above this much available memory the force-stop of chat apps buys nothing. */
     private static final long CLEAN_SKIP_AVAILABLE_KB = 3000000L;
     private static final long DEPLOY_TIMEOUT_MS = 8000L;
-    private static final Pattern RUNNING_PAYLOAD = Pattern.compile("uaf_plant_replay");
     private static final String RUN_MARKER = "/data/local/tmp/.lhasa_run";
     private static final String FAILED_MARKER = "/data/local/tmp/.lhasa_failed_boot";
     private static final String ROOTD_SOCKET = "/data/local/tmp/pc98260-root.sock";
-    private static final String EXPLOIT_BINARIES = "uaf_plant_replay perf_slide slide_probe reach_probe";
-    /**
-     * 单次探测的硬上限（秒）。超出就 kill，绝不让采样器以 root 常驻——
-     * 常驻的 perf_slide 会把设备拖进 soft lockup，表现就是"跑一次重启一次"。
-     */
-    private static final int PERF_PROBE_TIMEOUT_S = 8;
+    private static final String EXPLOIT_BINARIES = "uaf_plant_replay slide_probe reach_probe";
+    /** 单次探测的硬上限（秒）。超出就 kill，绝不允许探针以 root 常驻。 */
     private static final int SLIDE_PROBE_TIMEOUT_S = 12;
     private static final int DIAGNOSE_TIMEOUT_S = 25;
     private final CommandExecutor executor;
@@ -323,18 +318,19 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
         append("[诊断] security_patch=" + patch + (patch.compareTo("2026-10-06") < 0
                 ? " · 未修补窗口"
                 : " · 可能已回补"));
-        // reach_probe 用较新的工具链编译，attr.size 超出 6.18 内核接受的范围，
-        // perf_event_open 会拿到 E2BIG；用真正取址的 perf_slide 复核这一项。
+        // reach_probe 报告 perf_error_open 失败时，用真正求 slide 的 slide_probe 复核：
+        // 本 ROM 的 SELinux 只允许用户态 perf，所以 probe 的 FAIL 不代表环境不可用。
         if (report.contains("perf_event_open") && report.contains("FAIL")) {
-            CommandResult slideProbe = run(BootGuard.withTimeout(PERF_PROBE_TIMEOUT_S,
-                    "/data/local/tmp/perf_slide --duration 1"), true);
-            String slide = KernelSupport.extractSlide(slideProbe.output);
+            deployer.stage("slide_probe");
+            CommandResult probe = run(BootGuard.withTimeout(SLIDE_PROBE_TIMEOUT_S,
+                    "/data/local/tmp/slide_probe"), true);
+            String slide = KernelSupport.extractSlide(probe.output);
             boolean usable = slide != null && KernelSupport.isSlideValid(KernelSupport.parseHex(slide));
             append("[诊断] 覆盖：" + (usable
-                    ? "perf_slide 实测可用（slide=" + slide + "），perf_event_open 一项为探针 attr.size 误报"
-                    : "perf_slide 同样取不到 KASLR 偏移，该项按真实失败处理"));
+                    ? "slide_probe 实测可用（slide=" + slide + "），perf_event_open 一项为 shell 域权限限制"
+                    : "slide_probe 也拿不到 slide，该项按真实失败处理"));
             if (usable) {
-                String message = "诊断通过 · 环境可用（perf 项已覆盖）";
+                String message = "诊断通过 · 环境可用（perf 项由 slide_probe 覆盖）";
                 append("[诊断] 通过 · 除 perf_event_open 探针项外全部达标");
                 status(message);
                 callbacks.onState(state, message);
@@ -344,7 +340,7 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
         String message;
         if (report.contains("必需项全部通过")) {
             message = "诊断通过 · 环境可用";
-            append("[诊断] 通过 · 环境可用（仅代表探针达标，不代表固件已修补或未修补）");
+            append("[诊断] 通过 · 环境可用");
         } else {
             message = "诊断未通过 · 详见日志";
             append(report.contains("必需接口不可用") ? "[诊断] 失败 · 有必需项未通过" : "[诊断] 未完成 · 详见日志");
@@ -446,38 +442,14 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
     /**
      * 测量本次开机的内核地址。
      *
-     * 三条来源依次尝试：perf 采样（--slide）→ slide_probe 的 calc=（--slide）→ site=（--site）。
-     * 三者在 shell 身份下都可能失败：这台 ROM 的 SELinux 对 shell 禁了
-     * `perf_event` 的 `{ kernel }` 权限，kallsyms 与 kprobe 也封闭。
+     * 只有一条来源：slide_probe（上游实现，扫 trace_pipe_raw 的二进制记录，
+     * 用 call_site − profile.alloc_timer_site 得到 2 MiB 对齐的 slide）。
+     * 之前的 perf_slide 已删除——本 ROM 的 SELinux 对 u:r:shell:s0 拒绝
+     * perf_event 的 { kernel } 权限，那条路在这里永远走不通。
      *
-     * 因此拿不到时**不再中断**：打印明确警告，返回空参数，让 uaf_plant_replay
-     * 用 lhasa_profile.txt 里的链接期地址自行判定。它的失败保护（holding zombie →
-     * 本次开机终止）仍然生效，所以最坏情况与现在持平。
+     * 拿不到时：打印明确原因，返回空参数，让 uaf_plant_replay 用 profile 自行判定。
      */
     private String measureAddress() throws Exception {
-        for (int seconds : new int[]{1, 2}) {
-            run(BootGuard.markCommand("probe-perf"), true);
-            CommandResult result = run(BootGuard.withTimeout(PERF_PROBE_TIMEOUT_S,
-                    "/data/local/tmp/perf_slide --duration " + seconds), true);
-            String output = filterProbe(result.output);
-            if (!output.trim().isEmpty()) {
-                append(output);
-            }
-            if (result.exitCode == BootGuard.TIMEOUT_EXIT) {
-                append("perf_slide 超过 " + PERF_PROBE_TIMEOUT_S + " 秒被 timeout 终止（采样器卡住），换下一档");
-            }
-            String slide = KernelSupport.extractSlide(result.output);
-            long parsed = KernelSupport.parseHex(slide);
-            if (slide != null && KernelSupport.isSlideValid(parsed)) {
-                append("slide = " + slide + "（perf " + seconds + "s）");
-                return "--slide " + slide;
-            }
-            if (slide != null) {
-                append("slide " + slide + " 越界/未对齐，弃用");
-            }
-        }
-
-        append("perf_slide 未取到，改用 slide_probe");
         run(BootGuard.markCommand("probe-slide"), true);
         CommandResult probe = run(BootGuard.withTimeout(SLIDE_PROBE_TIMEOUT_S,
                 "/data/local/tmp/slide_probe"), false);
@@ -485,24 +457,20 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
         if (probe.exitCode == BootGuard.TIMEOUT_EXIT) {
             append("slide_probe 超过 " + SLIDE_PROBE_TIMEOUT_S + " 秒被 timeout 终止");
         }
-        String calc = KernelSupport.extractCalc(probe.output);
-        if (calc != null) {
-            append("slide = " + calc + "（kprobe）");
-            return "--slide " + calc;
+
+        String slide = KernelSupport.extractSlide(probe.output);
+        if (slide != null && KernelSupport.isSlideValid(KernelSupport.parseHex(slide))) {
+            append("slide = " + slide + "（slide_probe）");
+            return "--slide " + slide;
         }
         String site = KernelSupport.extractSite(probe.output);
         if (site != null) {
-            append("site = " + site + "（site 探测）");
+            append("site = " + site + "（slide_probe）");
             return "--site " + site;
         }
 
-        // 三条来源都没拿到：不再中断，交给 payload 自行判定。
-        append("[测量] 三种来源都没取到内核地址：");
-        append("[测量]   · perf 采样被 SELinux 拒绝（shell 域无 perf_event kernel 权限）");
-        append("[测量]   · slide_probe 命中 0（tracefs 只能看到分配事件，拿不到真实地址）");
-        append("[测量]   · kallsyms / kprobe 对 shell 封闭");
+        append("[测量] slide_probe 未给出可用地址（输出里没有 slide=/site=）");
         append("[测量] 改为不带参数运行，让 uaf_plant_replay 用 lhasa_profile.txt 自行判定。");
-        recordFailedBootStage("measure-skip");
         return "";
     }
 
@@ -551,15 +519,6 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
             }
         }
         return isRoot(run("/data/local/tmp/pc98260-su -c 'id'", true).output);
-    }
-
-    /** 只记阶段面包屑，不动失败标记（测量失败不等于内核已被污染）。 */
-    private void recordFailedBootStage(String stage) {
-        try {
-            run(BootGuard.markCommand(stage), true);
-        } catch (Exception ignored) {
-            // 诊断信息缺失不影响主流程
-        }
     }
 
     private void stopPayload() throws Exception {
