@@ -1,3 +1,5 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
 }
@@ -8,7 +10,7 @@ fun readSigningProperties(): Map<String, String> {
     if (!file.exists()) {
         return emptyMap()
     }
-    val properties = java.util.Properties()
+    val properties = Properties()
     file.inputStream().use { properties.load(it) }
     val result = mutableMapOf<String, String>()
     for (name in properties.stringPropertyNames()) {
