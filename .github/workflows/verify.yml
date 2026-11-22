@@ -1,7 +1,7 @@
-name: verify
+name: build
 
-# 逻辑全部在 tools/ci_verify.sh，本文件保持最小，减少 YAML 出错面。
-# 注意：注释里不要出现触发器关键字。
+# 只读校验：跑单测 + 打包 debug APK，产物上传为运行附件。
+# 不再往分支回写任何东西（除最后一份验收报告），也不再打滚动 tag。
 
 on:
   push:
@@ -12,7 +12,7 @@ permissions:
   contents: write
 
 jobs:
-  verify:
+  build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -20,5 +20,23 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
-      - name: Verify, test and compile plant
+      - name: Test, wire and assemble
         run: bash tools/ci_verify.sh
+      - name: Upload APK
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lhasa26-debug-apk
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: warn
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lhasa26-build-logs
+          path: |
+            test.log
+            build.log
+            wire.log
+            plant/verify-report.md
+          if-no-files-found: warn

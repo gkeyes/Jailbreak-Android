@@ -1,0 +1,37 @@
+name: plant
+
+# 独立的 payload 编译验证，与 app 构建互不干扰。
+
+on:
+  push:
+    branches: [ fix/p0-clean-boot-retry ]
+    paths:
+      - 'plant/**'
+      - 'tools/plant_build.sh'
+      - '.github/workflows/plant.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  plant:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cross compile payloads
+        run: bash tools/plant_build.sh
+      - name: Upload binaries
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lhasa26-payloads
+          path: plant/out/*
+          if-no-files-found: warn
+      - name: Upload log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lhasa26-plant-log
+          path: plant/build.log
+          if-no-files-found: warn

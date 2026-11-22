@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """把 BootGuard / DeployGate 接到 WorkflowEngine 的真实入口。
 
-两次失败的教训：
-  - git apply 对 hunk 行数校验严格，手写 diff 的数字写错就整份拒绝；
-  - 多行精确字符串做锚点，文件一旦被改过一次就再也匹配不上。
+定位：这是**一次性**的源码改写脚本。它跑绿一次后，ci_verify.sh 会把改写结果提交进分支
+并把本文件删掉。之后仓库里不再有任何“CI 改源码”的环节，验收可以干净地绑定到提交。
 
-所以部署相关三处改用正则做结构性替换（能同时适配基线、旧接线、新接线三种形态），
-其余不需要变化的小改动继续用精确字符串。每条改动都断言“命中一次”。
+历史上两次失败：
+  - git apply 对 hunk 行数校验严格，数字写错就整份拒绝；
+  - 多行精确字符串锚点，文件被改过一次后就不再匹配。
+所以部署相关三处用正则做结构性替换，能同时适配基线、旧接线、新接线三种形态。
 """
 from __future__ import annotations
 
@@ -50,6 +51,10 @@ GATE_TWO_ARG_RE = re.compile(
 
 CONST_RE = re.compile(r'(    private static final long CLEAN_SKIP_AVAILABLE_KB = 3000000L;\n)')
 CONST_LINE = '    private static final long DEPLOY_TIMEOUT_MS = 8000L;\n'
+
+# 早前几轮反复插入导致同一行出现复数次；先归一，再断言。
+DUP_DECL_RE = re.compile(r'(?:    private static final long DEPLOY_TIMEOUT_MS = 8000L;\n)+')
+ONE_DECL = '    private static final long DEPLOY_TIMEOUT_MS = 8000L;\n'
 
 STR_CHANGES: list[tuple[str, list[str], str]] = [
     (
@@ -142,21 +147,26 @@ def main() -> int:
     source = TARGET.read_text(encoding="utf-8")
     log: list[str] = []
 
-    # 1) 常量：单次插入，已有就不动。
+    # 0) 先归一重复的常量声明（早前几轮反复插入的后果）。
+    source, deduped = DUP_DECL_RE.subn(ONE_DECL, source)
+    if deduped:
+        log.append(f"常量声明归一 {deduped} 处")
+
+    # 1) 常量：没有则插在 CLEAN_SKIP 后面。
     if "DEPLOY_TIMEOUT_MS" not in source:
         source, n = CONST_RE.subn(lambda m: m.group(1) + CONST_LINE, source, count=1)
         log.append(f"常量插入 {n}")
     else:
         log.append("常量已存在")
 
-    # 2) 部署线程：基线（带 AtomicReference）或旧接线都能匹配。
+    # 2) 部署线程：基线或旧接线都能匹配。
     if "markCompleted" not in source:
         source, n = THREAD_RE.subn(lambda m: THREAD_NEW, source, count=1)
         log.append(f"部署线程替换 {n}")
     else:
         log.append("部署线程已是显式回报")
 
-    # 3) 闸门调用：基线的 join 块，或旧接线的两参数 await。
+    # 3) 闸门调用。
     if "deployGate.await(deploy)" not in source:
         source, n = GATE_JOIN_RE.subn(lambda m: GATE_NEW, source, count=1)
         log.append(f"闸门（基线）替换 {n}")
@@ -166,7 +176,7 @@ def main() -> int:
     else:
         log.append("闸门已是 deployGate.await")
 
-    # 4) 其余小改动（精确字符串，已改过的跳过）。
+    # 4) 其余小改动。
     for label, needles, replacement in STR_CHANGES:
         if replacement and replacement in source:
             log.append(f"{label}: 已应用")
@@ -189,11 +199,15 @@ def main() -> int:
         print(line)
 
     TARGET.write_text(source, encoding="utf-8")
+
     problems: list[str] = []
-    if source.count("DEPLOY_TIMEOUT_MS") != 2:
-        problems.append(f"DEPLOY_TIMEOUT_MS 出现 {source.count('DEPLOY_TIMEOUT_MS')} 次（应为 2）")
+    decl = source.count("private static final long DEPLOY_TIMEOUT_MS")
+    if decl != 1:
+        problems.append(f"DEPLOY_TIMEOUT_MS 声明 {decl} 次（应为 1）")
     if source.count("markCompleted") != 1:
-        problems.append(f"markCompleted 出现 {source.count('markCompleted')} 次（应为 1）")
+        problems.append(f"markCompleted {source.count('markCompleted')} 次（应为 1）")
+    if "deployGate.await(deploy)" not in source:
+        problems.append("闸门调用未完成")
     for leftover in ("deployError", "containsSuccessMarker", "containsRetryMarker",
                      "pkill -f uaf_plant_replay", "killall uaf_plant_replay"):
         if source.count(leftover):
