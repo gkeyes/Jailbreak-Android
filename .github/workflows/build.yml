@@ -2,13 +2,11 @@ name: build-apk
 
 # next 的发布构建。只做两件事：构建、按需发布。
 #
-# 签名策略（简单版）：
-#   - 钥匙就一把：keystore/lhasa26.jks，它在历史里，工作树里不常驻；
-#   - 口令在 keystore/keystore.properties（私有仓库，单人使用）；
-#   - 不依赖任何 Actions Secrets。想以后搬去 Secrets 时，代码不用改，
-#     只要设了同名环境变量就会优先用环境变量。
+# 签名：钥匙只有一把（keystore/lhasa26.jks，历史里），口令在
+# keystore/keystore.properties；不依赖 Actions Secrets。
 #
-# 其它与前几轮保持一致：只读为主，review 之外的写操作只有发布 job 和 tag。
+# 关于 Artifact：免费配额经常是满的，upload/download-artifact 会 403。
+# 所以 release job **自己构建**，不经过 Artifact —— 发布链路不能依赖存储配额。
 
 on:
   push:
@@ -36,7 +34,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          # 需要历史才能把 jks 从旧提交里取回来
           fetch-depth: 0
 
       - uses: actions/setup-java@v4
@@ -60,7 +57,7 @@ jobs:
       - name: 资产台账
         run: python3 tools/check_assets.py --strict
 
-      - name: 校验 ksud（不匹配即失败，不再自动覆盖）
+      - name: 校验 ksud
         run: bash tools/fetch_ksud.sh
 
       - name: 恢复签名钥匙
@@ -69,7 +66,6 @@ jobs:
           if [ -f keystore/lhasa26.jks ]; then
             echo "工作树里已有 keystore"
           else
-            echo "从历史恢复 keystore/lhasa26.jks"
             git show 535ee09ab2aa2c9bd8cc6e76b2159f6c4e1cef4e:keystore/lhasa26.jks > keystore/lhasa26.jks
           fi
           ls -l keystore/lhasa26.jks keystore/keystore.properties
@@ -94,7 +90,7 @@ jobs:
 
           apksigner=$(ls "$ANDROID_SDK_ROOT"/build-tools/*/apksigner 2>/dev/null | tail -1)
           if [ -z "$apksigner" ]; then
-            echo "::error::找不到 apksigner，无法校验签名"
+            echo "::error::找不到 apksigner"
             exit 1
           fi
           "$apksigner" verify --print-certs "$apk" > /tmp/certs.txt 2>&1 || {
@@ -114,7 +110,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload APK
-        if: success()
+        if: success() && (github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[apk]'))
         continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
@@ -122,16 +118,6 @@ jobs:
           path: app/build/outputs/apk/release/*.apk
           if-no-files-found: error
           retention-days: 7
-
-      - name: Upload build log
-        if: failure()
-        continue-on-error: true
-        uses: actions/upload-artifact@v4
-        with:
-          name: build-log
-          path: build.log
-          if-no-files-found: ignore
-          retention-days: 2
 
   release:
     needs: build
@@ -142,30 +128,53 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          sparse-checkout: |
-            app/build.gradle.kts
-            tools/ksud.lock.properties
+          fetch-depth: 0
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/setup-java@v4
         with:
-          name: lhasa26-release-apk
-          path: dist
+          distribution: temurin
+          java-version: '17'
+
+      - name: Prepare SDK
+        run: |
+          set +e
+          for root in "${ANDROID_SDK_ROOT:-}" /usr/local/lib/android/sdk /opt/android-sdk; do
+            if [ -n "$root" ] && [ -d "$root/platforms" ]; then
+              echo "ANDROID_SDK_ROOT=$root" >> "$GITHUB_ENV"
+              break
+            fi
+          done
+
+      - name: 恢复签名钥匙
+        run: |
+          set -e
+          git show 535ee09ab2aa2c9bd8cc6e76b2159f6c4e1cef4e:keystore/lhasa26.jks > keystore/lhasa26.jks
+          ls -l keystore/lhasa26.jks
+
+      - name: 构建并签名
+        run: |
+          set -o pipefail
+          chmod +x gradlew
+          ./gradlew --no-daemon :app:assembleRelease 2>&1 | tail -40
 
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -e
-          apk=$(ls dist/*.apk | head -1)
+          apk=$(ls app/build/outputs/apk/release/*.apk | head -1)
           ver=$(sed -n 's/.*versionName = "\(.*\)".*/\1/p' app/build.gradle.kts | head -1)
           sha=$(sha256sum "$apk" | awk '{print $1}')
           size=$(stat -c%s "$apk")
-          tag="v${ver}"
-          asset="dist/lhasa26-${ver}.apk"
-          cp "$apk" "$asset"
           ksud=$(sed -n 's/^sha256=//p' tools/ksud.lock.properties)
-          notes=$(printf '## 18fold越狱 %s\n\n- size: %s bytes\n- sha256: `%s`\n- ksud: `%s`\n- commit: `%s`\n' \
-            "$ver" "$size" "$sha" "$ksud" "${GITHUB_SHA:0:8}")
+          apksigner=$(ls "$ANDROID_SDK_ROOT"/build-tools/*/apksigner 2>/dev/null | tail -1)
+          cert=$("$apksigner" verify --print-certs "$apk" 2>/dev/null | grep -m1 'SHA-256 digest' | awk '{print $NF}' || true)
+
+          tag="v${ver}"
+          asset="/tmp/lhasa26-${ver}.apk"
+          cp "$apk" "$asset"
+          notes=$(printf '## 18fold越狱 %s\n\n- size: %s bytes\n- sha256: `%s`\n- signer: `%s`\n- ksud: `%s`\n- commit: `%s`\n\n四个探针由 plant/*.c 构建；uaf_plant_replay 与 ksud 保持原件。\n' \
+            "$ver" "$size" "$sha" "${cert:-unknown}" "$ksud" "${GITHUB_SHA:0:8}")
           if gh release view "$tag" >/dev/null 2>&1; then
             gh release upload "$tag" "$asset" --clobber
           else
