@@ -4,8 +4,9 @@
 不用 patch / diff：hunk 行号与行数太容易写错，git apply 会整份拒绝。
 锚点式替换，每处断言“恰好命中一次”，不命中就报错退出。
 
-每项改动可以给多个候选锚点：基线文件与已经接过一次线的文件文本不同，
-候选都能匹配；替换结果已在文件里则视为已应用并跳过（幂等到单项）。
+幂等判断必须“先看结果、再看锚点”。
+反例：常量那条的锚点（CLEAN_SKIP_AVAILABLE_KB 那一行）在替换后仍然存在，
+如果先看锚点就会每次都再揥一次，造成变量重复定义。
 """
 from __future__ import annotations
 
@@ -55,9 +56,13 @@ GATE_NEW = '        DeployGate.Result deployResult = deployGate.await(deploy);\n
 CHANGES: list[tuple[str, list[str], str]] = [
     (
         "DEPLOY_TIMEOUT_MS 常量",
-        ['    private static final long CLEAN_SKIP_AVAILABLE_KB = 3000000L;\n'],
+        [
+            '    private static final long CLEAN_SKIP_AVAILABLE_KB = 3000000L;\n'
+            '    private static final Pattern RUNNING_PAYLOAD'
+        ],
         '    private static final long CLEAN_SKIP_AVAILABLE_KB = 3000000L;\n'
-        '    private static final long DEPLOY_TIMEOUT_MS = 8000L;\n',
+        '    private static final long DEPLOY_TIMEOUT_MS = 8000L;\n'
+        '    private static final Pattern RUNNING_PAYLOAD',
     ),
     (
         "内核不匹配警告",
@@ -173,6 +178,10 @@ def main() -> int:
     failures: list[str] = []
 
     for label, needles, replacement in CHANGES:
+        # 先看结果：已经改过的位置直接跳过，避免带前缀性质的锚点被重复揥入。
+        if replacement and replacement in source:
+            skipped += 1
+            continue
         hit = None
         for needle in needles:
             if source.count(needle) == 1:
@@ -181,9 +190,6 @@ def main() -> int:
         if hit is not None:
             source = source.replace(hit, replacement)
             applied += 1
-            continue
-        if replacement and replacement in source:
-            skipped += 1
             continue
         if not replacement:
             skipped += 1
@@ -198,18 +204,26 @@ def main() -> int:
 
     TARGET.write_text(source, encoding="utf-8")
     print(f"applied={applied} skipped={skipped}")
-    print(f"BootGuard.classify: {source.count('BootGuard.classify')}")
-    print(f"DeployGate:         {source.count('DeployGate')}")
-    print(f"markCompleted:      {source.count('markCompleted')}")
-    print(f"DEPLOY_TIMEOUT_MS:  {source.count('DEPLOY_TIMEOUT_MS')}")
+    for marker in ("BootGuard.classify", "DeployGate", "markCompleted", "DEPLOY_TIMEOUT_MS",
+                   "deployError", "containsSuccessMarker", "containsRetryMarker",
+                   "pkill -f uaf_plant_replay", "killall uaf_plant_replay"):
+        print(f"{marker}: {source.count(marker)}")
 
+    problems = []
+    if source.count("DEPLOY_TIMEOUT_MS") > 2:
+        problems.append("DEPLOY_TIMEOUT_MS 重复定义")
     for leftover in ("containsSuccessMarker", "containsRetryMarker", "deployError",
                      "pkill -f uaf_plant_replay", "killall uaf_plant_replay"):
-        remaining = source.count(leftover)
-        if remaining:
-            print(f"::error::仍残留 {leftover} x{remaining}")
-            return 1
-    print("no leftovers")
+        if source.count(leftover):
+            problems.append(f"仍残留 {leftover}")
+    if source.count("markCompleted") != 1:
+        problems.append(f"markCompleted 出现 {source.count('markCompleted')} 次")
+
+    if problems:
+        for line in problems:
+            print(f"::error::{line}")
+        return 1
+    print("clean")
     return 0
 
 
