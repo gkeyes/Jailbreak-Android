@@ -10,7 +10,11 @@ fun readSigningProperties(): Map<String, String> {
     }
     val properties = java.util.Properties()
     file.inputStream().use { properties.load(it) }
-    return properties.entries.associate { it.key.toString() to it.value.toString() }
+    val result = mutableMapOf<String, String>()
+    for (name in properties.stringPropertyNames()) {
+        result[name] = properties.getProperty(name)
+    }
+    return result
 }
 
 android {
@@ -35,17 +39,18 @@ android {
                 ?: stored["storeFile"]
                 ?: "keystore/lhasa26.jks"
             val keystoreFile = rootProject.file(keystorePath)
-            val storePassword = System.getenv("LHASA_STORE_PASSWORD") ?: stored["storePassword"]
-            val keyAliasValue = System.getenv("LHASA_KEY_ALIAS") ?: stored["keyAlias"]
-            val keyPasswordValue = System.getenv("LHASA_KEY_PASSWORD")
-                ?: stored["keyPassword"]
-                ?: storePassword
+            val storePass = System.getenv("LHASA_STORE_PASSWORD") ?: stored["storePassword"]
 
-            if (keystoreFile.exists() && !storePassword.isNullOrEmpty()) {
+            if (keystoreFile.exists() && !storePass.isNullOrEmpty()) {
+                val keyPass = System.getenv("LHASA_KEY_PASSWORD")
+                    ?: stored["keyPassword"]
+                    ?: storePass
                 storeFile = keystoreFile
-                this.storePassword = storePassword
-                this.keyAlias = keyAliasValue ?: "lhasa26"
-                this.keyPassword = keyPasswordValue
+                this.storePassword = storePass
+                this.keyAlias = System.getenv("LHASA_KEY_ALIAS")
+                    ?: stored["keyAlias"]
+                    ?: "lhasa26"
+                this.keyPassword = keyPass
             } else {
                 logger.lifecycle(
                     "没有可用的签名材料（keystore 缺失或口令为空），release 构建产出未签名 APK。"
