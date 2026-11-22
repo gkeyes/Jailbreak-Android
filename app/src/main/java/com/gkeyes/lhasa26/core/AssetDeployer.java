@@ -8,13 +8,19 @@ import java.io.OutputStream;
 /** Copies the supplied device-specific payloads through the already-authorized shell. */
 public final class AssetDeployer {
     /**
-     * Payloads needed before the exploit runs. `ksud` is deliberately absent: it is 4.9 MB, is only
-     * used by the KernelSU step (which stages it on demand after root is established), and pulling it
-     * through the Shizuku pipe inside the pre-exploit window costs both time and heap churn.
+     * Payloads needed before the exploit runs.
+     *
+     * `ksud` is deliberately absent: it is 4.9 MB, only used by the KernelSU step (staged on demand
+     * after root is established), and pulling it through the Shizuku pipe inside the pre-exploit
+     * window costs both time and heap churn.
+     *
+     * `perf_slide` was removed on 2026-11-22: this ROM's SELinux denies `{ kernel }` on
+     * `tclass=perf_event` for `u:r:shell:s0`, so perf kernel sampling can never succeed here.
+     * KASLR slide now comes from `slide_probe` (tracefs binary-record scan).
      */
     public static final String[] RUNTIME_ASSETS = {
             "reach_probe", "slide_probe", "uaf_plant_replay", "pc98260-su",
-            "perf_slide", "lhasa_profile.txt"
+            "lhasa_profile.txt"
     };
 
     private final AssetManager assets;
