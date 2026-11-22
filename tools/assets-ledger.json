@@ -44,64 +44,74 @@
       "decision": "2026-11-22：原始源码目录（lhasa_port/plant）在本机已不存在。字符串可还原日志契约与 CLI（--slide/--site/--timer），但 UAF 窗口、页回收顺序、cred 偏移这些时序型原语无法从字符串复原；写一个只对得上字符串的空壳会让等价性门禁变成假阳性，因此不做。",
       "action": "维持预编译件，接受「不可重建」这一事实；台账与 README 明确标注。若要闭环，只有两条路：找回原始 .c，或从反汇编重做（按周计）。",
       "contract": {
-        "cli": ["--slide", "--site", "--timer"],
+        "cli": [
+          "--slide",
+          "--site",
+          "--timer"
+        ],
         "logFile": "/data/local/tmp/uaf_replay.log",
         "socket": "/data/local/tmp/pc98260-root.sock",
         "profile": "/data/local/tmp/lhasa_profile.txt",
-        "stages": ["stream", "uaf", "cred", "selinux", "rootd"]
+        "stages": [
+          "stream",
+          "uaf",
+          "cred",
+          "selinux",
+          "rootd"
+        ]
       }
     },
     {
       "name": "reach_probe",
       "path": "app/src/main/assets/reach_probe",
-      "size": 51368,
-      "gitBlobSha1": "673fd33c7a4dfa749742e56b944dc857fd40eb6b",
-      "sha256": null,
-      "origin": "prebuilt-with-source",
+      "size": 45664,
+      "gitBlobSha1": "8325c3df4baea822fc3f71b14f45935fb9816ead",
+      "sha256": "0938f6b6f873665db0fc03e17bf0555f30327605c6cf2e9b9661ea67b3d16d10",
+      "origin": "rebuilt-from-source",
       "sourceDraft": "plant/reach_probe.c",
       "inApk": true,
       "usedBy": "core/AssetDeployer.RUNTIME_ASSETS（接口可达性诊断）",
-      "status": "source-equivalent-static",
-      "action": "静态锚点已全部通过（表格格式 + 接口清单 + OK/FAIL 汇总段）；待设备侧跑一次比对输出后替换"
+      "status": "rebuilt",
+      "action": "2026-11-22 由 plant/reach_probe.c 交叉编译后替换"
     },
     {
       "name": "slide_probe",
       "path": "app/src/main/assets/slide_probe",
-      "size": 44776,
-      "gitBlobSha1": "022326460fb7ab31f6c0af7ccd34cccf37b276eb",
-      "sha256": null,
-      "origin": "prebuilt-with-source",
+      "size": 35336,
+      "gitBlobSha1": "dd34b9407f04e686b2da4c230d947ee114b4bdbc",
+      "sha256": "e9830ee4f058f82c3b455eb1611e58b4771e8995f23c0adf3926c9c5b64b63b5",
+      "origin": "rebuilt-from-source",
       "sourceDraft": "plant/slide_probe.c",
       "inApk": true,
       "usedBy": "core/AssetDeployer.RUNTIME_ASSETS（tracefs 触发器测 KASLR 位移）",
-      "status": "source-equivalent-static",
-      "action": "3 个日志锚点全中；待设备侧比对 trace 输出后替换"
+      "status": "rebuilt",
+      "action": "2026-11-22 由 plant/slide_probe.c 交叉编译后替换"
     },
     {
       "name": "perf_slide",
       "path": "app/src/main/assets/perf_slide",
-      "size": 31840,
-      "gitBlobSha1": "9aec90ed6e3fb91af5ea4800ab1895b9f87d9072",
-      "sha256": null,
-      "origin": "prebuilt-with-source",
+      "size": 27144,
+      "gitBlobSha1": "e44e33e817ab7a9f035a9a1803cbf08acb338cd6",
+      "sha256": "89705ef467342d6af11bbcc21289f988bc4953de7d2ac2df14eb8843a5cb6d1f",
+      "origin": "rebuilt-from-source",
       "sourceDraft": "plant/perf_slide.c",
       "inApk": true,
       "usedBy": "core/AssetDeployer.RUNTIME_ASSETS（硬件 PMU 采样投票）",
-      "status": "source-equivalent-static",
-      "action": "5 个日志锚点全中；待设备侧比对采样输出后替换"
+      "status": "rebuilt",
+      "action": "2026-11-22 由 plant/perf_slide.c 交叉编译后替换"
     },
     {
       "name": "pc98260-su",
       "path": "app/src/main/assets/pc98260-su",
-      "size": 28416,
-      "gitBlobSha1": "4c37dd5341b15daf1f9f159da7ccbeb853b6b7d1",
-      "sha256": null,
-      "origin": "prebuilt-with-source",
+      "size": 26616,
+      "gitBlobSha1": "99f2323ab4af1d6798567c1fb07c86f3b04f9a88",
+      "sha256": "231cf185d2808b66c9fd7cc45c00ab5a0fa4b7fa588f96e06587af8ee390fdd2",
+      "origin": "rebuilt-from-source",
       "sourceDraft": "plant/pc98260-su.c",
       "inApk": true,
       "usedBy": "core/AssetDeployer.RUNTIME_ASSETS（连 rootd 执行命令）",
-      "status": "source-equivalent-static",
-      "action": "字符串表已逐条对齐（PC98260_SOCK / usage / connect root daemon / /dev/null）；建议第一个做设备侧替换"
+      "status": "rebuilt",
+      "action": "2026-11-22 由 plant/pc98260-su.c 交叉编译后替换"
     },
     {
       "name": "lhasa_profile.txt",
