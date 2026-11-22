@@ -85,7 +85,7 @@
       "inApk": true,
       "usedBy": "core/AssetDeployer.RUNTIME_ASSETS（tracefs 触发器测 KASLR 位移）",
       "status": "rebuilt",
-      "action": "2026-11-22 由 plant/slide_probe.c 交叉编译后替换（事件顺序已修正）"
+      "action": "2026-11-22 由 plant/slide_probe.c 交叉编译后替换"
     },
     {
       "name": "perf_slide",
@@ -98,7 +98,7 @@
       "inApk": true,
       "usedBy": "core/AssetDeployer.RUNTIME_ASSETS（软件/硬件 perf 采样 + profile 投票求 slide）",
       "status": "rebuilt",
-      "action": "2026-11-22 由 plant/perf_slide.c 交叉编译后替换（软件事件回退、--duration 按秒）"
+      "action": "2026-11-22 由 plant/perf_slide.c 交叉编译后替换"
     },
     {
       "name": "pc98260-su",
