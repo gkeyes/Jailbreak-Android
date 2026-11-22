@@ -1,75 +1,77 @@
-# payload 源码化：等价性的定义与替换流程
+# 等价性验证：现在怎么验
 
-目标：`app/src/main/assets/` 里的原生件全部由本仓库的 C 源码重建，
-不再依赖不可追溯的预编译产物。
+目标：`app/src/main/assets/` 里的原生件都可追溯到源码，且换实现时不悄悄退化。
 
-**「等价」不等于字节相同。** 换编译器就换字节，这不代表功能变了；
-真正会坏的是语义骨架。所以等价性拆成四道闸，前一道不过就不往下走。
+## 现状（2026-11-22）
 
-## 闸 1：静态锚点（`tools/equiv.py`，CI 自动跑）
+| 资产 | 来源 |
+|---|---|
+| `reach_probe` | 自有 `plant/reach_probe.c` |
+| `slide_probe` | 上游 MIT `src/xr98260_slide_probe.c` |
+| `pc98260-su` | 上游 MIT `src/pc98260_su.c` |
+| `uaf_plant_replay` | 上游 MIT `src/exploit-android-perf.c` |
+| `ksud` | KernelSU v3.3.1 `libksud.so`（GPL-3.0） |
 
-参照物就是 `app/src/main/assets/<名字>` 里的**原件**——它一直在 git 历史里，
-不需要另外提交「基线文件」。
+上游钉在 `tools/xring.lock.properties`（commit + tarball sha256），
+由 `tools/build_xring.sh` 下载校验后编译。
 
-| 检查 | 性质 | 理由 |
-|---|---|---|
-| ELF / 64 位 / aarch64 | 硬性 | 目标机是 arm64 Android |
-| 原件里的日志锚点仍存在 | 硬性 | Java 侧按字符串判定 |
-| `lhasa_profile` 登记的内核目标常量仍在 | 硬性 | 地址变了利用就打在错的地方 |
-| 体积在原件 0.5x~3x 之间 | 硬性 | 体积突变通常说明编译选项不对 |
-| 字符串增删、内核立即数增删 | 提示 | 新增串要人工过目 |
+## 闸 1：静态锚点（CI 自动，`tools/equiv.py`）
 
-```sh
-python3 tools/equiv.py check pc98260-su /path/to/rebuild   # 单个
-python3 tools/equiv.py check-dir <编译产物目录>              # CI 用这个
-```
+参照物是 `plant/equiv/<名字>.json` = **首次替换前原件**的指纹（一经归档不覆盖）。
+自有源码的产物每次构建都要过：
 
-草稿期没有归档基线时是**报告模式**（只列 GAP 不判红）；
-某资产归档过 `plant/equiv/<名字>.json` 后自动进入**严格模式**（不过即红）。
+- ELF / 64 位 / aarch64
+- 原件的日志锚点仍存在
+- `lhasa_profile` 登记的内核目标常量仍在
+- 体积在 0.5x~3x
 
-## 闸 2：设备行为（`tools/device_verify.sh`）
-
-在已适配的 6.18.21 内核上，原件与重建物**成对执行**再比输出：
+上游源码构建的产物不过这道闸——它的可信度来自「钉版 tarball + sha256」，
+而不是与原件逐字相同（本来就不是同一份实现）。
 
 ```sh
-# root shell（Shizuku 提权后或 adb shell su）
-mkdir -p /data/local/tmp/plant/{orig,new}
-# 原件：从 assets/ 拷；重建物：从 CI Artifact plant-binaries/out 拷
-tools/device_verify.sh run /data/local/tmp/plant/orig /data/local/tmp/plant/new
+python3 tools/equiv.py check-dir <编译产物目录>
+python3 tools/equiv.py baseline      # 已存在则 KEEP，重建需 --force
 ```
 
-脚本固定参数、归一化 pid/字节数/耗时/地址，然后逐行 diff；退出码不一致也算失败。
-日志落在 `/data/local/tmp/plant/out/logs/`，差异看 `*.diff`。
+## 闸 2：上机跑（**shell 身份**）
 
-判定口径：
-- 锚点行（OK/FAIL 行、`[slide]`/`[perf]`/`[stream]` 前缀行）不许增加或消失
-- 新增 FAIL 一律视为不等价；把原有 FAIL 变成 OK 必须在提交信息里写明原因
-  （例如 `reach_probe.c` 注释里那条 `attr.size` 误报修正）
+**不需要 root。** 整条链的设计前提就是「以 shell 权限泄漏 KASLR，再提权」，
+所以测试必须在 shell 身份下做，root 反而掩盖问题。
 
-## 闸 3：真实入口回归（App）
+```sh
+# 1. 取产物（两种都行）
+#    A. 从 CI 的 plant/out/<名字>.b64 解码
+base64 -d <名字>.b64 > /data/local/tmp/<名字> && chmod 755 /data/local/tmp/<名字>
+#    B. 从已安装 APK 里抽
+unzip -p "$(pm path com.gkeyes.lhasa26 | head -1 | sed 's/^package://')" assets/<名字> > /data/local/tmp/<名字>
 
-走 `WorkflowEngine` 真实入口：诊断 → 临时 ROOT → KSU 接管，确认状态机、
-日志、`onTail` 尾巴都正常。只跑裸二进制不够——入口层还有超时与重试逻辑。
+# 2. 关键一步：拿 slide（必须能打印 slide=0x…）
+timeout 10 /data/local/tmp/slide_probe
 
-## 闸 4：台账登记（`tools/assets-ledger.json`）
+# 3. 用拿到的 slide 跑主利用
+/data/local/tmp/uaf_plant_replay --slide 0x<上一步的值>
+```
 
-替换的提交必须同时更新台账：`origin` 改为 `rebuilt-from-source`、
-`sourceDraft` 指向真实源文件、`sha256` 换成新产物、`status` 改为 `rebuilt`。
+判据：
+- `slide_probe` 必须输出 `site=0x… slide=0x…`，且 slide 是 2 MiB 对齐
+- `uaf_plant_replay` 出现 `[cred] rooted` 或 `[rootd] listening` 才算成功
+- 出现 `holding zombie` 就必须重启，不能在同一次开机重试
 
-## 当前进度
+`pc98260-su` 的协议比对用 `tools/gate2_pc98260.sh`（只测连接失败与参数解析，
+不碰真 rootd——连它会让已污染的堆再次崩溃）。
 
-| 资产 | 源码 | 闸 1 | 闸 2 | 闸 3 |
-|---|---|---|---|---|
-| `pc98260-su` | `plant/pc98260-su.c` | ✅ 0 GAP | 待跑 | 待跑 |
-| `reach_probe` | `plant/reach_probe.c` | ✅ 0 GAP | 待跑 | 待跑 |
-| `slide_probe` | `plant/slide_probe.c` | ✅ 0 GAP | 待跑 | 待跑 |
-| `perf_slide` | `plant/perf_slide.c` | ✅ 0 GAP | 待跑 | 待跑 |
-| `uaf_plant_replay` | **无源码（原始目录已丢失）** | — | — | — |
+## 闸 3：App 真实入口
 
-`uaf_plant_replay` 的结论与已知契约（CLI、日志路径、套接字、五个阶段）记在
-`tools/assets-ledger.json` 的 `contract` 字段里，供以后做反汇编重建时对照。
+只有验证 `WorkflowEngine` 的超时/重试/状态机时才需要装 APK。
+装完可先跑 `tools/verify_apk_assets.sh` 自证 APK 里的 assets 与台账一致
+（哈希直接读 `tools/assets-ledger.json`，不再硬编码）。
+
+## 闸 4：台账
+
+替换产物必须同步 `tools/assets-ledger.json`：`origin`、`sourceDraft`、`license`、
+`sha256`、`size`。`tools/check_assets.py --strict` 是 CI 第一道门。
 
 ## 回退
 
-每个产物替换都是独立提交，回退只需 `git revert` 那一个提交；原件可从
-`assets/` 的提交历史取回，台账里也保留了它的 `sha256` 与 `gitBlobSha1`。
+每次替换都是独立提交，`git revert` 即可；原件指纹留在 `plant/equiv/`，
+原二进制在 git 历史里。
