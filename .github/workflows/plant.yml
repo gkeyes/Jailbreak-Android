@@ -3,7 +3,7 @@ name: plant
 # plant/ 下的自有 C 源码：交叉编译 + 与原件/基线的等价性验证。
 #
 # 默认全只读。唯一会写仓库的是 publish job：workflow_dispatch 专用，
-# 而且必须显式勾选 publish=true 才会跑——它负责把编出来的二进制提交进 assets。
+# 而且必须显式勾选 publish=true 才会跑。
 
 on:
   push:
@@ -17,7 +17,7 @@ on:
   workflow_dispatch:
     inputs:
       publish:
-        description: '把编译产物提交进 app/src/main/assets（会写仓库）'
+        description: '把编译产物提交进 app/src/main/assets（会写仓库，并触发带签名的发布）'
         type: boolean
         default: false
 
@@ -219,7 +219,7 @@ jobs:
             echo "没有变化，跳过提交"
             exit 0
           fi
-          git commit -m "feat(assets): 四个探针改为自有源码构建产物
+          git commit -m "feat(assets): 四个探针改为自有源码构建产物 [apk] [release]
 
 - reach_probe / slide_probe / perf_slide / pc98260-su 由 plant/*.c 交叉编译替换
 - 原件指纹归档到 plant/equiv/，此后等价性检查进入严格模式
