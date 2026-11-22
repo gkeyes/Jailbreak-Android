@@ -6,18 +6,20 @@
 # 用法：tools/verify_apk_assets.sh [包名]
 #
 # 期望值必须与 tools/assets-ledger.json 保持一致；改动 assets 后要同步这里。
+# 装完包先跑这个，确认 APK 里装的确实是我们编的二进制，再去判断提权结果——
+# 否则「提权失败」可能只是包没换对。
 
 set -u
 
 PKG="${1:-com.gkeyes.lhasa26}"
 
-# 台账现值（2026-11-22，第二次替换 + perf_slide 两轮修复之后）
+# 台账现值（0.4.0-dev，2026-11-22）
 #   perf_slide    37376  be977d32…  软件事件回退 + --duration 按秒 + profile 投票
 #   slide_probe   35352  8b3681cb…  先开 trace 再 timer_create
 #   reach_probe   45664  0938f6b6…
 #   pc98260-su    26616  231cf185…
 #   ksud        4990848  4f7d5fd6…  上游原件（KernelSU v3.3.1 的 libksud.so）
-#   uaf_plant_replay 88488（无源码，保持原件，台账里记为不可重建）
+#   uaf_plant_replay 88488（无源码，保持原件）
 expect_sha() {
 	case "$1" in
 		perf_slide)  echo be977d32d3def2fe6673403f4fd92626af8fe68eb1439f7d5fca49f723d89aca ;;
