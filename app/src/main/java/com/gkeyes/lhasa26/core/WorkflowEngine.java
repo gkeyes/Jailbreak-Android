@@ -26,7 +26,10 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
     private static final long IDLE_AVAILABLE_KB = 1500000L;
     private static final long CLEAN_SKIP_AVAILABLE_KB = 3000000L;
     private static final long DEPLOY_TIMEOUT_MS = 8000L;
+    private static final long DEPLOY_JOIN_MS = 1500L;
     private static final int TEMP_ROOT_PROBE_TIMEOUT_S = 3;
+    /** ksud 的权威大小（tools/assets-ledger.json）；不一致就重新投放。 */
+    private static final long KSUD_BYTES = 4990848L;
     private static final String RUN_MARKER = "/data/local/tmp/.lhasa_run";
     private static final String ROOTD_SOCKET = "/data/local/tmp/pc98260-root.sock";
     private static final String SU_CLIENT = "/data/local/tmp/pc98260-su";
@@ -45,9 +48,7 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
     private final Object logLock = new Object();
     private final StringBuilder sessionLog = new StringBuilder();
     private final Set<String> payloadLines = new LinkedHashSet<>();
-    /** payload 启动时刻（毫秒），用于给每行输出打相对时间戳。 */
     private volatile long payloadStartAt;
-    /** 已经镜像到面包屑文件的 payload 子阶段，避免同阶段重复写。 */
     private volatile String mirroredStage = "";
     private volatile State state = State.IDLE;
     private volatile long startedAt;
@@ -108,6 +109,7 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
     }
 
     public void stop() {
+        deployer.cancel();
         worker.shutdownNow();
         executor.kill();
     }
@@ -149,7 +151,6 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
         return (System.currentTimeMillis() - start) / 1000.0;
     }
 
-    /** 把 payload 的新增输出写进会话日志（去重），每条带相对时间前缀。 */
     private void appendPayloadOutput(String tail) {
         if (tail == null || tail.trim().isEmpty()) {
             return;
@@ -165,12 +166,7 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
         }
     }
 
-    /**
-     * 把 payload 最新子阶段写进面包屑。
-     *
-     * 硬重启时来不及写日志，而这份文件是崩溃**前**写好的：下次启动读它就能定位
-     * 到具体是哪一步把设备带走的。只在阶段变化时写，通常一次运行不超过十次。
-     */
+    /** 把 payload 最新子阶段写进面包屑；硬重启后靠它定位。只在阶段变化时写。 */
     private void mirrorPayloadStage(String tail) {
         if (tail == null || tail.isEmpty()) {
             return;
@@ -213,7 +209,6 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
         }
     }
 
-    /** 从形如 `[cred] plant attempt 3/12` 的行里取 3；取不到就返回 0。 */
     private static String attemptNumber(String line) {
         int idx = line.indexOf("attempt ");
         if (idx < 0) {
@@ -325,7 +320,8 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
             clearRunMarker();
             state = State.ROOTED;
             selinuxAfterRoot = enforceNow();
-            callbacks.onState(State.ROOTED, "复用已有临时 ROOT · 正在接管 KernelSU");
+            // 注意：仍在运行中，接管结束后才发 COMPLETE；这里先给 RUNNING 让 UI 保持计时。
+            callbacks.onState(State.RUNNING, "复用已有临时 ROOT · 正在接管 KernelSU");
             runKernelSuStep();
             return;
         }
@@ -364,6 +360,19 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
         deploy.start();
         DeployGate.Result deployResult = deployGate.await(deploy);
         if (deployResult != DeployGate.Result.READY) {
+            // 先真正停掉写入，确认线程退出，再进入失败清理——否则旧任务会在清理之后把文件写回去。
+            deployer.cancel();
+            deploy.interrupt();
+            try {
+                deploy.join(DEPLOY_JOIN_MS);
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+            }
+            if (deploy.isAlive()) {
+                append("[部署] 取消后部署线程仍未退出——本轮不再继续，请重启设备后再试");
+            } else {
+                append("[部署] 已取消，并确认部署线程退出");
+            }
             recordFailedBoot(boot, false);
             throw new IllegalStateException("部署未完成（" + deployResult + "）· 请重启后重试");
         }
@@ -535,28 +544,27 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
         }
     }
 
-    private void stageKsudIfNeeded() {
+    /**
+     * ksud 复用必须按身份判断：大小精确匹配且可执行，才算同一个文件。
+     * 之前只看 >1MB，APK 换了新件也可能继续用旧的。
+     */
+    private void stageKsudIfNeeded() throws Exception {
+        CommandResult probe = run("if [ -x " + KSUD_FILE + " ]; then stat -c %s " + KSUD_FILE
+                + "; else echo 0; fi", true);
+        long remote = -1L;
         try {
-            CommandResult size = run("stat -c %s " + KSUD_FILE + " 2>/dev/null || echo 0", true);
-            long remote;
-            try {
-                remote = Long.parseLong(size.output.trim());
-            } catch (NumberFormatException ignored) {
-                remote = -1L;
-            }
-            if (remote > 1000000L) {
-                append("[部署] ksud 已在设备上（" + remote + " 字节），跳过传输");
-                return;
-            }
-            deployer.stage("ksud");
-        } catch (Exception error) {
-            append("[部署] ksud 预检失败，改为重新投放：" + error.getMessage());
-            try {
-                deployer.stage("ksud");
-            } catch (Exception fatal) {
-                append("[部署] ksud 投放失败：" + fatal.getMessage());
-            }
+            remote = Long.parseLong(probe.output.trim());
+        } catch (NumberFormatException ignored) {
+            remote = -1L;
         }
+        if (remote == KSUD_BYTES) {
+            append("[部署] ksud 已存在且大小匹配（" + remote + " 字节），跳过传输");
+            return;
+        }
+        if (remote > 0) {
+            append("[部署] ksud 身份不匹配（" + remote + " ≠ " + KSUD_BYTES + " 字节或不可执行），重新投放");
+        }
+        deployer.stage("ksud");
     }
 
     private void waitForIdle() throws Exception {
@@ -799,6 +807,8 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
             append(result.isSuccess()
                     ? "维护命令完成"
                     : "维护命令失败（退出码 " + result.exitCode + "）：" + result.output);
+            // 维护任务结束，把状态回到"已完成"，避免界面一直显示"正在诊断"。
+            callbacks.onState(state, result.isSuccess() ? "维护完成" : "维护失败 · 详见日志");
         }, false);
     }
 
