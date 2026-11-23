@@ -36,7 +36,12 @@ public final class BootGuard {
      */
     public static final String PID_FILE = "/data/local/tmp/.lhasa_pid";
 
-    /** 阶段面包屑：每个会碰内核的动作开跑前写一次，成功后清空。 */
+    /**
+     * 阶段面包屑：每个会碰内核的动作开跑前写一次，成功后清空。
+     *
+     * payload 运行期间会按子阶段反复刷新（`payload-cred-3` 之类）。硬重启来不及写日志，
+     * 但这份文件是崩溃**之前**写好的，下次启动读它就能定位到具体阶段。
+     */
     public static final String STAGE_FILE = "/data/local/tmp/.lhasa_stage";
 
     /** 本次开机的失败记录：`<boot_id> <abort|permissive|enforcing>`。 */
@@ -51,7 +56,6 @@ public final class BootGuard {
     private static final char BOOT_SEP = ':';
     private static final String BOOT_ID_READ = "$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)";
 
-    /** 读 pid 文件并拆出 pgid/boot_id；pgid 必须是 >1 的纯数字，否则视为损坏。 */
     private static final String READ_PGID =
             "rec=$(cat " + PID_FILE + " 2>/dev/null); "
                     + "p=${rec%%" + BOOT_SEP + "*}; b=${rec##*" + BOOT_SEP + "}; "
@@ -71,11 +75,6 @@ public final class BootGuard {
             "[cred] rooted"
     };
 
-    /**
-     * 意味着「这一轮已经结束、没有东西被植入」，可以安全重跑。
-     *
-     * 刻意不含 "[selinux] attempt "：那一行在链路正常推进时就会出现（attempt 1/6 在开头）。
-     */
     private static final String[] RETRY_MARKERS = {
             "leak failed",
             "unsupported kernel",
@@ -114,7 +113,6 @@ public final class BootGuard {
                 + " · 将按现有 offsets 继续尝试；若失败或内核异常，请重启后再试，不要在本次开机重复点击";
     }
 
-    /** 单次探测命令加硬超时；`-k 2` 是第二道保险：SIGTERM 后 2 秒仍不退就 SIGKILL。 */
     public static String withTimeout(int seconds, String command) {
         return "timeout -k 2 " + seconds + " " + command;
     }
@@ -139,7 +137,6 @@ public final class BootGuard {
         return "rm -f " + FAILED_FILE;
     }
 
-    /** 解析失败记录；兼容旧格式 `<boot_id> 0|1`。 */
     public static Retry parseFailure(String content, String currentBootId) {
         if (content == null || content.trim().isEmpty()) {
             return Retry.ALLOWED;
@@ -161,6 +158,7 @@ public final class BootGuard {
         return Retry.BLOCKED;
     }
 
+    /** 把残留面包屑翻成人话；payload-<子阶段> 会展开成可读的步骤名。 */
     public static String leftoverStageHint(String stageFileContent) {
         if (stageFileContent == null || stageFileContent.trim().isEmpty()) {
             return "";
@@ -168,24 +166,55 @@ public final class BootGuard {
         String[] parts = stageFileContent.trim().split("\\s+");
         String stage = parts[0];
         String label;
-        switch (stage) {
-            case "payload":
-                label = "主利用（uaf_plant_replay）";
-                break;
-            case "ksu":
-                label = "KernelSU late-load（加载内核模块）";
-                break;
-            case "probe-slide":
-                label = "slide_probe 测量";
-                break;
-            case "diagnose":
-                label = "reach_probe 诊断";
-                break;
-            default:
-                label = stage;
-                break;
+        if (stage.startsWith("payload")) {
+            String detail = stage.length() > "payload".length()
+                    ? stage.substring("payload".length()).replaceFirst("^[-_]", "")
+                    : "";
+            label = detail.isEmpty()
+                    ? "主利用（uaf_plant_replay）"
+                    : "主利用 · 具体阶段 " + describePayloadStage(detail);
+        } else {
+            switch (stage) {
+                case "ksu":
+                    label = "KernelSU late-load（加载内核模块）";
+                    break;
+                case "probe-slide":
+                    label = "slide_probe 测量";
+                    break;
+                case "diagnose":
+                    label = "reach_probe 诊断";
+                    break;
+                default:
+                    label = stage;
+                    break;
+            }
         }
         return "上次运行停在「" + label + "」阶段，没有正常结束——如果是重启造成的，那就是这个阶段把设备带走的。";
+    }
+
+    private static String describePayloadStage(String detail) {
+        if (detail.startsWith("task")) {
+            return "task_struct 泄漏（task）";
+        }
+        if (detail.startsWith("selinux")) {
+            return "清 SELinux（" + detail + "）";
+        }
+        if (detail.startsWith("cred")) {
+            return "植入 cred（" + detail + "）";
+        }
+        if (detail.startsWith("exec")) {
+            return "非 leader exec 竞态（exec）";
+        }
+        if (detail.startsWith("stream")) {
+            return "order-1 页复用写入（stream）";
+        }
+        if (detail.startsWith("miss")) {
+            return "页未命中，准备重试（page miss）";
+        }
+        if (detail.startsWith("rootd")) {
+            return "启动 rootd（rootd）";
+        }
+        return detail;
     }
 
     private static String sanitize(String value) {
@@ -195,7 +224,6 @@ public final class BootGuard {
         return value.replaceAll("[^A-Za-z0-9_.-]", "_");
     }
 
-    /** Launches the payload in its own session and records `&lt;pgid&gt;:&lt;boot_id&gt;`. */
     public static String launchCommand(String binary, String arguments, String logPath) {
         return "toybox setsid sh -c '" + binary + " " + arguments
                 + " > " + logPath + " 2>&1 < /dev/null & echo \"$$" + BOOT_SEP + "\""
@@ -203,7 +231,6 @@ public final class BootGuard {
                 + "' >/dev/null 2>&1 &";
     }
 
-    /** Signals the recorded process group from the shell identity (only works while still uid=2000). */
     public static String killCommand() {
         return "if [ -s " + PID_FILE + " ]; then "
                 + READ_PGID
@@ -212,12 +239,7 @@ public final class BootGuard {
                 + "fi; rm -f " + PID_FILE + "; fi; true";
     }
 
-    /**
-     * 接管成功后收掉临时 rootd。
-     *
-     * 那个进程已经升权到 uid=0，shell 的 kill 会 EPERM；而 unlink socket 并不会终止监听者。
-     * 所以只能借 KernelSU 的 su 按 pgid 发信号，并校验 boot_id 与 pgid 数值。
-     */
+    /** 接管成功后收掉临时 rootd：它已升权 uid=0，只能借 su 按 pgid 发信号。 */
     public static String suKillCommand() {
         return "if [ -s " + PID_FILE + " ]; then "
                 + READ_PGID
@@ -227,12 +249,6 @@ public final class BootGuard {
                 + "echo done; else echo none; fi";
     }
 
-    /**
-     * Prints 1 when the recorded process group still exists in this boot, 0 otherwise.
-     *
-     * `kill -0` fails with EPERM for a live process owned by another uid (exactly what an elevated
-     * payload looks like) and with ESRCH when it is really gone.
-     */
     public static String aliveCommand() {
         return "if [ -s " + PID_FILE + " ]; then "
                 + READ_PGID
