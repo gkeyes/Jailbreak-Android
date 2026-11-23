@@ -36,8 +36,6 @@ public final class ConsoleActivity extends ComponentActivity
         implements WorkflowCallbacks, FoldConsoleView.Listener {
 
     private static final int REQUEST_SHIZUKU = 1001;
-    /** 临时 ROOT 就绪后自动接管 KernelSU 的延迟，让 UI 先渲染一次结果。 */
-    private static final long AUTO_KSU_DELAY_MS = 600L;
 
     /**
      * 完整框架重启：zygote 会全新拉起，Zygisk 因此在 zygote 启动时重新注入，
@@ -52,7 +50,7 @@ public final class ConsoleActivity extends ComponentActivity
      * 一旦在本次开机内被删掉，再点主按钮就可能对已释放节点二次 rb_erase 打 panic。
      */
     private static final String CLEAN_TARGETS =
-            "uaf_replay.log diag.log ksu_try.log .lhasa_stage";
+            "uaf_replay.log diag.log ksu_try.log .lhasa_stage .lhasa_slide";
 
     private WorkflowEngine engine;
     private ShizukuExecutor executor;
@@ -94,20 +92,6 @@ public final class ConsoleActivity extends ComponentActivity
             elapsed = ((System.currentTimeMillis() - startAt) / 1000) + " s";
             render();
             handler.postDelayed(this, 1000L);
-        }
-    };
-
-    private final Runnable autoKsu = () -> {
-        if (engine == null || running) {
-            return;
-        }
-        if (engine.getState() != WorkflowEngine.State.ROOTED) {
-            return;
-        }
-        status = "已获得临时 ROOT · 自动接管 KernelSU";
-        render();
-        if (engine.retryKernelSu()) {
-            beginRun();
         }
     };
 
@@ -267,7 +251,7 @@ public final class ConsoleActivity extends ComponentActivity
                     break;
                 }
                 if (state == WorkflowEngine.State.ROOTED || state == WorkflowEngine.State.KSU_PENDING) {
-                    // 自动接管已内建；这里只是手动补一次，不再弹确认框。
+                    // 正常流程里引擎已经自动接管；这里只处理接管失败后的手动重试。
                     if (engine.retryKernelSu()) {
                         beginRun();
                     }
@@ -306,7 +290,7 @@ public final class ConsoleActivity extends ComponentActivity
                         .setTitle("使用帮助")
                         .setMessage("1. 点击主按钮：自动打开 Shizuku 并请求授权\n"
                                 + "2. 接口诊断确认环境\n"
-                                + "3. 一键临时 ROOT：拿到临时 root 后会自动接管 KernelSU\n"
+                                + "3. 一键临时 ROOT：拿到临时 root 后自动接管 KernelSU，无需再点\n"
                                 + "4. 接管会 late-load 内核模块，这是最容易触发重启的一步\n"
                                 + "5. 软重启会重载框架，Zygisk/LSPosed 随之重新注入；\n"
                                 + "   若仍不生效，用内核管理器里热重启模块的动作（会额外重建 lspd/zygiskd）\n"
@@ -354,10 +338,6 @@ public final class ConsoleActivity extends ComponentActivity
                 .show();
     }
 
-    /**
-     * 导出前统一脱敏；写入失败时把已经插进 MediaStore 的空条目删掉，
-     * 否则 Download/lhasa26 下会积累 0 字节的残留文件。
-     */
     private void exportLog() {
         String header = "app=" + versionName() + "\npackage=" + getPackageName()
                 + "\ndevice=" + device + " / " + build + "\nkernel=" + kernel
@@ -478,9 +458,6 @@ public final class ConsoleActivity extends ComponentActivity
                     running = false;
                     privilege = "临时 ROOT";
                     handler.removeCallbacks(ticker);
-                    // 临时 ROOT 就绪 → 自动接管 KernelSU，不再让用户点第二次。
-                    handler.removeCallbacks(autoKsu);
-                    handler.postDelayed(autoKsu, AUTO_KSU_DELAY_MS);
                     break;
                 case KSU_PENDING:
                     running = false;
@@ -490,7 +467,6 @@ public final class ConsoleActivity extends ComponentActivity
                 case COMPLETE:
                     running = false;
                     privilege = "KernelSU 已接管";
-                    handler.removeCallbacks(autoKsu);
                     handler.removeCallbacks(ticker);
                     break;
                 case FAILED:
