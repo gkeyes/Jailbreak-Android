@@ -121,7 +121,6 @@ internal fun FoldMoreMenu(
         enterTransition = EnterTransition.None,
         exitTransition = fadeOut(GlassMotion.transformBounds(false)),
     ) {
-        // Let the popup enter from the measured toolbar icon after the host is mounted.
         var expanded by remember { mutableStateOf(false) }
         LaunchedEffect(show) { expanded = show }
         Box(Modifier.fillMaxSize()) {
@@ -137,6 +136,10 @@ internal fun FoldMoreMenu(
     }
 }
 
+/**
+ * 覆盖层只负责展示与确认，真正的动作仍由宿主执行。
+ * 帮助文案必须和当前行为一致：接管 KernelSU 已经是自动的，不需要再点第二次。
+ */
 @Composable
 internal fun FoldDialogs(
     request: FoldEvent?,
@@ -159,9 +162,36 @@ internal fun FoldDialogs(
     if (event == FoldEvent.HELP) {
         val help: @Composable () -> Unit = {
             Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).navigationBarsPadding()) {
-                BasicComponent(title = "控制台", summary = "查看授权与会话状态。", insideMargin = PaddingValues(vertical = 7.dp))
-                BasicComponent(title = "设备", summary = "查看设备信息，使用设备维护工具。", insideMargin = PaddingValues(vertical = 7.dp))
-                BasicComponent(title = "记录", summary = "查看和导出本次会话的日志。", insideMargin = PaddingValues(vertical = 7.dp))
+                BasicComponent(
+                    title = "1. 授权 Shizuku",
+                    summary = "点主按钮会自动打开 Shizuku 并请求授权；先启动、后授权都可以。",
+                    insideMargin = PaddingValues(vertical = 7.dp),
+                )
+                BasicComponent(
+                    title = "2. 接口诊断（可选）",
+                    summary = "确认环境能否用于提权。诊断只读，不改内核状态。",
+                    insideMargin = PaddingValues(vertical = 7.dp),
+                )
+                BasicComponent(
+                    title = "3. 一键临时 ROOT",
+                    summary = "测 KASLR 位移 → 跑利用 → 起 rootd。成功后会自动接管 KernelSU，不需要再点第二次。",
+                    insideMargin = PaddingValues(vertical = 7.dp),
+                )
+                BasicComponent(
+                    title = "4. 接管 KernelSU",
+                    summary = "自动执行 late-load 加载内核模块，这是整条链里最容易触发重启的一步。",
+                    insideMargin = PaddingValues(vertical = 7.dp),
+                )
+                BasicComponent(
+                    title = "5. 软重启 = 重载框架",
+                    summary = "会 stop/start 全部 Android 服务，zygote 重新拉起，Zygisk/LSPosed 因此重新注入。屏幕会黑几秒。",
+                    insideMargin = PaddingValues(vertical = 7.dp),
+                )
+                BasicComponent(
+                    title = "6. 重启后失效",
+                    summary = "临时 ROOT 绑定本次开机；重启后需要重新执行一遍。",
+                    insideMargin = PaddingValues(vertical = 7.dp),
+                )
                 Spacer(Modifier.height(12.dp))
                 DialogAction("完成", GlassDialogButtonRole.Primary, glass, dismiss, Modifier.fillMaxWidth())
                 Spacer(Modifier.height(8.dp))
@@ -177,8 +207,10 @@ internal fun FoldDialogs(
 
     val (title, summary) = when (event) {
         FoldEvent.SETTINGS -> "设置" to null
-        FoldEvent.CLEAN -> "清理临时文件" to "将清理本次日志及临时诊断文件。确认继续？"
-        FoldEvent.SOFT_REBOOT -> "软重启" to "系统服务将重新启动，界面可能短暂消失。确认继续？"
+        FoldEvent.CLEAN -> "清理临时文件" to
+            "将清理本次日志、su 输出、阶段面包屑与 slide 缓存。\n不会清除防 panic 标记（它绑定本次开机，重启后自然失效）。"
+        FoldEvent.SOFT_REBOOT -> "软重启（重载框架）" to
+            "将停止并重新启动全部 Android 服务：zygote 重新拉起，Zygisk/LSPosed 因此重新注入。\n屏幕会黑几秒，请勿中断。"
         FoldEvent.REBOOT -> "重启设备" to "设备将立即重启，当前临时会话会结束。确认继续？"
         else -> return
     }
@@ -199,7 +231,7 @@ internal fun FoldDialogs(
         } else {
             val action = when (event) {
                 FoldEvent.CLEAN -> "清理"
-                FoldEvent.SOFT_REBOOT -> "软重启"
+                FoldEvent.SOFT_REBOOT -> "重载框架"
                 else -> "重启"
             }
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
