@@ -1,12 +1,15 @@
 name: build-apk
 
-# next 的发布构建。只做两件事：构建、按需发布。
+# 发布构建：测试 → 签名 APK → 按需发布。
+#
+# 省额度策略（重要）：
+#   1. job 级 if 门禁 —— 只有提交信息含 [release]/[apk]，或手动触发，才真正执行。
+#      被跳过的 job 不计费，所以普通 push 只留一条"skipped"记录，不烧分钟。
+#   2. concurrency —— 同一分支后跑的取消前跑的。
+#   3. Gradle 缓存 —— 依赖与增量编译目录复用，构建时间大约减半。
 #
 # 签名：钥匙只有一把（keystore/lhasa26.jks，历史里），口令在
 # keystore/keystore.properties；不依赖 Actions Secrets。
-#
-# 关于 Artifact：免费配额经常是满的，upload/download-artifact 会 403。
-# 所以 release job **自己构建**，不经过 Artifact。
 
 on:
   push:
@@ -25,12 +28,19 @@ on:
 
 permissions:
   contents: read
+  issues: write
+
+concurrency:
+  group: build-apk-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[release]') || contains(github.event.head_commit.message, '[apk]')
     permissions:
       contents: read
+      issues: write
     steps:
       - uses: actions/checkout@v4
         with:
@@ -54,6 +64,17 @@ jobs:
             fi
           done
 
+      - name: Gradle 缓存
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+            app/build
+          key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle*', 'gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: |
+            gradle-${{ runner.os }}-
+
       - name: 资产台账
         run: python3 tools/check_assets.py --strict
 
@@ -70,7 +91,15 @@ jobs:
           fi
           ls -l keystore/lhasa26.jks keystore/keystore.properties
 
+      - name: 单元测试（发布前置门）
+        id: tests
+        run: |
+          chmod +x gradlew
+          set -o pipefail
+          ./gradlew --no-daemon :app:testDebugUnitTest 2>&1 | tee "$RUNNER_TEMP/test.log" | tail -30
+
       - name: Gradle build
+        id: assemble
         run: |
           chmod +x gradlew
           set -o pipefail
@@ -119,6 +148,34 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+      - name: 失败时把日志写进 issue
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OUT_TESTS: ${{ steps.tests.outcome }}
+          OUT_ASSEMBLE: ${{ steps.assemble.outcome }}
+        run: |
+          set -uo pipefail
+          body="$RUNNER_TEMP/ci-failure.md"
+          {
+            echo "commit: \`$GITHUB_SHA\`"
+            echo
+            echo '```text'
+            echo "tests    = ${OUT_TESTS}"
+            echo "assemble = ${OUT_ASSEMBLE}"
+            echo '```'
+            echo '```text'
+            grep -nE '(^e: |error:|FAILURE:|Caused by:|What went wrong|> Task .* FAILED|BUILD FAILED)' \
+              "$RUNNER_TEMP/test.log" build.log 2>/dev/null | head -60 || echo "（没有匹配的报错行）"
+            echo '```'
+            echo '```text'
+            tail -c 8000 "$RUNNER_TEMP/test.log" 2>/dev/null || true
+            tail -c 8000 build.log 2>/dev/null || true
+            echo '```'
+          } > "$body"
+          gh issue create --title "ci: build 失败 ${GITHUB_SHA:0:8}" --body-file "$body" \
+            --repo "${{ github.repository }}" || true
+
   release:
     needs: build
     if: contains(github.event.head_commit.message, '[release]')
@@ -145,17 +202,28 @@ jobs:
             fi
           done
 
+      - name: Gradle 缓存
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+            app/build
+          key: gradle-release-${{ runner.os }}-${{ hashFiles('**/*.gradle*', 'gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: |
+            gradle-${{ runner.os }}-
+
       - name: 恢复签名钥匙
         run: |
           set -e
           git show 535ee09ab2aa2c9bd8cc6e76b2159f6c4e1cef4e:keystore/lhasa26.jks > keystore/lhasa26.jks
           ls -l keystore/lhasa26.jks
 
-      - name: 构建并签名
+      - name: 测试并构建
         run: |
           set -o pipefail
           chmod +x gradlew
-          ./gradlew --no-daemon :app:assembleRelease 2>&1 | tail -40
+          ./gradlew --no-daemon :app:testDebugUnitTest :app:assembleRelease 2>&1 | tail -40
 
       - name: Publish release
         env:
@@ -199,4 +267,19 @@ jobs:
             gh release edit "$tag" --notes "$notes"
           else
             gh release create "$tag" "$asset" --title "18fold越狱 ${ver}" --notes "$notes" --target "$GITHUB_SHA"
+          fi
+
+      - name: 同步 tag 指向本次构建提交
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          ver=$(sed -n 's/.*versionName = "\(.*\)".*/\1/p' app/build.gradle.kts | head -1)
+          tag="v${ver}"
+          if gh api -X PATCH "repos/${{ github.repository }}/git/refs/tags/${tag}" \
+               -f sha="$GITHUB_SHA" -F force=true > /tmp/tag.json 2>&1; then
+            echo "tag ${tag} → ${GITHUB_SHA}"
+          else
+            echo "::warning::tag ${tag} 同步失败（不影响本次发布）"
+            cat /tmp/tag.json || true
           fi
