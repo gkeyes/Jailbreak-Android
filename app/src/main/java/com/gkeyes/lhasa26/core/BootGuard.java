@@ -14,7 +14,6 @@ package com.gkeyes.lhasa26.core;
  */
 public final class BootGuard {
 
-    /** Result of inspecting one line of payload output. */
     public enum Outcome {
         SUCCESS,
         RETRY_SAFE,
@@ -22,7 +21,6 @@ public final class BootGuard {
         CONTINUE
     }
 
-    /** What the recorded failure of this boot allows. */
     public enum Retry {
         ALLOWED,
         PERMISSIVE_RETRY,
@@ -44,6 +42,9 @@ public final class BootGuard {
     /** 本次开机的失败记录：`<boot_id> <abort|permissive|enforcing>`。 */
     public static final String FAILED_FILE = "/data/local/tmp/.lhasa_failed_boot";
 
+    /** 同开机 KASLR slide 缓存：`<boot_id> <slide|site> <value>`。 */
+    public static final String SLIDE_CACHE_FILE = "/data/local/tmp/.lhasa_slide";
+
     /** timeout(1) 被触发时的退出码。 */
     public static final int TIMEOUT_EXIT = 124;
 
@@ -64,15 +65,19 @@ public final class BootGuard {
     };
 
     /**
-     * Failures that leave nothing planted.
+     * 意味着「这一轮已经结束、没有东西被植入」，可以安全重跑。
      *
-     * Deliberately does NOT contain "[selinux] attempt ": that line appears while the chain is still
-     * progressing normally (attempt 1/6 happens right at the start).
+     * 刻意不含 "[selinux] attempt "：那一行在链路正常推进时就会出现（attempt 1/6 在开头）。
+     * 后半段几条是上游真实的放弃语句，出现即说明 payload 自己停了，外层不必再等。
      */
     private static final String[] RETRY_MARKERS = {
             "leak failed",
             "unsupported kernel",
-            "slide_probe failed"
+            "slide_probe failed",
+            "[selinux] 3 consecutive misses, stop",
+            "[selinux] 3 hits without effect, stop",
+            "[cred] 6 consecutive misses, stop",
+            "[cred] 3 attempts installed but not rooted, stop"
     };
 
     private BootGuard() {
@@ -192,12 +197,7 @@ public final class BootGuard {
                 + "' >/dev/null 2>&1 &";
     }
 
-    /**
-     * Signals the recorded process group, but only when the record belongs to the running boot.
-     *
-     * A payload that already elevated itself cannot be signalled by this uid=2000 shell; the call is
-     * best-effort and must not be treated as "nothing running".
-     */
+    /** Signals the recorded process group, but only when the record belongs to the running boot. */
     public static String killCommand() {
         return "if [ -s " + PID_FILE + " ]; then "
                 + "rec=$(cat " + PID_FILE + " 2>/dev/null); "
@@ -211,25 +211,20 @@ public final class BootGuard {
     /**
      * Prints 1 when the recorded process group still exists in this boot, 0 otherwise.
      *
-     * `kill -0` fails with EPERM for a live process owned by another uid (which is exactly what an
-     * elevated payload looks like), and with ESRCH when it is really gone. Treating every failure as
-     * "alive" made the early-exit check useless, so the two cases are separated here.
+     * `kill -0` fails with EPERM for a live process owned by another uid (exactly what an elevated
+     * payload looks like) and with ESRCH when it is really gone. Treating every failure as "alive"
+     * made the early-exit check useless, so the two cases are separated.
      */
     public static String aliveCommand() {
         return "if [ -s " + PID_FILE + " ]; then "
                 + "rec=$(cat " + PID_FILE + " 2>/dev/null); "
                 + "p=${rec%%" + BOOT_SEP + "*}; b=${rec##*" + BOOT_SEP + "}; "
                 + "now=" + BOOT_ID_READ + "; "
-                + "if [ -n \"$now\" ] && [ ! \"$b\" = \"$now\" ]; then rm -f " + PID_FILE + "; echo 0; "
-                + "elif [ -z \"$p\" ]; then rm -f " + PID_FILE + "; echo 0; "
-                + "elif kill -0 -$p 2>/dev/null; then echo 1; "
-                + "else "
-                + "  msg=$(kill -0 -$p 2>&1); "
-                + "  case \"$msg\" in "
-                + "    *ermitted*) echo 1 ;; "
-                + "    *) rm -f " + PID_FILE + "; echo 0 ;; "
-                + "  esac; "
-                + "fi; "
+                + "if [ -n \"$now\" ] && [ \"$b\" = \"$now\" ] && [ -n \"$p\" ]; then "
+                + "err=$(kill -0 -$p 2>&1); rc=$?; "
+                + "if [ $rc -eq 0 ] || echo \"$err\" | grep -qiE 'permitted|eperm|not owner'; then echo 1; "
+                + "else rm -f " + PID_FILE + "; echo 0; fi; "
+                + "else rm -f " + PID_FILE + "; echo 0; fi; "
                 + "else echo 0; fi";
     }
 
