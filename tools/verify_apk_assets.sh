@@ -5,11 +5,10 @@
 #
 # 期望值直接取自 tools/assets-ledger.json（唯一事实来源），不再硬编码。
 #
-# 用法：tools/verify_apk_assets.sh [包名] [台账路径]
+# 注意：`lhasa_profile.txt` 现在是**构建期输入**（tools/gen_xr_profiles.py 读它生成
+# 编译期 profile 表），App 运行时不再把它推到设备上；但它仍打进 APK，所以这里照样校验。
 #
-# 装完包先跑这个：确认 APK 里装的确实是我们编的二进制，再去判断提权结果。
-# 2026-11-22 起 uaf_plant_replay 是 xring_plant_realcred.c 的构建（约 99 KB），
-# 不是早先那个 88 KB 的原件，也不是 115 KB 的 exploit-android-perf 变体。
+# 用法：tools/verify_apk_assets.sh [包名] [台账路径]
 
 set -u
 
