@@ -3,10 +3,9 @@
 #
 # 只读：用 unzip -p 读 APK 条目算 sha256，不执行任何 payload、不碰 rootd / tracefs / perf。
 #
-# 期望值直接取自 tools/assets-ledger.json（唯一事实来源），不再硬编码。
-#
-# 注意：`lhasa_profile.txt` 现在是**构建期输入**（tools/gen_xr_profiles.py 读它生成
-# 编译期 profile 表），App 运行时不再把它推到设备上；但它仍打进 APK，所以这里照样校验。
+# 期望值来自 tools/assets-ledger.json（唯一事实来源）。解析不看字段顺序：
+# 逐个资产对象收集 name 与 sha256，遇到下一个 name 才收尾。
+# **摘要缺失一律判失败**——旧版把空摘要当成"未固定"放过，会把错误文件判成通过。
 #
 # 用法：tools/verify_apk_assets.sh [包名] [台账路径]
 
@@ -24,25 +23,20 @@ if [ ! -f "$LEDGER" ]; then
 	exit 2
 fi
 
+# 按对象收集 name→sha256，不受字段顺序影响。
 expected() {
 	awk -v want="$1" '
-		/"name": *"/ {
-			line = $0
-			sub(/.*"name": *"/, "", line)
-			sub(/".*/, "", line)
-			name = line
+		/"name":/ {
+			if (nm == want) { print sha; done = 1; exit }
+			nm = $0; sub(/.*"name": *"/, "", nm); sub(/".*/, "", nm)
 			sha = ""
 		}
-		/"sha256": *"/ {
-			line = $0
-			sub(/.*"sha256": *"/, "", line)
-			sub(/".*/, "", line)
-			sha = line
+		/"sha256":/ {
+			s = $0
+			sub(/.*"sha256": *"/, "", s); sub(/".*/, "", s)
+			if (s != "" && s != "null") sha = s
 		}
-		/"sha256": *null/ { sha = "" }
-		/"gitBlobSha1"/ {
-			if (name == want) { print sha; exit }
-		}
+		END { if (!done && nm == want) print sha }
 	' "$LEDGER"
 }
 
@@ -60,18 +54,24 @@ trap 'rm -rf "$work"' EXIT
 
 fail=0
 for name in reach_probe slide_probe pc98260-su uaf_plant_replay ksud lhasa_profile.txt; do
-	if ! unzip -p "$apk_path" "assets/$name" > "$work/$name" 2>/dev/null || [ ! -s "$work/$name" ]; then
-		echo "缺失 assets/$name"
-		fail=1
-		continue
-	fi
-	actual=$(sha256sum "$work/$name" | cut -d' ' -f1)
-	size=$(wc -c < "$work/$name" | tr -d ' ')
 	want=$(expected "$name")
 
 	if [ -z "$want" ]; then
-		echo "OK?  assets/$name  $size 字节（台账未固定 sha256）"
-	elif [ "$actual" = "$want" ]; then
+		echo "FAIL assets/$name —— 台账里没有该资产的 sha256（解析失败或未登记）"
+		fail=1
+		continue
+	fi
+
+	if ! unzip -p "$apk_path" "assets/$name" > "$work/$name" 2>/dev/null || [ ! -s "$work/$name" ]; then
+		echo "FAIL assets/$name —— APK 中缺失或为空"
+		fail=1
+		continue
+	fi
+
+	actual=$(sha256sum "$work/$name" | cut -d' ' -f1)
+	size=$(wc -c < "$work/$name" | tr -d ' ')
+
+	if [ "$actual" = "$want" ]; then
 		echo "OK   assets/$name  $size 字节"
 	else
 		echo "FAIL assets/$name  $size 字节"
@@ -83,7 +83,7 @@ done
 
 echo
 if [ "$fail" -eq 0 ]; then
-	echo "APK 内的 assets 与台账一致"
+	echo "APK 内的 assets 与台账一致（6/6）"
 else
 	echo "APK 内的 assets 与台账不一致"
 fi
