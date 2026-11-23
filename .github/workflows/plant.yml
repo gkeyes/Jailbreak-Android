@@ -2,11 +2,9 @@ name: plant
 
 # 交叉编译、等价性验证与产物分发。
 #
-# 默认只读。唯一会写仓库的是 publish job（提交信息含 [publish]）：
-#   1. 编译自有探针 reach_probe → 等价性门禁（对照 plant/equiv 原件基线）
-#   2. 从上游钉版源码（MIT）构建 uaf_plant_replay / slide_probe / pc98260-su
-#   3. 覆盖 app/src/main/assets/、归档基线、同步台账
-#   4. 产物另存 plant/out/*.b64，便于直接在设备上解码运行（不必打 APK）
+# 默认只读。唯一会写仓库的是 publish job（提交信息含 [publish]），且必须
+# 在 compile job 通过之后才会运行；publish 自己也会对将要提交的产物跑一次
+# 等价性检查，避免"检查的是另一份构建"。
 
 on:
   push:
@@ -16,6 +14,7 @@ on:
       - 'app/src/main/assets/**'
       - 'tools/plant_build.sh'
       - 'tools/build_xring.sh'
+      - 'tools/gen_xr_profiles.py'
       - 'tools/equiv.py'
       - 'tools/xring.lock.properties'
       - '.github/workflows/plant.yml'
@@ -120,6 +119,7 @@ jobs:
 
   publish:
     name: 替换 assets
+    needs: compile
     if: contains(github.event.head_commit.message, '[publish]')
     runs-on: ubuntu-latest
     permissions:
@@ -146,6 +146,11 @@ jobs:
             -fno-asynchronous-unwind-tables -fno-unwind-tables -pthread \
             plant/reach_probe.c -o "$RUNNER_TEMP/out/reach_probe"
           ls -l "$RUNNER_TEMP/out"
+
+      - name: 对将要提交的产物做等价性检查
+        run: |
+          set -euo pipefail
+          python3 tools/equiv.py check reach_probe "$RUNNER_TEMP/out/reach_probe"
 
       - name: 编译上游产物（MIT）
         run: |
@@ -182,7 +187,6 @@ jobs:
           for name in slide_probe pc98260-su uaf_plant_replay; do
             base64 -w0 "$RUNNER_TEMP/xring/$name" > "plant/out/$name.b64"
           done
-          rm -f plant/out/perf_slide.b64
           ls -l plant/out
 
       - name: 同步台账并自检
@@ -196,7 +200,7 @@ jobs:
           upstream = {
               "slide_probe": "Lw5959/xring-cve-2026-98260@8b404774/src/xr98260_slide_probe.c",
               "pc98260-su": "Lw5959/xring-cve-2026-98260@8b404774/src/pc98260_su.c",
-              "uaf_plant_replay": "Lw5959/xring-cve-2026-98260@8b404774/src/exploit-android-perf.c",
+              "uaf_plant_replay": "Lw5959/xring-cve-2026-98260@8b404774/src/xring_plant_realcred.c + src/pc98260_rootd.c",
           }
           today = datetime.date.today().isoformat()
           for entry in ledger["assets"]:
@@ -220,8 +224,6 @@ jobs:
                   entry["status"] = "upstream-built"
                   entry["license"] = "MIT"
                   entry["action"] = today + " 由上游 MIT 源码编译后替换（tools/xring.lock.properties）"
-                  entry.pop("decision", None)
-          ledger["assets"] = [e for e in ledger["assets"] if e.get("name") != "perf_slide"]
           ledger["updatedAt"] = today
           ledger_path.write_text(json.dumps(ledger, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
           print("台账已更新")
@@ -238,7 +240,7 @@ jobs:
             echo "没有变化，跳过提交"
             exit 0
           fi
-          git commit -m "feat(assets): 主利用与探针全部改为上游源码构建"
+          git commit -m "feat(assets): 探针产物、基线与 base64 分发"
           git push
 
       - name: 失败时把日志写进 issue
