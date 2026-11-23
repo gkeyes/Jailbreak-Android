@@ -24,7 +24,6 @@ public final class ShizukuExecutor implements CommandExecutor {
             "TMPDIR=/data/local/tmp"
     };
 
-    /** 反射查找一次即可；API 13.1.5 里 newProcess 还是私有方法。 */
     private static final Method NEW_PROCESS_METHOD = resolveNewProcessMethod();
 
     private static Method resolveNewProcessMethod() {
@@ -38,20 +37,16 @@ public final class ShizukuExecutor implements CommandExecutor {
         }
     }
 
-    /**
-     * 所有在跑的远端进程。
-     *
-     * 之前是单个 `volatile Process active`：部署线程（stageAll → open）和工作线程
-     * （waitForIdle → run → 结尾 active = null）会互相覆盖，于是 DeployGate 超时时
-     * kill() 拿不到真正卡住的那个进程，被覆盖的另一条还会泄漏。
-     */
     private final Set<Process> active =
             Collections.newSetFromMap(new ConcurrentHashMap<Process, Boolean>());
+
+    /** 关闭后不再接受新的远端进程。 */
+    private volatile boolean closed;
 
     @Override
     public boolean isAvailable() {
         try {
-            return Shizuku.pingBinder() && Shizuku.checkSelfPermission() == 0;
+            return !closed && Shizuku.pingBinder() && Shizuku.checkSelfPermission() == 0;
         } catch (Throwable ignored) {
             return false;
         }
@@ -59,6 +54,9 @@ public final class ShizukuExecutor implements CommandExecutor {
 
     @Override
     public Process open(String command) throws Exception {
+        if (closed) {
+            throw new IllegalStateException("执行器已关闭");
+        }
         if (!isAvailable()) {
             throw new IllegalStateException("Shizuku 未运行或尚未授权");
         }
@@ -79,6 +77,7 @@ public final class ShizukuExecutor implements CommandExecutor {
 
     @Override
     public void kill() {
+        closed = true;
         List<Process> snapshot = new ArrayList<>(active);
         active.clear();
         for (Process process : snapshot) {
@@ -102,11 +101,6 @@ public final class ShizukuExecutor implements CommandExecutor {
         }
     }
 
-    /**
-     * API 13.1.5 keeps newProcess private while the transition to UserService is in progress.
-     * Keep the compatibility bridge isolated here so the rest of the app does not depend on
-     * Shizuku internals.
-     */
     private static Process newProcess(String[] command, String[] environment, String directory) throws Exception {
         Method method = NEW_PROCESS_METHOD;
         if (method == null) {
@@ -136,9 +130,18 @@ public final class ShizukuExecutor implements CommandExecutor {
             ByteArrayOutputStream stderr = new ByteArrayOutputStream();
             Future<?> outFuture = drainAsync(process.getInputStream(), stdout);
             Future<?> errFuture = drainAsync(process.getErrorStream(), stderr);
-            int exitCode = CommandExecutor.waitWithTimeout(process, 120L);
+            int exitCode;
+            try {
+                exitCode = CommandExecutor.waitWithTimeout(process, 120L);
+            } catch (InterruptedException interrupted) {
+                // 被中断时先真正杀掉进程，再让 finally 注销；否则它会脱离 active 集合继续跑。
+                destroy(process);
+                awaitQuietly(outFuture, 1000L);
+                awaitQuietly(errFuture, 1000L);
+                Thread.currentThread().interrupt();
+                throw interrupted;
+            }
             if (exitCode == CommandExecutor.TIMEOUT) {
-                // 只销毁这一次调用的进程，不要把部署线程里的进程一起带走。
                 destroy(process);
                 awaitQuietly(outFuture, 2000L);
                 awaitQuietly(errFuture, 2000L);
