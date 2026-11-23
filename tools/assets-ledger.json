@@ -34,8 +34,8 @@
       "name": "uaf_plant_replay",
       "path": "app/src/main/assets/uaf_plant_replay",
       "size": 99048,
-      "gitBlobSha1": "4e8fa96f280c832dc185818c9dda6bf15f280165",
-      "sha256": "e7ddb4723c2698ab022843e5597f0599f35c1c49ade80014c73a632daa2eb74b",
+      "gitBlobSha1": "de95b39544b6b0ca10e6bdc919b7de8868fca133",
+      "sha256": "d854aa21b4a367145a0f77454de9090f1110c09befd2cc6ab2dd34ff78f591ee",
       "origin": "upstream-source",
       "sourceDraft": "Lw5959/xring-cve-2026-98260@8b404774/src/xring_plant_realcred.c + src/pc98260_rootd.c",
       "license": "MIT",
@@ -78,29 +78,29 @@
       "name": "slide_probe",
       "path": "app/src/main/assets/slide_probe",
       "size": 43448,
-      "gitBlobSha1": "09742d64ce2a94de40f5199ee3b0deb578abfe32",
-      "sha256": "8b3681cbd2966eefe5a800b8964e58253ff338b37bffe997b4d891933c8c9e3c",
+      "gitBlobSha1": "afe1fc9da5c67456d633548c73f632a2663059a9",
+      "sha256": "86cf24faadcbf18a48fc0069336e5e9e03341f9eade24a4f7f14066bc0dd4e60",
       "origin": "upstream-source",
       "sourceDraft": "Lw5959/xring-cve-2026-98260@8b404774/src/xr98260_slide_probe.c",
       "license": "MIT",
       "inApk": true,
       "usedBy": "core/AssetDeployer.RUNTIME_ASSETS（tracefs 二进制记录扫描求 KASLR slide；同开机结果缓存在 .lhasa_slide）",
       "status": "upstream-built",
-      "action": "由上游 MIT 源码交叉编译后替换"
+      "action": "由上游 MIT 源码交叉编译后替换（tools/xring.lock.properties）"
     },
     {
       "name": "pc98260-su",
       "path": "app/src/main/assets/pc98260-su",
       "size": 25512,
-      "gitBlobSha1": "99f2323ab4af1d6798567c1fb07c86f3b04f9a88",
-      "sha256": "231cf185d2808b66c9fd7cc45c00ab5a0fa4b7fa588f96e06587af8ee390fdd2",
+      "gitBlobSha1": "2f90262d302e69155011bf87676c159b77a6fa4e",
+      "sha256": "b1e89658ee5a40214960830f4404ebe6ef7d64e1c9aa3857ee58eb58f98105f3",
       "origin": "upstream-source",
       "sourceDraft": "Lw5959/xring-cve-2026-98260@8b404774/src/pc98260_su.c",
       "license": "MIT",
       "inApk": true,
       "usedBy": "core/AssetDeployer.RUNTIME_ASSETS（连 rootd 执行命令，uint32 长度前缀协议；KSU 接管也走它）",
       "status": "upstream-built",
-      "action": "由上游 MIT 源码交叉编译后替换"
+      "action": "由上游 MIT 源码交叉编译后替换（tools/xring.lock.properties）"
     },
     {
       "name": "lhasa_profile.txt",
@@ -113,6 +113,7 @@
       "inApk": true,
       "usedBy": "构建期输入：tools/gen_xr_profiles.py 用它生成 xr98260_profiles.c 并编进上游产物；运行期不再部署",
       "status": "data",
-      "action": "OTA 换内核时只需在此追加一行 release=..."}
+      "action": "OTA 换内核时只需在此追加一行 release=..."
+    }
   ]
 }
