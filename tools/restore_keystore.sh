@@ -1,38 +1,36 @@
 #!/usr/bin/env bash
-# 在 CI 里恢复签名材料。
-#
-# 优先从 Actions Secrets 读取（转公开后的唯一正确来源）：
-#   LHASA_KEYSTORE_B64    keystore 文件内容的单行 base64
-#   LHASA_STORE_PASSWORD  storePassword
-#   LHASA_KEY_PASSWORD    keyPassword（可省略）
-#   LHASA_KEY_ALIAS       keyAlias（默认 lhasa26）
-#
-# 未配置时回退到历史提交里的 keystore —— 仅用于迁移期；转公开后
-# 应当删除该回退分支（历史里的旧 blob 不应再被 CI 当作来源）。
+# Restore only the current fixed release key from Actions Secrets.
+# Passwords remain in the job environment; no repository files or historical fallbacks are read.
 set -euo pipefail
-
-mkdir -p keystore
-
-if [ -n "${LHASA_KEYSTORE_B64:-}" ]; then
-  printf '%s' "$LHASA_KEYSTORE_B64" | base64 -d > keystore/lhasa26.jks
-  : "${LHASA_STORE_PASSWORD:?缺少 LHASA_STORE_PASSWORD}"
-  {
-    echo "storeFile=keystore/lhasa26.jks"
-    echo "storePassword=${LHASA_STORE_PASSWORD}"
-    echo "keyAlias=${LHASA_KEY_ALIAS:-lhasa26}"
-    echo "keyPassword=${LHASA_KEY_PASSWORD:-$LHASA_STORE_PASSWORD}"
-  } > keystore/keystore.properties
-  chmod 600 keystore/keystore.properties keystore/lhasa26.jks
-  echo "签名材料来自 Secrets（${#LHASA_KEYSTORE_B64} 字符 base64）"
-else
-  echo "::warning::未配置 LHASA_KEYSTORE_B64，回退到历史提交里的 keystore（迁移期路径）"
-  git show 535ee09ab2aa2c9bd8cc6e76b2159f6c4e1cef4e:keystore/lhasa26.jks > keystore/lhasa26.jks
-  cat > keystore/keystore.properties <<'EOF'
-storeFile=keystore/lhasa26.jks
-storePassword=lhasa26pass
-keyAlias=lhasa26
-keyPassword=lhasa26pass
-EOF
+for name in LHASA_KEYSTORE_B64 LHASA_STORE_PASSWORD LHASA_KEY_ALIAS LHASA_KEY_PASSWORD; do
+  if [ -z "${!name:-}" ]; then
+    echo "::error::Required Actions secret $name is missing"
+    exit 1
+  fi
+done
+umask 077
+signing_dir="$RUNNER_TEMP/lhasa26-signing"
+mkdir -p "$signing_dir"
+keystore="$signing_dir/release.jks"
+certificate="$signing_dir/certificate.der"
+if ! printf '%s' "$LHASA_KEYSTORE_B64" | base64 --decode > "$keystore"; then
+  echo "::error::LHASA_KEYSTORE_B64 is not valid base64"
+  exit 1
 fi
+if [ ! -s "$keystore" ]; then
+  echo "::error::The configured release keystore is empty"
+  exit 1
+fi
+if ! keytool -exportcert -keystore "$keystore" -alias "$LHASA_KEY_ALIAS" \
+  -storepass:env LHASA_STORE_PASSWORD -file "$certificate" > /dev/null 2>&1; then
+  echo "::error::The configured keystore, store password or key alias is invalid"
+  exit 1
+fi
+actual=$(sha256sum "$certificate" | awk '{print $1}')
+if [ "$actual" != "$LHASA_SIGNING_CERT_SHA256" ]; then
+  echo "::error::The signing certificate does not match the fixed release identity"
+  exit 1
+fi
+echo "LHASA_KEYSTORE=$keystore" >> "$GITHUB_ENV"
+echo "Release signing certificate verified"
 
-ls -l keystore/lhasa26.jks keystore/keystore.properties
