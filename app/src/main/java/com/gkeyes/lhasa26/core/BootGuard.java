@@ -51,6 +51,13 @@ public final class BootGuard {
     private static final char BOOT_SEP = ':';
     private static final String BOOT_ID_READ = "$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)";
 
+    /** 读 pid 文件并拆出 pgid/boot_id；pgid 必须是 >1 的纯数字，否则视为损坏。 */
+    private static final String READ_PGID =
+            "rec=$(cat " + PID_FILE + " 2>/dev/null); "
+                    + "p=${rec%%" + BOOT_SEP + "*}; b=${rec##*" + BOOT_SEP + "}; "
+                    + "now=" + BOOT_ID_READ + "; "
+                    + "case \"$p\" in ''|*[!0-9]*) p=0 ;; esac; ";
+
     private static final String[] ABORT_MARKERS = {
             "holding zombie",
             "Kernel panic",
@@ -68,7 +75,6 @@ public final class BootGuard {
      * 意味着「这一轮已经结束、没有东西被植入」，可以安全重跑。
      *
      * 刻意不含 "[selinux] attempt "：那一行在链路正常推进时就会出现（attempt 1/6 在开头）。
-     * 后半段几条是上游真实的放弃语句，出现即说明 payload 自己停了，外层不必再等。
      */
     private static final String[] RETRY_MARKERS = {
             "leak failed",
@@ -197,30 +203,40 @@ public final class BootGuard {
                 + "' >/dev/null 2>&1 &";
     }
 
-    /** Signals the recorded process group, but only when the record belongs to the running boot. */
+    /** Signals the recorded process group from the shell identity (only works while still uid=2000). */
     public static String killCommand() {
         return "if [ -s " + PID_FILE + " ]; then "
-                + "rec=$(cat " + PID_FILE + " 2>/dev/null); "
-                + "p=${rec%%" + BOOT_SEP + "*}; b=${rec##*" + BOOT_SEP + "}; "
-                + "now=" + BOOT_ID_READ + "; "
-                + "if [ -n \"$now\" ] && [ \"$b\" = \"$now\" ]; then "
+                + READ_PGID
+                + "if [ \"$b\" = \"$now\" ] && [ \"$p\" -gt 1 ]; then "
                 + "kill -TERM -$p 2>/dev/null; sleep 1; kill -KILL -$p 2>/dev/null; "
                 + "fi; rm -f " + PID_FILE + "; fi; true";
+    }
+
+    /**
+     * 接管成功后收掉临时 rootd。
+     *
+     * 那个进程已经升权到 uid=0，shell 的 kill 会 EPERM；而 unlink socket 并不会终止监听者。
+     * 所以只能借 KernelSU 的 su 按 pgid 发信号，并校验 boot_id 与 pgid 数值。
+     */
+    public static String suKillCommand() {
+        return "if [ -s " + PID_FILE + " ]; then "
+                + READ_PGID
+                + "if [ -n \"$now\" ] && [ \"$b\" = \"$now\" ] && [ \"$p\" -gt 1 ]; then "
+                + "/system/bin/su -c \"kill -TERM -$p 2>/dev/null; sleep 1; kill -KILL -$p 2>/dev/null; true\" 2>/dev/null; "
+                + "fi; rm -f " + PID_FILE + "; "
+                + "echo done; else echo none; fi";
     }
 
     /**
      * Prints 1 when the recorded process group still exists in this boot, 0 otherwise.
      *
      * `kill -0` fails with EPERM for a live process owned by another uid (exactly what an elevated
-     * payload looks like) and with ESRCH when it is really gone. Treating every failure as "alive"
-     * made the early-exit check useless, so the two cases are separated.
+     * payload looks like) and with ESRCH when it is really gone.
      */
     public static String aliveCommand() {
         return "if [ -s " + PID_FILE + " ]; then "
-                + "rec=$(cat " + PID_FILE + " 2>/dev/null); "
-                + "p=${rec%%" + BOOT_SEP + "*}; b=${rec##*" + BOOT_SEP + "}; "
-                + "now=" + BOOT_ID_READ + "; "
-                + "if [ -n \"$now\" ] && [ \"$b\" = \"$now\" ] && [ -n \"$p\" ]; then "
+                + READ_PGID
+                + "if [ \"$b\" = \"$now\" ] && [ \"$p\" -gt 1 ]; then "
                 + "err=$(kill -0 -$p 2>&1); rc=$?; "
                 + "if [ $rc -eq 0 ] || echo \"$err\" | grep -qiE 'permitted|eperm|not owner'; then echo 1; "
                 + "else rm -f " + PID_FILE + "; echo 0; fi; "
