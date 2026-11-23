@@ -45,6 +45,8 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
     private final Object logLock = new Object();
     private final StringBuilder sessionLog = new StringBuilder();
     private final Set<String> payloadLines = new LinkedHashSet<>();
+    /** payload 启动时刻（毫秒），用于给每行输出打相对时间戳。 */
+    private volatile long payloadStartAt;
     private volatile State state = State.IDLE;
     private volatile long startedAt;
     private volatile int currentStep = -1;
@@ -137,6 +139,21 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
         callbacks.onLog(value);
     }
 
+    /** 从 payload 启动算起的秒数，用于给输出行打戳。 */
+    private double payloadElapsed() {
+        long start = payloadStartAt;
+        if (start <= 0L) {
+            return 0.0;
+        }
+        return (System.currentTimeMillis() - start) / 1000.0;
+    }
+
+    /**
+     * 把 payload 的新增输出写进会话日志（去重），每条带相对时间前缀。
+     *
+     * 前缀是这条日志第一次被看到的时刻（轮询 500ms，所以分辨率约 0.5s），
+     * 足以区分「fork+写入慢」和「卡在等待」这两种不同的慢法。
+     */
     private void appendPayloadOutput(String tail) {
         if (tail == null || tail.trim().isEmpty()) {
             return;
@@ -147,7 +164,7 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
                 continue;
             }
             if (payloadLines.add(trimmed)) {
-                append(trimmed);
+                append(String.format(Locale.US, "[t+%5.1fs] %s", payloadElapsed(), trimmed));
             }
         }
     }
@@ -177,6 +194,7 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
                     sessionLog.setLength(0);
                 }
                 payloadLines.clear();
+                payloadStartAt = 0L;
                 callbacks.onState(State.RUNNING, operation);
             } else {
                 callbacks.onStatus("正在诊断");
@@ -225,7 +243,6 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
         String boot = preflight.getOrDefault("BOOT", "");
         applyBaseline(preflight);
 
-        // 已经持有 KernelSU root 时不要再跑 UAF。
         if (rootBeforeRun) {
             clearRunMarker();
             run(BootGuard.clearStageCommand(), true);
@@ -238,8 +255,6 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
             return;
         }
 
-        // 上次已经拿到临时 ROOT（例如停在 KSU_PENDING，或 App 被强退）→ 直接接管。
-        // 同时绕开 hidepid=invisible 下 ps 看不到已提权进程的盲区。
         if (hasUsableTempRoot()) {
             append("[复用] 临时 ROOT 仍可用，跳过部署/测量/提权，直接接管 KernelSU。");
             run(BootGuard.clearFailureCommand(), true);
@@ -334,10 +349,6 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
         runKernelSuStep();
     }
 
-    /**
-     * 临时 ROOT 是否仍可用：socket 在、客户端可执行、且 3 秒内能返回 uid=0。
-     * 只读探测，不会碰内核。
-     */
     private boolean hasUsableTempRoot() {
         try {
             if (!socketExists()) {
@@ -389,10 +400,6 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
         callbacks.onState(state, message);
     }
 
-    /**
-     * KMI 只取「Android 版本 + 内核主次版本」。接管后的状态探测全部塞进同一条命令，
-     * 用 __XX__ 标记回读，省掉 4 次远端进程。
-     */
     private void runKernelSuStep() {
         try {
             step(6);
@@ -436,9 +443,8 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
             selinuxAfterRoot = enf.isEmpty() ? enforceNow() : enf;
             append("[SELinux] 最终实测 " + selinuxAfterRoot);
             if (suOut.contains("uid=0")) {
-                // 临时 rootd 已升权到 uid=0，shell 杀不动；借 su 按 pgid 收掉它。
                 run(BootGuard.suKillCommand(), true);
-                append("[清理] 临时 rootd 已请求收尾（socket 文件 unlink 不会终止监听者，必须按 pgid 发信号）");
+                append("[清理] 临时 rootd 已请求收尾（socket unlink 不会终止监听者，必须按 pgid 发信号）");
                 state = State.COMPLETE;
                 callbacks.onState(State.COMPLETE, "全部完成 · 已接管 · SELinux " + selinuxAfterRoot);
             } else {
@@ -465,7 +471,6 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
         }
     }
 
-    /** ksud 4.9 MB，大小一致就不再走 Binder 管道重传一遍。 */
     private void stageKsudIfNeeded() {
         try {
             CommandResult size = run("stat -c %s " + KSUD_FILE + " 2>/dev/null || echo 0", true);
@@ -531,7 +536,6 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
                 freeKb, reached ? "达标，开跑" : "未达标，仍开跑"));
     }
 
-    /** 同一次开机 KASLR slide 不变，命中缓存就跳过 tracefs 采样。 */
     private String measureAddress(String boot) throws Exception {
         if (boot != null && !boot.isEmpty()) {
             String cached = run("cat " + BootGuard.SLIDE_CACHE_FILE + " 2>/dev/null", true).output.trim();
@@ -548,10 +552,13 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
             }
         }
 
+        long begin = System.currentTimeMillis();
         run(BootGuard.markCommand("probe-slide"), true);
         CommandResult probe = run(BootGuard.withTimeout(SLIDE_PROBE_TIMEOUT_S,
                 "/data/local/tmp/slide_probe"), false);
         append(filterProbe(probe.output));
+        append(String.format(Locale.US, "[耗时] slide_probe %.1fs",
+                (System.currentTimeMillis() - begin) / 1000.0));
         if (probe.exitCode == BootGuard.TIMEOUT_EXIT) {
             append("slide_probe 超过 " + SLIDE_PROBE_TIMEOUT_S + " 秒被 timeout 终止");
         }
@@ -585,6 +592,12 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
         }
     }
 
+    /**
+     * Runs the payload up to three times.
+     *
+     * @return null on success; otherwise a message to show. An empty message means "plain failure"
+     *         (the caller records it), a non-empty one is a fatal condition already recorded here.
+     */
     private String runPayload(String addressArgument, String boot) throws Exception {
         String args = addressArgument == null ? "" : addressArgument.trim();
         if (!args.isEmpty()) {
@@ -593,7 +606,9 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
             append("[payload] 不带地址参数启动（由 payload 自行判定）");
         }
         payloadLines.clear();
+        int misses = 0;
         for (int attempt = 1; attempt <= 3; attempt++) {
+            payloadStartAt = System.currentTimeMillis();
             run("rm -f /data/local/tmp/uaf_replay.log; " + BootGuard.launchCommand(
                     "/data/local/tmp/uaf_plant_replay",
                     args,
@@ -617,16 +632,19 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
                 }
                 BootGuard.Outcome outcome = BootGuard.classify(tail);
                 if (outcome == BootGuard.Outcome.SUCCESS) {
+                    append(String.format(Locale.US, "[耗时] payload 成功，总耗时 %.1fs（本轮第 %d 次尝试，累计未命中 %d 次）",
+                            payloadElapsed(), attempt, misses));
                     return null;
                 }
                 if (outcome == BootGuard.Outcome.ABORT_BOOT) {
                     run(BootGuard.recordFailureCommand(boot, true, false), true);
                     return "payload 报告节点已挂树（holding zombie）· 本次开机禁止重跑，请重启设备";
                 }
-                // 只有确认 rootd 已就绪才去连它：在 [stream]/[cred] 阶段连上等于踩脏堆。
                 if (sockReady || tail.contains("[rootd]")) {
                     CommandResult verify = run(SU_CLIENT + " -c 'id'", true);
                     if (isRoot(verify.output)) {
+                        append(String.format(Locale.US, "[耗时] payload 成功，总耗时 %.1fs（第 %d 次尝试，累计未命中 %d 次）",
+                                payloadElapsed(), attempt, misses));
                         return null;
                     }
                 }
@@ -653,8 +671,10 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
                 recordFailedBoot(boot, false);
                 return "payload 提前退出（未进入提权阶段）· 详见上方输出";
             }
+            misses++;
+            append(String.format(Locale.US, "[重试] 第 %d 次未命中（本轮耗时 %.1fs），重启 payload 再试（%d/3）",
+                    attempt, payloadElapsed(), attempt + 1));
             if (attempt < 3) {
-                append("[重试] 第 " + attempt + " 次未命中，重启 payload 再试（" + (attempt + 1) + "/3）");
                 stopPayload();
                 Thread.sleep(1000L);
             }
@@ -683,7 +703,6 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
             if (!keepRootClient) {
                 run(BootGuard.killCommand(), true);
             }
-            // ksud 保留：4.9 MB 重传代价高，且它不会自动执行任何东西。
             String targets = EXPLOIT_BINARIES
                     + (keepRootClient ? "" : " pc98260-su pc98260-root.sock");
             run("cd /data/local/tmp 2>/dev/null; rm -f " + targets + "; true", true);
@@ -805,7 +824,6 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
         }
     }
 
-    /** 一次 shell 采集全部前置状态，避免 9 次远端进程启动。 */
     private Map<String, String> fetchPreflightSnapshot() throws Exception {
         String cmd = "echo \"UNAME=$(uname -r 2>/dev/null)\"; "
                 + "echo \"BOOT=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)\"; "
