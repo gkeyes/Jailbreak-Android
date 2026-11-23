@@ -81,6 +81,19 @@ public class BootGuardStageTest {
         assertEquals(BootGuard.Outcome.RETRY_SAFE, BootGuard.classify("[uaf] leak failed"));
     }
 
+    /** 上游真正的放弃语句：出现即代表这一轮结束，外层不必再等满 200 轮。 */
+    @Test
+    public void upstreamGiveUpLinesEndTheRound() {
+        assertEquals(BootGuard.Outcome.RETRY_SAFE,
+                BootGuard.classify("[selinux] 3 consecutive misses, stop"));
+        assertEquals(BootGuard.Outcome.RETRY_SAFE,
+                BootGuard.classify("[selinux] 3 hits without effect, stop"));
+        assertEquals(BootGuard.Outcome.RETRY_SAFE,
+                BootGuard.classify("[cred] 6 consecutive misses, stop"));
+        assertEquals(BootGuard.Outcome.RETRY_SAFE,
+                BootGuard.classify("[cred] 3 attempts installed but not rooted, stop"));
+    }
+
     @Test
     public void holdingZombieAbortsTheBoot() {
         assertEquals(BootGuard.Outcome.ABORT_BOOT,
@@ -118,5 +131,26 @@ public class BootGuardStageTest {
         assertTrue(BootGuard.recordFailureCommand("b1", false, true).contains("permissive"));
         assertTrue(BootGuard.recordFailureCommand("b1", false, false).contains("enforcing"));
         assertFalse(BootGuard.recordFailureCommand("", true, true).contains(BootGuard.FAILED_FILE));
+    }
+
+    /**
+     * aliveCommand 必须区分 EPERM（已提权存活）与 ESRCH（已退出），
+     * 且不能回到旧版「kill 失败也 echo 1」的写法，否则提前退出检测形同虚设。
+     */
+    @Test
+    public void aliveCommandDistinguishesEpermFromExit() {
+        String alive = BootGuard.aliveCommand();
+        assertTrue(alive, alive.contains("kill -0"));
+        assertTrue(alive, alive.contains("permitted"));
+        assertTrue(alive, !alive.contains("kill -KILL"));
+    }
+
+    /** 损坏的 pid 文件不能把信号发给当前进程组。 */
+    @Test
+    public void processGroupIsValidatedBeforeSignalling() {
+        assertTrue(BootGuard.killCommand().contains("-gt 1"));
+        assertTrue(BootGuard.aliveCommand().contains("-gt 1"));
+        assertTrue(BootGuard.suKillCommand().contains("-gt 1"));
+        assertTrue(BootGuard.suKillCommand().contains("/system/bin/su"));
     }
 }
