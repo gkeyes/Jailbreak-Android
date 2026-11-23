@@ -1,6 +1,5 @@
 package com.gkeyes.lhasa26;
 
-import android.app.AlertDialog;
 import android.content.ContentValues;
 import android.content.Intent;
 import android.net.Uri;
@@ -29,8 +28,10 @@ import java.util.Locale;
 import rikka.shizuku.Shizuku;
 
 /**
- * Host for the Miuix console. ComponentActivity is required because AbstractComposeView resolves
- * ViewTreeLifecycleOwner and ViewTreeSavedStateRegistryOwner from the view tree.
+ * Host for the Miuix console.
+ *
+ * 确认框与帮助文案统一由 Compose 层（FoldDialogs）负责，宿主只执行动作：
+ * 那里已经弹过一次窗，这里再弹就会出现两个风格不同的确认框。
  */
 public final class ConsoleActivity extends ComponentActivity
         implements WorkflowCallbacks, FoldConsoleView.Listener {
@@ -276,27 +277,11 @@ public final class ConsoleActivity extends ComponentActivity
                         + "; do [ -e \"$f\" ] && rm -f \"$f\"; done; true", "临时文件已清理");
                 break;
             case SOFT_REBOOT:
-                confirm("软重启（重载框架）",
-                        "会停止并重新启动全部 Android 服务：zygote 重新拉起，"
-                                + "Zygisk/LSPosed 因此重新注入。\n屏幕会黑几秒，请勿中断。",
-                        () -> maintenance(SOFT_REBOOT_COMMAND, "已提交框架重启"));
+                // Compose 层已确认过；这里直接执行，避免第二次弹窗。
+                maintenance(SOFT_REBOOT_COMMAND, "已提交框架重启");
                 break;
             case REBOOT:
-                confirm("重启设备", "本次开机取得的临时 ROOT 会失效。", () ->
-                        maintenance("reboot 2>/dev/null || svc power reboot 2>/dev/null", "重启指令已提交"));
-                break;
-            case HELP:
-                new AlertDialog.Builder(this)
-                        .setTitle("使用帮助")
-                        .setMessage("1. 点击主按钮：自动打开 Shizuku 并请求授权\n"
-                                + "2. 接口诊断确认环境\n"
-                                + "3. 一键临时 ROOT：拿到临时 root 后自动接管 KernelSU，无需再点\n"
-                                + "4. 接管会 late-load 内核模块，这是最容易触发重启的一步\n"
-                                + "5. 软重启会重载框架，Zygisk/LSPosed 随之重新注入；\n"
-                                + "   若仍不生效，用内核管理器里热重启模块的动作（会额外重建 lspd/zygiskd）\n"
-                                + "6. 重启后临时 ROOT 失效，需要重新执行")
-                        .setPositiveButton("知道了", null)
-                        .show();
+                maintenance("reboot 2>/dev/null || svc power reboot 2>/dev/null", "重启指令已提交");
                 break;
             case KEEP_ON:
                 keepScreenOn = !keepScreenOn;
@@ -327,15 +312,6 @@ public final class ConsoleActivity extends ComponentActivity
             return;
         }
         toast(done);
-    }
-
-    private void confirm(String title, String message, Runnable action) {
-        new AlertDialog.Builder(this)
-                .setTitle(title)
-                .setMessage(message)
-                .setNegativeButton("取消", null)
-                .setPositiveButton("继续", (dialog, which) -> action.run())
-                .show();
     }
 
     private void exportLog() {
@@ -455,10 +431,6 @@ public final class ConsoleActivity extends ComponentActivity
                     handler.post(ticker);
                     break;
                 case ROOTED:
-                    running = false;
-                    privilege = "临时 ROOT";
-                    handler.removeCallbacks(ticker);
-                    break;
                 case KSU_PENDING:
                     running = false;
                     privilege = "临时 ROOT";
