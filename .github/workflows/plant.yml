@@ -2,9 +2,9 @@ name: plant
 
 # 交叉编译、等价性验证与产物分发。
 #
-# 默认只读。唯一会写仓库的是 publish job（提交信息含 [publish]），且必须
-# 在 compile job 通过之后才会运行；publish 自己也会对将要提交的产物跑一次
-# 等价性检查，避免"检查的是另一份构建"。
+# 省额度：job 级 if 门禁 —— 只有提交信息含 [publish] 或手动触发才真正执行；
+# 被跳过的 job 不计费。publish 必须等 compile 通过，且会对即将提交的产物
+# 再跑一次等价性检查。
 
 on:
   push:
@@ -24,10 +24,15 @@ permissions:
   contents: read
   issues: write
 
+concurrency:
+  group: plant-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   compile:
     name: 编译与等价性验证
     runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[publish]')
     steps:
       - uses: actions/checkout@v4
 
@@ -77,19 +82,6 @@ jobs:
           set -uo pipefail
           python3 tools/equiv.py check-dir "$RUNNER_TEMP/out" 2>&1 | tee "$RUNNER_TEMP/equiv.log"
           exit "${PIPESTATUS[0]}"
-
-      - name: 上传产物
-        if: always()
-        continue-on-error: true
-        uses: actions/upload-artifact@v4
-        with:
-          name: plant-binaries
-          path: |
-            ${{ runner.temp }}/out/*
-            ${{ runner.temp }}/equiv.log
-            ${{ runner.temp }}/compile.log
-          if-no-files-found: ignore
-          retention-days: 3
 
       - name: 失败时把日志写进 issue
         if: failure()
@@ -262,50 +254,3 @@ jobs:
           } > "$body"
           gh issue create --title "ci: publish 失败 ${GITHUB_SHA:0:8}" --body-file "$body" \
             --repo "${{ github.repository }}" || true
-
-  scan:
-    name: 常量扫描
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: 扫描内核立即数
-        run: |
-          python3 - <<'PY'
-          import os, pathlib
-
-          LO, HI = 0xffffff8000000000, 0xffffffff00000000
-          BASE = pathlib.Path("app/src/main/assets")
-          TARGETS = ["uaf_plant_replay", "slide_probe", "pc98260-su", "reach_probe"]
-
-          out = ["# payload 常量扫描", ""]
-          for name in TARGETS:
-              path = BASE / name
-              if not path.exists():
-                  out += ["## " + name, "", "资产不存在。", ""]
-                  continue
-              data = path.read_bytes()
-              hits = {}
-              for off in range(0, len(data) - 8, 4):
-                  value = int.from_bytes(data[off:off + 8], "little")
-                  if LO <= value < HI:
-                      hits[value] = hits.get(value, 0) + 1
-              rows = sorted(hits.items(), key=lambda kv: -kv[1])[:30]
-              out += ["## " + name, "", str(len(data)) + " bytes，立即数 " + str(len(hits)) + " 个。", ""]
-              for value, count in rows:
-                  out.append("| `0x" + format(value, "016x") + "` | " + str(count) + " |")
-              out.append("")
-
-          dest = pathlib.Path(os.environ["RUNNER_TEMP"]) / "analysis-report.md"
-          dest.write_text("\n".join(out) + "\n")
-          print("wrote", dest)
-          PY
-
-      - name: 上传扫描报告
-        continue-on-error: true
-        uses: actions/upload-artifact@v4
-        with:
-          name: payload-analysis
-          path: ${{ runner.temp }}/analysis-report.md
-          if-no-files-found: warn
-          retention-days: 2
