@@ -1,22 +1,38 @@
-import java.util.Properties
-
 plugins {
     id("com.android.application")
 }
 
-/** 读 keystore/keystore.properties；缺文件时返回空表。 */
-fun readSigningProperties(): Map<String, String> {
-    val file = rootProject.file("keystore/keystore.properties")
-    if (!file.exists()) {
-        return emptyMap()
+// Release signing is supplied only by the environment; debug builds need no release key.
+val releaseSigningNames = listOf(
+    "LHASA_KEYSTORE",
+    "LHASA_STORE_PASSWORD",
+    "LHASA_KEY_ALIAS",
+    "LHASA_KEY_PASSWORD",
+)
+val releaseSigningValues = releaseSigningNames.associateWith { System.getenv(it).orEmpty() }
+val releaseKeystoreFile = releaseSigningValues.getValue("LHASA_KEYSTORE")
+    .takeIf { it.isNotBlank() }
+    ?.let { rootProject.file(it).absoluteFile }
+
+val verifyReleaseSigning = tasks.register("verifyReleaseSigning") {
+    group = "verification"
+    description = "Require externally supplied release signing credentials."
+    doLast {
+        val missing = releaseSigningNames.filter { releaseSigningValues.getValue(it).isBlank() }
+        check(missing.isEmpty()) {
+            "Missing release signing environment variables: ${missing.joinToString()}. " +
+                "Release builds require the existing signing key; no fallback is permitted."
+        }
+        check(releaseKeystoreFile?.isFile == true) {
+            "The configured release keystore does not exist or is not a regular file."
+        }
     }
-    val properties = Properties()
-    file.inputStream().use { properties.load(it) }
-    val result = mutableMapOf<String, String>()
-    for (name in properties.stringPropertyNames()) {
-        properties.getProperty(name)?.let { value -> result[name] = value }
+}
+
+tasks.configureEach {
+    if (name in setOf("preReleaseBuild", "packageRelease", "bundleRelease", "assembleRelease")) {
+        dependsOn(verifyReleaseSigning)
     }
-    return result
 }
 
 android {
@@ -36,29 +52,10 @@ android {
 
     signingConfigs {
         create("release") {
-            // 取值顺序：环境变量 → keystore/keystore.properties → 不签名。
-            val stored = readSigningProperties()
-            val keystorePath = System.getenv("LHASA_KEYSTORE")
-                ?: stored["storeFile"]
-                ?: "keystore/lhasa26.jks"
-            val keystoreFile = rootProject.file(keystorePath)
-            val storePass = System.getenv("LHASA_STORE_PASSWORD") ?: stored["storePassword"]
-
-            if (keystoreFile.exists() && !storePass.isNullOrEmpty()) {
-                val keyPass = System.getenv("LHASA_KEY_PASSWORD")
-                    ?: stored["keyPassword"]
-                    ?: storePass
-                storeFile = keystoreFile
-                this.storePassword = storePass
-                this.keyAlias = System.getenv("LHASA_KEY_ALIAS")
-                    ?: stored["keyAlias"]
-                    ?: "lhasa26"
-                this.keyPassword = keyPass
-            } else {
-                logger.lifecycle(
-                    "没有可用的签名材料（keystore 缺失或口令为空），release 构建产出未签名 APK。"
-                )
-            }
+            storeFile = releaseKeystoreFile
+            storePassword = releaseSigningValues.getValue("LHASA_STORE_PASSWORD").takeIf { it.isNotBlank() }
+            keyAlias = releaseSigningValues.getValue("LHASA_KEY_ALIAS").takeIf { it.isNotBlank() }
+            keyPassword = releaseSigningValues.getValue("LHASA_KEY_PASSWORD").takeIf { it.isNotBlank() }
         }
     }
 
@@ -68,11 +65,7 @@ android {
             // 要正式发布时把下面两行改回 true，并确认 proguard-rules.pro 完整。
             isMinifyEnabled = false
             isShrinkResources = false
-            signingConfigs.findByName("release")?.let { signing ->
-                if (signing.storeFile != null) {
-                    signingConfig = signing
-                }
-            }
+            signingConfig = signingConfigs.getByName("release")
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro",
@@ -102,3 +95,4 @@ dependencies {
 
     testImplementation("junit:junit:4.13.2")
 }
+

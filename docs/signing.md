@@ -1,55 +1,58 @@
-# 签名
+# 发布签名
 
-## 一句话
+## 固定签名身份
 
-签名就是 App 的身份：**同一把钥匙 → 能覆盖安装；换钥匙 → 必须卸载重装**。
-所以本项目只维护一把钥匙，不搞轮换、不搞多套 Secret。
+本项目继续使用原来的发布签名钥匙。迁移只改变签名材料的保存与读取方式，不生成新钥匙。
+覆盖升级还需满足 Android 对应用 ID、签名和版本号的校验。
 
-## 现状
+固定发布证书的 SHA-256（公钥证书摘要，可公开）：
 
-| 东西 | 在哪 |
+```text
+3317c15bb094220efb3c61efeb88b7443b3acbe76fcb98566c940ae0a961aa89
+```
+
+## Actions Secrets
+
+| Secret | 内容 |
 |---|---|
-| 钥匙（`lhasa26.jks`，alias `lhasa26`） | git 历史里（工作树已移出，用时恢复） |
-| 口令 / alias | `keystore/keystore.properties`（随仓库走） |
-| 构建取值顺序 | 环境变量 → `keystore.properties` → 不签名 |
+| `LHASA_KEYSTORE_B64` | 原发布 keystore 文件的 base64 内容 |
+| `LHASA_STORE_PASSWORD` | 原 keystore 的存储密码 |
+| `LHASA_KEY_ALIAS` | 原发布私钥的 alias |
+| `LHASA_KEY_PASSWORD` | 原发布私钥的密码 |
 
-CI（`build.yml`）在构建前用 `git show <提交>:keystore/lhasa26.jks` 把它恢复出来再签名；
-本地构建把它放回 `keystore/lhasa26.jks` 就行。
+这些值只保存在 Actions Secrets 或维护者的受保护备份中，不写入源码、日志、issue、构建产物或 Git 历史。
+不在文档中提供私钥、密码及其编码值。
 
-环境变量（`LHASA_KEYSTORE` / `LHASA_STORE_PASSWORD` / `LHASA_KEY_ALIAS` /
-`LHASA_KEY_PASSWORD`）优先级更高，是为了以后若要把口令挪去 Secrets 时**不用改代码**。
+## CI 的签名流程
 
-## 这么做的代价（明确写下来）
+1. 仅从上述四个 Secrets 读取签名材料；缺失任一项立即失败。
+2. 以仅当前用户可读写的权限，将 keystore 解码到 `$RUNNER_TEMP/lhasa26-signing/release.jks`。
+3. 使用配置的存储密码和 alias 导出公钥证书，并核对上述 SHA-256；格式、密码、alias 或证书不符即失败。
+4. 将临时文件路径通过 `LHASA_KEYSTORE` 交给 Gradle；其余三个值通过同名环境变量传入。
+5. Gradle 对 app release 任务检查四个签名环境变量和 keystore 文件；签名密码错误会使签名任务失败。
+6. 对最终 APK 运行 `apksigner verify --print-certs`，要求签名有效且只有预期发布证书的摘要，之后才上传或发布。
+7. 无论任务成功或失败，都清理临时签名文件。
 
-能读这个仓库的人，就能用它签出**可以覆盖安装到你手机上**的包。
-前提是私有仓库、只有本人访问——在这个前提下，把钥匙放一处、口令放一处，
-比在 CI/Secrets/本地三处维护同一份东西更不容易出错。
+CI 不从仓库文件、`keystore.properties` 或旧提交恢复签名，也不在缺失时新建、提交钥匙或发布未签名 APK。
+`main` 与 `next` 使用同一套 Secrets、同一个固定证书摘要。
 
-一旦仓库要公开、或者要多个人协作：
-1. 把 `keystore.properties` 的四个值搬到 Actions Secrets；
-2. 删掉 `keystore.properties`；
-3. 代码不用改动——环境变量会优先命中。
+## 本地构建
 
-## 恢复钥匙的命令
+Debug 构建不需要发布签名材料。构建 release 时，维护者须从受保护的备份取得原 keystore，
+放在仓库外，并在本地进程环境中设置以下四个名称：
 
-```sh
-# 在任意有 git 的机器上
-git clone git@github.com:gkeyes/Lhasa26-Android.git
-cd Lhasa26-Android
-git show 535ee09ab2aa2c9bd8cc6e76b2159f6c4e1cef4e:keystore/lhasa26.jks > keystore/lhasa26.jks
-```
+- `LHASA_KEYSTORE`：原 keystore 文件的绝对路径。
+- `LHASA_STORE_PASSWORD`：原存储密码。
+- `LHASA_KEY_ALIAS`：原 alias。
+- `LHASA_KEY_PASSWORD`：原私钥密码。
 
-手机上也可以在网页打开那次提交的 `keystore/lhasa26.jks` → Raw 下载。
+Gradle 不读取仓库中的签名 properties 文件，也没有默认密码或默认 alias。
+不要把环境变量的实际值写入命令历史、提交、日志或可分享的构建脚本。
+本地 APK 对外提供前，同样使用 `apksigner verify --print-certs` 核对上面的固定证书摘要。
 
-## 校验签名是否还是原来那把
+## 历史材料的清理
 
-```sh
-apksigner verify --print-certs app-release.apk | grep 'SHA-256'
-```
+`.gitignore` 仅阻止新文件被普通方式加入 Git，不能移除已跟踪文件或历史对象。
+私钥和含密码的配置必须从所有拟公开分支及标签中清除；还需单独核实历史 PR 引用、旧提交缓存和旧产物，
+确认 GitHub 不再向公开访问者提供这些签名材料后，才能公开原仓库。
 
-和手机上已装版本的签名摘要一致，就说明能覆盖安装。
-
-## 已知未做
-
-· `lhasa26.jks` 仍在 git 历史里。私有仓库可以接受；要彻底清除需 `git filter-repo`
-重写历史并强推，代价是所有克隆失效，目前不做。

@@ -16,3 +16,14 @@ captures/
 *.part
 plant/*.log
 plant/verify-report.md
+
+# Private release signing material must never enter Git.
+keystore/
+keystore.properties
+*.p12
+*.pfx
+*.key
+*.pem
+.env
+.env.*
+

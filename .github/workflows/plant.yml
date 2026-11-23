@@ -150,20 +150,17 @@ jobs:
           mkdir -p "$RUNNER_TEMP/xring"
           bash tools/build_xring.sh "$RUNNER_TEMP/xring"
 
-      - name: 恢复原件（用于归档基线）
+      - name: 检查已归档的原件基线
         run: |
-          set -e
+          set -euo pipefail
           for name in reach_probe slide_probe pc98260-su uaf_plant_replay; do
-            git show "8c7de4445ed5525c5742c0b3cb35b6b4472b1b4a^:app/src/main/assets/$name" \
-              > "app/src/main/assets/$name"
-            echo "restored $name"
+            if [ ! -s "plant/equiv/$name.json" ]; then
+              echo "::error::缺少已归档的原件基线：plant/equiv/$name.json"
+              exit 1
+            fi
+            python3 -m json.tool "plant/equiv/$name.json" > /dev/null
           done
-
-      - name: 归档原件基线（已存在则跳过）
-        run: |
-          set -e
-          python3 tools/equiv.py baseline
-          ls -l plant/equiv/
+          # 基线来自既有归档；不得用新产物重建原件基线。
 
       - name: 覆盖 assets
         run: |
@@ -254,3 +251,4 @@ jobs:
           } > "$body"
           gh issue create --title "ci: publish 失败 ${GITHUB_SHA:0:8}" --body-file "$body" \
             --repo "${{ github.repository }}" || true
+
