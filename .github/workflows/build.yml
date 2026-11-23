@@ -18,13 +18,13 @@ permissions:
   issues: write
 
 env:
-  LHASA_SIGNING_CERT_SHA256: '3317c15bb094220efb3c61efeb88b7443b3acbe76fcb98566c940ae0a961aa89'
+  LHASA_SIGNING_CERT_SHA256: 'c8a20a023c2ed36ae144327f7f254ff082b965806b4388fc5c55809be81bb7cc'
   KSUSD_SHA256: 4f7d5fd65631915ea579ff406bd9cbe58217f2c91dac6527f5b2f28ad4508171
   KSU_APK_SHA256: b4a059ace71de2fa65cc7f12b1c58d55fc23ab25e057ee4230ce779742abe450
 
 jobs:
   app:
-    if: "!contains(github.event.head_commit.message, 'ci: signed apk ok') && !contains(github.event.head_commit.message, 'ci: build failed')"
+    if: "github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && (!contains(github.event.head_commit.message, 'ci: signed apk ok') && !contains(github.event.head_commit.message, 'ci: build failed'))"
     runs-on: ubuntu-latest
     env:
       LHASA_STORE_PASSWORD: ${{ secrets.LHASA_STORE_PASSWORD }}
@@ -280,4 +280,5 @@ jobs:
           tail -c 20000 design/miuix-console/design.log > /tmp/dfail.log 2>/dev/null || true
           { echo "Console library build, commit \`${GITHUB_SHA:0:8}\`"; echo; echo '```text'; cat /tmp/dfail.log; echo '```'; } > /tmp/dfail.md
           gh issue create --title "design-build failed ${GITHUB_SHA:0:8}" --body-file /tmp/dfail.md
+
 

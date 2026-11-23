@@ -1,3 +1,7 @@
+import java.security.KeyStore
+import java.security.MessageDigest
+import java.security.PrivateKey
+
 plugins {
     id("com.android.application")
 }
@@ -9,6 +13,7 @@ val releaseSigningNames = listOf(
     "LHASA_KEY_ALIAS",
     "LHASA_KEY_PASSWORD",
 )
+val expectedReleaseSignerSha256 = "c8a20a023c2ed36ae144327f7f254ff082b965806b4388fc5c55809be81bb7cc"
 val releaseSigningValues = releaseSigningNames.associateWith { System.getenv(it).orEmpty() }
 val releaseKeystoreFile = releaseSigningValues.getValue("LHASA_KEYSTORE")
     .takeIf { it.isNotBlank() }
@@ -21,10 +26,34 @@ val verifyReleaseSigning = tasks.register("verifyReleaseSigning") {
         val missing = releaseSigningNames.filter { releaseSigningValues.getValue(it).isBlank() }
         check(missing.isEmpty()) {
             "Missing release signing environment variables: ${missing.joinToString()}. " +
-                "Release builds require the existing signing key; no fallback is permitted."
+                "Release builds require the current fixed signing key; no fallback is permitted."
         }
-        check(releaseKeystoreFile?.isFile == true) {
+        val keystoreFile = checkNotNull(releaseKeystoreFile) {
+            "The configured release keystore is missing."
+        }
+        check(keystoreFile.isFile) {
             "The configured release keystore does not exist or is not a regular file."
+        }
+        val storePassword = releaseSigningValues.getValue("LHASA_STORE_PASSWORD").toCharArray()
+        val keyPassword = releaseSigningValues.getValue("LHASA_KEY_PASSWORD").toCharArray()
+        try {
+            val keyStore = KeyStore.getInstance("JKS")
+            keystoreFile.inputStream().use { keyStore.load(it, storePassword) }
+            val alias = releaseSigningValues.getValue("LHASA_KEY_ALIAS")
+            check(keyStore.getKey(alias, keyPassword) is PrivateKey) {
+                "The configured release alias must contain an accessible private key."
+            }
+            val certificate = checkNotNull(keyStore.getCertificate(alias)) {
+                "The configured release alias has no certificate."
+            }
+            val actualSigner = MessageDigest.getInstance("SHA-256").digest(certificate.encoded)
+                .joinToString("") { "%02x".format(it.toInt() and 0xff) }
+            check(actualSigner == expectedReleaseSignerSha256) {
+                "Release signing certificate is retired or unexpected; use the current fixed release key."
+            }
+        } finally {
+            storePassword.fill('\u0000')
+            keyPassword.fill('\u0000')
         }
     }
 }
@@ -85,4 +114,5 @@ dependencies {
     implementation("androidx.activity:activity:1.12.4")
     implementation(project(":design:miuix-console:ui"))
 }
+
 
