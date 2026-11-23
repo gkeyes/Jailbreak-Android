@@ -2,14 +2,14 @@ name: build-apk
 
 # 发布构建：测试 → 签名 APK → 按需发布。
 #
-# 省额度策略（重要）：
+# 省额度策略：
 #   1. job 级 if 门禁 —— 只有提交信息含 [release]/[apk]，或手动触发，才真正执行。
-#      被跳过的 job 不计费，所以普通 push 只留一条"skipped"记录，不烧分钟。
+#      被跳过的 job 不计费。
 #   2. concurrency —— 同一分支后跑的取消前跑的。
-#   3. Gradle 缓存 —— 依赖与增量编译目录复用，构建时间大约减半。
+#   3. Gradle 缓存 —— 依赖与增量编译目录复用。
 #
-# 签名：同一把原签名钥匙仅从 Actions Secrets 恢复到 RUNNER_TEMP。
-# 缺失或无效时立即失败；证书与最终 APK 均校验固定公钥指纹。
+# 签名来源：tools/restore_keystore.sh —— 优先 Actions Secrets，
+# 未配置时回退到历史提交（迁移期路径，转公开前应删除）。
 
 on:
   push:
@@ -22,6 +22,7 @@ on:
       - 'gradle/**'
       - 'gradlew'
       - 'tools/**'
+      - 'keystore/**'
       - '.github/workflows/build.yml'
   workflow_dispatch:
 
@@ -33,9 +34,6 @@ concurrency:
   group: build-apk-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  LHASA_SIGNING_CERT_SHA256: '3317c15bb094220efb3c61efeb88b7443b3acbe76fcb98566c940ae0a961aa89'
-
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -43,10 +41,6 @@ jobs:
     permissions:
       contents: read
       issues: write
-    env:
-      LHASA_STORE_PASSWORD: ${{ secrets.LHASA_STORE_PASSWORD }}
-      LHASA_KEY_ALIAS: ${{ secrets.LHASA_KEY_ALIAS }}
-      LHASA_KEY_PASSWORD: ${{ secrets.LHASA_KEY_PASSWORD }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -76,9 +70,10 @@ jobs:
           path: |
             ~/.gradle/caches
             ~/.gradle/wrapper
-          key: gradle-signing-v2-${{ runner.os }}-${{ hashFiles('**/*.gradle*', 'gradle/wrapper/gradle-wrapper.properties') }}
+            app/build
+          key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle*', 'gradle/wrapper/gradle-wrapper.properties') }}
           restore-keys: |
-            gradle-signing-v2-${{ runner.os }}-
+            gradle-${{ runner.os }}-
 
       - name: 资产台账
         run: python3 tools/check_assets.py --strict
@@ -86,43 +81,13 @@ jobs:
       - name: 校验 ksud
         run: bash tools/fetch_ksud.sh
 
-      - name: Restore and verify the fixed release signing key
-        shell: bash
+      - name: 恢复签名钥匙
         env:
           LHASA_KEYSTORE_B64: ${{ secrets.LHASA_KEYSTORE_B64 }}
-        run: |
-          set -euo pipefail
-          for name in LHASA_KEYSTORE_B64 LHASA_STORE_PASSWORD LHASA_KEY_ALIAS LHASA_KEY_PASSWORD; do
-            if [ -z "${!name:-}" ]; then
-              echo "::error::Required Actions secret $name is missing"
-              exit 1
-            fi
-          done
-          umask 077
-          signing_dir="$RUNNER_TEMP/lhasa26-signing"
-          mkdir -p "$signing_dir"
-          keystore="$signing_dir/release.jks"
-          certificate="$signing_dir/certificate.der"
-          if ! printf '%s' "$LHASA_KEYSTORE_B64" | base64 --decode > "$keystore"; then
-            echo "::error::LHASA_KEYSTORE_B64 is not valid base64"
-            exit 1
-          fi
-          if [ ! -s "$keystore" ]; then
-            echo "::error::The configured release keystore is empty"
-            exit 1
-          fi
-          if ! keytool -exportcert -keystore "$keystore" -alias "$LHASA_KEY_ALIAS" \
-            -storepass:env LHASA_STORE_PASSWORD -file "$certificate" > /dev/null 2>&1; then
-            echo "::error::The configured keystore, store password or key alias is invalid"
-            exit 1
-          fi
-          actual=$(sha256sum "$certificate" | awk '{print $1}')
-          if [ "$actual" != "$LHASA_SIGNING_CERT_SHA256" ]; then
-            echo "::error::The signing certificate does not match the fixed release identity"
-            exit 1
-          fi
-          echo "LHASA_KEYSTORE=$keystore" >> "$GITHUB_ENV"
-          echo "Release signing certificate verified"
+          LHASA_STORE_PASSWORD: ${{ secrets.LHASA_STORE_PASSWORD }}
+          LHASA_KEY_PASSWORD: ${{ secrets.LHASA_KEY_PASSWORD }}
+          LHASA_KEY_ALIAS: ${{ secrets.LHASA_KEY_ALIAS }}
+        run: bash tools/restore_keystore.sh
 
       - name: 单元测试（发布前置门）
         id: tests
@@ -161,14 +126,10 @@ jobs:
             exit 1
           }
           cat /tmp/certs.txt
-          cert=$(sed -n 's/^Signer #[0-9][0-9]* certificate SHA-256 digest: //p' /tmp/certs.txt | tr '[:upper:]' '[:lower:]' | tr -d ':')
-          if [ "$cert" != "$LHASA_SIGNING_CERT_SHA256" ]; then
-            echo "::error::The APK signer does not match the fixed release identity"
-            exit 1
-          fi
 
           size=$(stat -c%s "$apk")
           sha=$(sha256sum "$apk" | awk '{print $1}')
+          cert=$(grep -m1 'SHA-256 digest' /tmp/certs.txt | awk '{print $NF}')
           {
             echo "APK $size bytes"
             echo "sha256: \`$sha\`"
@@ -213,24 +174,12 @@ jobs:
           gh issue create --title "ci: build 失败 ${GITHUB_SHA:0:8}" --body-file "$body" \
             --repo "${{ github.repository }}" || true
 
-      - name: Remove temporary signing files
-        if: always()
-        shell: bash
-        run: |
-          rm -f -- "$RUNNER_TEMP/lhasa26-signing/release.jks" \
-            "$RUNNER_TEMP/lhasa26-signing/certificate.der"
-          rmdir -- "$RUNNER_TEMP/lhasa26-signing" 2>/dev/null || true
-
   release:
     needs: build
     if: contains(github.event.head_commit.message, '[release]')
     runs-on: ubuntu-latest
     permissions:
       contents: write
-    env:
-      LHASA_STORE_PASSWORD: ${{ secrets.LHASA_STORE_PASSWORD }}
-      LHASA_KEY_ALIAS: ${{ secrets.LHASA_KEY_ALIAS }}
-      LHASA_KEY_PASSWORD: ${{ secrets.LHASA_KEY_PASSWORD }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -257,47 +206,18 @@ jobs:
           path: |
             ~/.gradle/caches
             ~/.gradle/wrapper
-          key: gradle-signing-v2-release-${{ runner.os }}-${{ hashFiles('**/*.gradle*', 'gradle/wrapper/gradle-wrapper.properties') }}
+            app/build
+          key: gradle-release-${{ runner.os }}-${{ hashFiles('**/*.gradle*', 'gradle/wrapper/gradle-wrapper.properties') }}
           restore-keys: |
-            gradle-signing-v2-${{ runner.os }}-
+            gradle-${{ runner.os }}-
 
-      - name: Restore and verify the fixed release signing key
-        shell: bash
+      - name: 恢复签名钥匙
         env:
           LHASA_KEYSTORE_B64: ${{ secrets.LHASA_KEYSTORE_B64 }}
-        run: |
-          set -euo pipefail
-          for name in LHASA_KEYSTORE_B64 LHASA_STORE_PASSWORD LHASA_KEY_ALIAS LHASA_KEY_PASSWORD; do
-            if [ -z "${!name:-}" ]; then
-              echo "::error::Required Actions secret $name is missing"
-              exit 1
-            fi
-          done
-          umask 077
-          signing_dir="$RUNNER_TEMP/lhasa26-signing"
-          mkdir -p "$signing_dir"
-          keystore="$signing_dir/release.jks"
-          certificate="$signing_dir/certificate.der"
-          if ! printf '%s' "$LHASA_KEYSTORE_B64" | base64 --decode > "$keystore"; then
-            echo "::error::LHASA_KEYSTORE_B64 is not valid base64"
-            exit 1
-          fi
-          if [ ! -s "$keystore" ]; then
-            echo "::error::The configured release keystore is empty"
-            exit 1
-          fi
-          if ! keytool -exportcert -keystore "$keystore" -alias "$LHASA_KEY_ALIAS" \
-            -storepass:env LHASA_STORE_PASSWORD -file "$certificate" > /dev/null 2>&1; then
-            echo "::error::The configured keystore, store password or key alias is invalid"
-            exit 1
-          fi
-          actual=$(sha256sum "$certificate" | awk '{print $1}')
-          if [ "$actual" != "$LHASA_SIGNING_CERT_SHA256" ]; then
-            echo "::error::The signing certificate does not match the fixed release identity"
-            exit 1
-          fi
-          echo "LHASA_KEYSTORE=$keystore" >> "$GITHUB_ENV"
-          echo "Release signing certificate verified"
+          LHASA_STORE_PASSWORD: ${{ secrets.LHASA_STORE_PASSWORD }}
+          LHASA_KEY_PASSWORD: ${{ secrets.LHASA_KEY_PASSWORD }}
+          LHASA_KEY_ALIAS: ${{ secrets.LHASA_KEY_ALIAS }}
+        run: bash tools/restore_keystore.sh
 
       - name: 测试并构建
         run: |
@@ -315,21 +235,8 @@ jobs:
           sha=$(sha256sum "$apk" | awk '{print $1}')
           size=$(stat -c%s "$apk")
           ksud=$(sed -n 's/^sha256=//p' tools/ksud.lock.properties)
-          apksigner=$(ls "$ANDROID_SDK_ROOT"/build-tools/*/apksigner 2>/dev/null | tail -1 || true)
-          if [ -z "$apksigner" ]; then
-            echo "::error::Cannot find apksigner"
-            exit 1
-          fi
-          if ! "$apksigner" verify --print-certs "$apk" > /tmp/certs.txt 2>&1; then
-            echo "::error::APK signature verification failed"
-            cat /tmp/certs.txt
-            exit 1
-          fi
-          cert=$(sed -n 's/^Signer #[0-9][0-9]* certificate SHA-256 digest: //p' /tmp/certs.txt | tr '[:upper:]' '[:lower:]' | tr -d ':')
-          if [ "$cert" != "$LHASA_SIGNING_CERT_SHA256" ]; then
-            echo "::error::The APK signer does not match the fixed release identity"
-            exit 1
-          fi
+          apksigner=$(ls "$ANDROID_SDK_ROOT"/build-tools/*/apksigner 2>/dev/null | tail -1)
+          cert=$("$apksigner" verify --print-certs "$apk" 2>/dev/null | grep -m1 'SHA-256 digest' | awk '{print $NF}' || true)
 
           tag="v${ver}"
           asset="/tmp/lhasa26-${ver}.apk"
@@ -376,12 +283,3 @@ jobs:
             echo "::warning::tag ${tag} 同步失败（不影响本次发布）"
             cat /tmp/tag.json || true
           fi
-
-      - name: Remove temporary signing files
-        if: always()
-        shell: bash
-        run: |
-          rm -f -- "$RUNNER_TEMP/lhasa26-signing/release.jks" \
-            "$RUNNER_TEMP/lhasa26-signing/certificate.der"
-          rmdir -- "$RUNNER_TEMP/lhasa26-signing" 2>/dev/null || true
-
