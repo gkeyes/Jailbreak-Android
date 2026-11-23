@@ -26,8 +26,10 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
     private static final long IDLE_AVAILABLE_KB = 1500000L;
     private static final long CLEAN_SKIP_AVAILABLE_KB = 3000000L;
     private static final long DEPLOY_TIMEOUT_MS = 8000L;
+    private static final int TEMP_ROOT_PROBE_TIMEOUT_S = 3;
     private static final String RUN_MARKER = "/data/local/tmp/.lhasa_run";
     private static final String ROOTD_SOCKET = "/data/local/tmp/pc98260-root.sock";
+    private static final String SU_CLIENT = "/data/local/tmp/pc98260-su";
     private static final String KSUD_FILE = "/data/local/tmp/ksud";
     private static final String EXPLOIT_BINARIES = "uaf_plant_replay slide_probe reach_probe";
     private static final int SLIDE_PROBE_TIMEOUT_S = 12;
@@ -42,7 +44,6 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
     });
     private final Object logLock = new Object();
     private final StringBuilder sessionLog = new StringBuilder();
-    /** payload 输出去重：同一条日志行只进 sessionLog 一次。 */
     private final Set<String> payloadLines = new LinkedHashSet<>();
     private volatile State state = State.IDLE;
     private volatile long startedAt;
@@ -224,7 +225,7 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
         String boot = preflight.getOrDefault("BOOT", "");
         applyBaseline(preflight);
 
-        // 已经持有 KernelSU root 时不要再跑 UAF：内核模块已加载，堆状态与 exploit 假设不同。
+        // 已经持有 KernelSU root 时不要再跑 UAF。
         if (rootBeforeRun) {
             clearRunMarker();
             run(BootGuard.clearStageCommand(), true);
@@ -234,6 +235,19 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
             append("[跳过] 不再执行 UAF 提权；如需重新验证请先重启设备。");
             callbacks.onState(State.COMPLETE,
                     "已由 KernelSU 接管 · 无需执行 · SELinux " + selinuxAfterRoot);
+            return;
+        }
+
+        // 上次已经拿到临时 ROOT（例如停在 KSU_PENDING，或 App 被强退）→ 直接接管。
+        // 同时绕开 hidepid=invisible 下 ps 看不到已提权进程的盲区。
+        if (hasUsableTempRoot()) {
+            append("[复用] 临时 ROOT 仍可用，跳过部署/测量/提权，直接接管 KernelSU。");
+            run(BootGuard.clearFailureCommand(), true);
+            clearRunMarker();
+            state = State.ROOTED;
+            selinuxAfterRoot = enforceNow();
+            callbacks.onState(State.ROOTED, "复用已有临时 ROOT · 正在接管 KernelSU");
+            runKernelSuStep();
             return;
         }
 
@@ -299,7 +313,7 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
 
         step(5);
         status("验证");
-        CommandResult verify = run("/data/local/tmp/pc98260-su -c 'id; getenforce; grep CapEff /proc/self/status'", false);
+        CommandResult verify = run(SU_CLIENT + " -c 'id; getenforce; grep CapEff /proc/self/status'", false);
         append(verify.output);
         if (!isRoot(verify.output)) {
             recordFailedBoot(boot, false);
@@ -308,7 +322,6 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
         run(BootGuard.clearFailureCommand(), true);
         clearRunMarker();
         run(BootGuard.clearStageCommand(), true);
-        // 保持 state=ROOTED：若接管失败仍可由 retryKernelSu() 恢复。
         state = State.ROOTED;
         selinuxAfterRoot = enforceNow();
         callbacks.onStatus("已获得临时 ROOT · SELinux " + selinuxAfterRoot);
@@ -319,6 +332,26 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
                 (System.currentTimeMillis() - chainStart) / 1000.0));
         append("[下一步] 自动接管 KernelSU（会加载内核模块，可能重启）。");
         runKernelSuStep();
+    }
+
+    /**
+     * 临时 ROOT 是否仍可用：socket 在、客户端可执行、且 3 秒内能返回 uid=0。
+     * 只读探测，不会碰内核。
+     */
+    private boolean hasUsableTempRoot() {
+        try {
+            if (!socketExists()) {
+                return false;
+            }
+            if (!"yes".equals(run("test -x " + SU_CLIENT + " && echo yes || echo no", true).output.trim())) {
+                return false;
+            }
+            CommandResult probe = run(BootGuard.withTimeout(TEMP_ROOT_PROBE_TIMEOUT_S,
+                    SU_CLIENT + " -c 'id'"), true);
+            return isRoot(probe.output);
+        } catch (Exception ignored) {
+            return false;
+        }
     }
 
     private void runDiagnosis() throws Exception {
@@ -357,8 +390,8 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
     }
 
     /**
-     * KMI 只取「Android 版本 + 内核主次版本」：本机 release 字符串里两者都在。
-     * 接管后的状态探测全部塞进同一条命令，用 __XX__ 标记回读，省掉 4 次远端进程。
+     * KMI 只取「Android 版本 + 内核主次版本」。接管后的状态探测全部塞进同一条命令，
+     * 用 __XX__ 标记回读，省掉 4 次远端进程。
      */
     private void runKernelSuStep() {
         try {
@@ -372,7 +405,7 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
                     + "k=$(echo \"$r\" | cut -d. -f1,2); "
                     + "kmi=\"${a:-android17}-${k:-6.18}\"; "
                     + "echo \"kmi=$kmi (from $r)\" >> /data/local/tmp/ksu_try.log; "
-                    + "/data/local/tmp/pc98260-su -c \"cd /data/local/tmp && ./ksud late-load --kmi $kmi --allow-shell --package-name me.weishu.kernelsu\" "
+                    + SU_CLIENT + " -c \"cd /data/local/tmp && ./ksud late-load --kmi $kmi --allow-shell --package-name me.weishu.kernelsu\" "
                     + ">> /data/local/tmp/ksu_try.log 2>&1; echo rc=$? >> /data/local/tmp/ksu_try.log; "
                     + "su_out=\"\"; "
                     + "for i in 1 2 3 4 5 6 7 8 9 10; do "
@@ -403,6 +436,9 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
             selinuxAfterRoot = enf.isEmpty() ? enforceNow() : enf;
             append("[SELinux] 最终实测 " + selinuxAfterRoot);
             if (suOut.contains("uid=0")) {
+                // 临时 rootd 已升权到 uid=0，shell 杀不动；借 su 按 pgid 收掉它。
+                run(BootGuard.suKillCommand(), true);
+                append("[清理] 临时 rootd 已请求收尾（socket 文件 unlink 不会终止监听者，必须按 pgid 发信号）");
                 state = State.COMPLETE;
                 callbacks.onState(State.COMPLETE, "全部完成 · 已接管 · SELinux " + selinuxAfterRoot);
             } else {
@@ -534,7 +570,7 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
         }
 
         append("[测量] slide_probe 未给出可用地址（输出里没有 slide=/site=）");
-        append("[测量] 改为不带参数运行，让 uaf_plant_replay 用 lhasa_profile.txt 自行判定。");
+        append("[测量] 改为不带参数运行，让 uaf_plant_replay 用 profile 自行判定。");
         return "";
     }
 
@@ -549,12 +585,6 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
         }
     }
 
-    /**
-     * Runs the payload up to three times.
-     *
-     * @return null on success; otherwise a message to show. An empty message means "plain failure"
-     *         (the caller records it), a non-empty one is a fatal condition already recorded here.
-     */
     private String runPayload(String addressArgument, String boot) throws Exception {
         String args = addressArgument == null ? "" : addressArgument.trim();
         if (!args.isEmpty()) {
@@ -595,7 +625,7 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
                 }
                 // 只有确认 rootd 已就绪才去连它：在 [stream]/[cred] 阶段连上等于踩脏堆。
                 if (sockReady || tail.contains("[rootd]")) {
-                    CommandResult verify = run("/data/local/tmp/pc98260-su -c 'id'", true);
+                    CommandResult verify = run(SU_CLIENT + " -c 'id'", true);
                     if (isRoot(verify.output)) {
                         return null;
                     }
@@ -629,7 +659,7 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
                 Thread.sleep(1000L);
             }
         }
-        return isRoot(run("/data/local/tmp/pc98260-su -c 'id'", true).output) ? null : "";
+        return isRoot(run(SU_CLIENT + " -c 'id'", true).output) ? null : "";
     }
 
     private boolean socketExists() throws Exception {
