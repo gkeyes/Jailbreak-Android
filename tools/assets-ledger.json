@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "updatedAt": "2026-11-22",
+  "updatedAt": "2026-11-23",
   "project": "Lhasa26-Android",
   "scope": "app/src/main/assets/",
   "rule": "凡是会被打进 APK 的文件都必须在此登记。未登记文件由 tools/check_assets.py 报警（--strict 下为失败）。",
@@ -26,7 +26,7 @@
       },
       "license": "GPL-3.0",
       "inApk": true,
-      "usedBy": "core/WorkflowEngine.java — KernelSU 接管步骤按需投放，不在 AssetDeployer.RUNTIME_ASSETS 预置清单里",
+      "usedBy": "core/WorkflowEngine.runKernelSuStep() — 按需投放；设备上已有同尺寸文件时跳过 4.9 MB 重传",
       "status": "pinned",
       "action": "保持；由 tools/fetch_ksud.sh 按 tools/ksud.lock.properties 从上游重建，仓库不再是唯一副本"
     },
@@ -34,24 +34,24 @@
       "name": "uaf_plant_replay",
       "path": "app/src/main/assets/uaf_plant_replay",
       "size": 99048,
-      "gitBlobSha1": "de95b39544b6b0ca10e6bdc919b7de8868fca133",
-      "sha256": "d854aa21b4a367145a0f77454de9090f1110c09befd2cc6ab2dd34ff78f591ee",
+      "gitBlobSha1": "4e8fa96f280c832dc185818c9dda6bf15f280165",
+      "sha256": "e7ddb4723c2698ab022843e5597f0599f35c1c49ade80014c73a632daa2eb74b",
       "origin": "upstream-source",
-      "sourceDraft": "Lw5959/xring-cve-2026-98260@8b404774/src/exploit-android-perf.c",
+      "sourceDraft": "Lw5959/xring-cve-2026-98260@8b404774/src/xring_plant_realcred.c + src/pc98260_rootd.c",
       "license": "MIT",
       "inApk": true,
-      "usedBy": "core/AssetDeployer.RUNTIME_ASSETS（主利用：POSIX CPU timer UAF → cred 植入 → rootd）",
+      "usedBy": "core/AssetDeployer.RUNTIME_ASSETS（主利用：POSIX CPU timer UAF → cred 植入 → rootd 常驻）",
       "status": "upstream-built",
-      "action": "2026-11-22 由上游 MIT 源码编译后替换（tools/xring.lock.properties）",
+      "action": "由上游 MIT 源码交叉编译后替换（tools/build_xring.sh；profile 表由 gen_xr_profiles.py 生成）",
       "contract": {
         "cli": [
           "--slide",
-          "--site",
-          "--timer"
+          "--task-only",
+          "--selinux-only",
+          "--kptr-test"
         ],
         "logFile": "/data/local/tmp/uaf_replay.log",
         "socket": "/data/local/tmp/pc98260-root.sock",
-        "profile": "/data/local/tmp/lhasa_profile.txt",
         "stages": [
           "stream",
           "uaf",
@@ -70,7 +70,7 @@
       "origin": "rebuilt-from-source",
       "sourceDraft": "plant/reach_probe.c",
       "inApk": true,
-      "usedBy": "core/AssetDeployer.RUNTIME_ASSETS（接口可达性诊断）",
+      "usedBy": "core/WorkflowEngine.runDiagnosis() — 仅诊断时按需投放，不在预部署清单里",
       "status": "rebuilt",
       "action": "2026-11-22 由 plant/reach_probe.c 交叉编译后替换"
     },
@@ -78,29 +78,29 @@
       "name": "slide_probe",
       "path": "app/src/main/assets/slide_probe",
       "size": 43448,
-      "gitBlobSha1": "afe1fc9da5c67456d633548c73f632a2663059a9",
-      "sha256": "86cf24faadcbf18a48fc0069336e5e9e03341f9eade24a4f7f14066bc0dd4e60",
+      "gitBlobSha1": "09742d64ce2a94de40f5199ee3b0deb578abfe32",
+      "sha256": "8b3681cbd2966eefe5a800b8964e58253ff338b37bffe997b4d891933c8c9e3c",
       "origin": "upstream-source",
       "sourceDraft": "Lw5959/xring-cve-2026-98260@8b404774/src/xr98260_slide_probe.c",
       "license": "MIT",
       "inApk": true,
-      "usedBy": "core/AssetDeployer.RUNTIME_ASSETS（tracefs 二进制记录扫描求 KASLR slide）",
+      "usedBy": "core/AssetDeployer.RUNTIME_ASSETS（tracefs 二进制记录扫描求 KASLR slide；同开机结果缓存在 .lhasa_slide）",
       "status": "upstream-built",
-      "action": "2026-11-22 由上游 MIT 源码编译后替换（tools/xring.lock.properties）"
+      "action": "由上游 MIT 源码交叉编译后替换"
     },
     {
       "name": "pc98260-su",
       "path": "app/src/main/assets/pc98260-su",
       "size": 25512,
-      "gitBlobSha1": "2f90262d302e69155011bf87676c159b77a6fa4e",
-      "sha256": "b1e89658ee5a40214960830f4404ebe6ef7d64e1c9aa3857ee58eb58f98105f3",
+      "gitBlobSha1": "99f2323ab4af1d6798567c1fb07c86f3b04f9a88",
+      "sha256": "231cf185d2808b66c9fd7cc45c00ab5a0fa4b7fa588f96e06587af8ee390fdd2",
       "origin": "upstream-source",
       "sourceDraft": "Lw5959/xring-cve-2026-98260@8b404774/src/pc98260_su.c",
       "license": "MIT",
       "inApk": true,
-      "usedBy": "core/AssetDeployer.RUNTIME_ASSETS（连 rootd 执行命令，uint32 长度前缀协议）",
+      "usedBy": "core/AssetDeployer.RUNTIME_ASSETS（连 rootd 执行命令，uint32 长度前缀协议；KSU 接管也走它）",
       "status": "upstream-built",
-      "action": "2026-11-22 由上游 MIT 源码编译后替换（tools/xring.lock.properties）"
+      "action": "由上游 MIT 源码交叉编译后替换"
     },
     {
       "name": "lhasa_profile.txt",
@@ -111,9 +111,8 @@
       "origin": "in-repo-data",
       "sourceDraft": null,
       "inApk": true,
-      "usedBy": "core/AssetDeployer.RUNTIME_ASSETS（内核链接期常量表，覆盖 3 个 OTA）",
+      "usedBy": "构建期输入：tools/gen_xr_profiles.py 用它生成 xr98260_profiles.c 并编进上游产物；运行期不再部署",
       "status": "data",
-      "action": "保持；导出日志已由 LogRedactor 脱敏"
-    }
+      "action": "OTA 换内核时只需在此追加一行 release=..."}
   ]
 }
