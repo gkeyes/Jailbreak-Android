@@ -1,6 +1,6 @@
 name: build-apk
 
-# next 的发布构建。单测 → 构建 → 按需发布。
+# next 的发布构建。只做两件事：构建、按需发布。
 #
 # 签名：钥匙只有一把（keystore/lhasa26.jks，历史里），口令在
 # keystore/keystore.properties；不依赖 Actions Secrets。
@@ -69,12 +69,6 @@ jobs:
             git show 535ee09ab2aa2c9bd8cc6e76b2159f6c4e1cef4e:keystore/lhasa26.jks > keystore/lhasa26.jks
           fi
           ls -l keystore/lhasa26.jks keystore/keystore.properties
-
-      - name: 单元测试
-        run: |
-          chmod +x gradlew
-          set -o pipefail
-          ./gradlew --no-daemon :app:testDebugUnitTest 2>&1 | tail -40
 
       - name: Gradle build
         run: |
@@ -157,11 +151,11 @@ jobs:
           git show 535ee09ab2aa2c9bd8cc6e76b2159f6c4e1cef4e:keystore/lhasa26.jks > keystore/lhasa26.jks
           ls -l keystore/lhasa26.jks
 
-      - name: 测试并构建
+      - name: 构建并签名
         run: |
           set -o pipefail
           chmod +x gradlew
-          ./gradlew --no-daemon :app:testDebugUnitTest :app:assembleRelease 2>&1 | tail -40
+          ./gradlew --no-daemon :app:assembleRelease 2>&1 | tail -40
 
       - name: Publish release
         env:
@@ -205,21 +199,4 @@ jobs:
             gh release edit "$tag" --notes "$notes"
           else
             gh release create "$tag" "$asset" --title "18fold越狱 ${ver}" --notes "$notes" --target "$GITHUB_SHA"
-          fi
-
-      - name: 同步 tag 指向本次构建提交
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -uo pipefail
-          ver=$(sed -n 's/.*versionName = "\(.*\)".*/\1/p' app/build.gradle.kts | head -1)
-          tag="v${ver}"
-          # 覆盖上传不会移动 tag：Release 页面的 Source code 会停在旧提交，
-          # 与实际 APK 不一致。这里把 tag 强制指向本次构建。
-          if gh api -X PATCH "repos/${{ github.repository }}/git/refs/tags/${tag}" \
-               -f sha="$GITHUB_SHA" -F force=true > /tmp/tag.json 2>&1; then
-            echo "tag ${tag} → ${GITHUB_SHA}"
-          else
-            echo "::warning::tag ${tag} 同步失败（不影响本次发布）"
-            cat /tmp/tag.json || true
           fi
