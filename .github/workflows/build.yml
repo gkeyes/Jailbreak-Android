@@ -18,9 +18,7 @@ permissions:
   issues: write
 
 env:
-  LHASA_STORE_PASSWORD: lhasa26pass
-  LHASA_KEY_ALIAS: lhasa26
-  LHASA_KEY_PASSWORD: lhasa26pass
+  LHASA_SIGNING_CERT_SHA256: '3317c15bb094220efb3c61efeb88b7443b3acbe76fcb98566c940ae0a961aa89'
   KSUSD_SHA256: 4f7d5fd65631915ea579ff406bd9cbe58217f2c91dac6527f5b2f28ad4508171
   KSU_APK_SHA256: b4a059ace71de2fa65cc7f12b1c58d55fc23ab25e057ee4230ce779742abe450
 
@@ -28,6 +26,10 @@ jobs:
   app:
     if: "!contains(github.event.head_commit.message, 'ci: signed apk ok') && !contains(github.event.head_commit.message, 'ci: build failed')"
     runs-on: ubuntu-latest
+    env:
+      LHASA_STORE_PASSWORD: ${{ secrets.LHASA_STORE_PASSWORD }}
+      LHASA_KEY_ALIAS: ${{ secrets.LHASA_KEY_ALIAS }}
+      LHASA_KEY_PASSWORD: ${{ secrets.LHASA_KEY_PASSWORD }}
     steps:
       - uses: actions/checkout@v4
 
@@ -62,28 +64,50 @@ jobs:
           git commit -m "ci: restore truncated ksud asset (sha256=$KSUSD_SHA256)"
           git push
 
-      - name: Ensure fixed signing key
-        run: |
-          set -e
-          if [ ! -f keystore/lhasa26.jks ]; then
-            mkdir -p keystore
-            keytool -genkeypair -v -keystore keystore/lhasa26.jks -alias "$LHASA_KEY_ALIAS" \
-              -keyalg RSA -keysize 2048 -validity 10000 \
-              -storepass "$LHASA_STORE_PASSWORD" -keypass "$LHASA_KEY_PASSWORD" \
-              -dname "CN=Lhasa26-Android, OU=local, O=local, C=CN" >> ci.log 2>&1
-            git config user.name "lhasa-ci"
-            git config user.email "lhasa-ci@users.noreply.github.com"
-            git add -f keystore/lhasa26.jks
-            git commit -m "ci: add fixed release signing key"
-            git push
-          fi
-          keytool -list -v -keystore keystore/lhasa26.jks -alias "$LHASA_KEY_ALIAS" \
-            -storepass "$LHASA_STORE_PASSWORD" 2>/dev/null | grep -m1 'SHA256:' >> ci.log || true
+
 
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
+
+      - name: Restore and verify the fixed release signing key
+        shell: bash
+        env:
+          LHASA_KEYSTORE_B64: ${{ secrets.LHASA_KEYSTORE_B64 }}
+        run: |
+          set -euo pipefail
+          for name in LHASA_KEYSTORE_B64 LHASA_STORE_PASSWORD LHASA_KEY_ALIAS LHASA_KEY_PASSWORD; do
+            if [ -z "${!name:-}" ]; then
+              echo "::error::Required Actions secret $name is missing"
+              exit 1
+            fi
+          done
+          umask 077
+          signing_dir="$RUNNER_TEMP/lhasa26-signing"
+          mkdir -p "$signing_dir"
+          keystore="$signing_dir/release.jks"
+          certificate="$signing_dir/certificate.der"
+          if ! printf '%s' "$LHASA_KEYSTORE_B64" | base64 --decode > "$keystore"; then
+            echo "::error::LHASA_KEYSTORE_B64 is not valid base64"
+            exit 1
+          fi
+          if [ ! -s "$keystore" ]; then
+            echo "::error::The configured release keystore is empty"
+            exit 1
+          fi
+          if ! keytool -exportcert -keystore "$keystore" -alias "$LHASA_KEY_ALIAS" \
+            -storepass:env LHASA_STORE_PASSWORD -file "$certificate" > /dev/null 2>&1; then
+            echo "::error::The configured keystore, store password or key alias is invalid"
+            exit 1
+          fi
+          actual=$(sha256sum "$certificate" | awk '{print $1}')
+          if [ "$actual" != "$LHASA_SIGNING_CERT_SHA256" ]; then
+            echo "::error::The signing certificate does not match the fixed release identity"
+            exit 1
+          fi
+          echo "LHASA_KEYSTORE=$keystore" >> "$GITHUB_ENV"
+          echo "Release signing certificate verified"
 
       - name: Prepare SDK
         run: |
@@ -105,17 +129,30 @@ jobs:
           ./gradlew --no-daemon :app:assembleRelease 2>&1 | tee -a ci.log
 
       - name: Verify APK
+        shell: bash
         run: |
+          set -euo pipefail
           apk=$(ls app/build/outputs/apk/release/*.apk | head -1)
           unzip -p "$apk" assets/ksud > /tmp/apk-ksud
           echo "$KSUSD_SHA256  /tmp/apk-ksud" | sha256sum -c - >> ci.log
           size=$(stat -c%s "$apk")
-          apksigner=$(ls "$ANDROID_SDK_ROOT"/build-tools/*/apksigner 2>/dev/null | tail -1)
-          if [ -n "$apksigner" ]; then
-            "$apksigner" verify --print-certs "$apk" > /tmp/certs.txt 2>&1 || true
-            cat /tmp/certs.txt >> ci.log
+          apksigner=$(ls "$ANDROID_SDK_ROOT"/build-tools/*/apksigner 2>/dev/null | tail -1 || true)
+          if [ -z "$apksigner" ]; then
+            echo "::error::Cannot find apksigner"
+            exit 1
           fi
-          echo "APK $size bytes"
+          if ! "$apksigner" verify --print-certs "$apk" > /tmp/certs.txt 2>&1; then
+            echo "::error::APK signature verification failed"
+            cat /tmp/certs.txt
+            exit 1
+          fi
+          cat /tmp/certs.txt >> ci.log
+          cert=$(sed -n 's/^Signer #[0-9][0-9]* certificate SHA-256 digest: //p' /tmp/certs.txt | tr '[:upper:]' '[:lower:]' | tr -d ':')
+          if [ "$cert" != "$LHASA_SIGNING_CERT_SHA256" ]; then
+            echo "::error::The APK signer does not match the fixed release identity"
+            exit 1
+          fi
+          echo "APK $size bytes; fixed release signer verified"
 
       - name: Upload APK
         if: success()
@@ -183,6 +220,14 @@ jobs:
           git tag -f "$tag"
           git push origin "refs/tags/$tag" --force
 
+      - name: Remove temporary signing files
+        if: always()
+        shell: bash
+        run: |
+          rm -f -- "$RUNNER_TEMP/lhasa26-signing/release.jks" \
+            "$RUNNER_TEMP/lhasa26-signing/certificate.der"
+          rmdir -- "$RUNNER_TEMP/lhasa26-signing" 2>/dev/null || true
+
   design:
     if: "!contains(github.event.head_commit.message, 'ci: signed apk ok') && !contains(github.event.head_commit.message, 'ci: build failed')"
     runs-on: ubuntu-latest
@@ -235,3 +280,4 @@ jobs:
           tail -c 20000 design/miuix-console/design.log > /tmp/dfail.log 2>/dev/null || true
           { echo "Console library build, commit \`${GITHUB_SHA:0:8}\`"; echo; echo '```text'; cat /tmp/dfail.log; echo '```'; } > /tmp/dfail.md
           gh issue create --title "design-build failed ${GITHUB_SHA:0:8}" --body-file /tmp/dfail.md
+

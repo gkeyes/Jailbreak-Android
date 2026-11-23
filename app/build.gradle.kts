@@ -2,6 +2,39 @@ plugins {
     id("com.android.application")
 }
 
+// Release signing is supplied only by the environment; debug builds need no release key.
+val releaseSigningNames = listOf(
+    "LHASA_KEYSTORE",
+    "LHASA_STORE_PASSWORD",
+    "LHASA_KEY_ALIAS",
+    "LHASA_KEY_PASSWORD",
+)
+val releaseSigningValues = releaseSigningNames.associateWith { System.getenv(it).orEmpty() }
+val releaseKeystoreFile = releaseSigningValues.getValue("LHASA_KEYSTORE")
+    .takeIf { it.isNotBlank() }
+    ?.let { rootProject.file(it).absoluteFile }
+
+val verifyReleaseSigning = tasks.register("verifyReleaseSigning") {
+    group = "verification"
+    description = "Require externally supplied release signing credentials."
+    doLast {
+        val missing = releaseSigningNames.filter { releaseSigningValues.getValue(it).isBlank() }
+        check(missing.isEmpty()) {
+            "Missing release signing environment variables: ${missing.joinToString()}. " +
+                "Release builds require the existing signing key; no fallback is permitted."
+        }
+        check(releaseKeystoreFile?.isFile == true) {
+            "The configured release keystore does not exist or is not a regular file."
+        }
+    }
+}
+
+tasks.configureEach {
+    if (name in setOf("preReleaseBuild", "packageRelease", "bundleRelease", "assembleRelease")) {
+        dependsOn(verifyReleaseSigning)
+    }
+}
+
 android {
     namespace = "com.gkeyes.lhasa26"
     compileSdk { version = release(37) { minorApiLevel = 2 } }
@@ -17,13 +50,10 @@ android {
 
     signingConfigs {
         create("release") {
-            val keystoreFile = rootProject.file(System.getenv("LHASA_KEYSTORE") ?: "keystore/lhasa26.jks")
-            if (keystoreFile.exists()) {
-                storeFile = keystoreFile
-                storePassword = System.getenv("LHASA_STORE_PASSWORD") ?: "lhasa26pass"
-                keyAlias = System.getenv("LHASA_KEY_ALIAS") ?: "lhasa26"
-                keyPassword = System.getenv("LHASA_KEY_PASSWORD") ?: "lhasa26pass"
-            }
+            storeFile = releaseKeystoreFile
+            storePassword = releaseSigningValues.getValue("LHASA_STORE_PASSWORD").takeIf { it.isNotBlank() }
+            keyAlias = releaseSigningValues.getValue("LHASA_KEY_ALIAS").takeIf { it.isNotBlank() }
+            keyPassword = releaseSigningValues.getValue("LHASA_KEY_PASSWORD").takeIf { it.isNotBlank() }
         }
     }
 
@@ -31,11 +61,7 @@ android {
         release {
             isMinifyEnabled = true
             isShrinkResources = true
-            signingConfigs.findByName("release")?.let { signing ->
-                if (signing.storeFile != null) {
-                    signingConfig = signing
-                }
-            }
+            signingConfig = signingConfigs.getByName("release")
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro",
@@ -59,3 +85,4 @@ dependencies {
     implementation("androidx.activity:activity:1.12.4")
     implementation(project(":design:miuix-console:ui"))
 }
+
