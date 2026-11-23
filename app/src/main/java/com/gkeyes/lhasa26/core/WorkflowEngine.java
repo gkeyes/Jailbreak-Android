@@ -47,6 +47,8 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
     private final Set<String> payloadLines = new LinkedHashSet<>();
     /** payload 启动时刻（毫秒），用于给每行输出打相对时间戳。 */
     private volatile long payloadStartAt;
+    /** 已经镜像到面包屑文件的 payload 子阶段，避免同阶段重复写。 */
+    private volatile String mirroredStage = "";
     private volatile State state = State.IDLE;
     private volatile long startedAt;
     private volatile int currentStep = -1;
@@ -139,7 +141,6 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
         callbacks.onLog(value);
     }
 
-    /** 从 payload 启动算起的秒数，用于给输出行打戳。 */
     private double payloadElapsed() {
         long start = payloadStartAt;
         if (start <= 0L) {
@@ -148,12 +149,7 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
         return (System.currentTimeMillis() - start) / 1000.0;
     }
 
-    /**
-     * 把 payload 的新增输出写进会话日志（去重），每条带相对时间前缀。
-     *
-     * 前缀是这条日志第一次被看到的时刻（轮询 500ms，所以分辨率约 0.5s），
-     * 足以区分「fork+写入慢」和「卡在等待」这两种不同的慢法。
-     */
+    /** 把 payload 的新增输出写进会话日志（去重），每条带相对时间前缀。 */
     private void appendPayloadOutput(String tail) {
         if (tail == null || tail.trim().isEmpty()) {
             return;
@@ -167,6 +163,73 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
                 append(String.format(Locale.US, "[t+%5.1fs] %s", payloadElapsed(), trimmed));
             }
         }
+    }
+
+    /**
+     * 把 payload 最新子阶段写进面包屑。
+     *
+     * 硬重启时来不及写日志，而这份文件是崩溃**前**写好的：下次启动读它就能定位
+     * 到具体是哪一步把设备带走的。只在阶段变化时写，通常一次运行不超过十次。
+     */
+    private void mirrorPayloadStage(String tail) {
+        if (tail == null || tail.isEmpty()) {
+            return;
+        }
+        String stage = null;
+        for (String raw : tail.split("\\n")) {
+            String line = raw.trim();
+            if (line.isEmpty()) {
+                continue;
+            }
+            if (line.startsWith("[rootd]")) {
+                stage = "payload-rootd";
+            } else if (line.startsWith("[cred] REAL_") || line.startsWith("[cred] installed")
+                    || line.startsWith("[child-cred]")) {
+                stage = "payload-cred-finish";
+            } else if (line.startsWith("[cred] plant attempt ")) {
+                stage = "payload-cred-" + attemptNumber(line);
+            } else if (line.startsWith("[selinux] already")) {
+                stage = "payload-selinux-done";
+            } else if (line.startsWith("[selinux] attempt ")) {
+                stage = "payload-selinux-" + attemptNumber(line);
+            } else if (line.startsWith("[uaf] page miss")) {
+                stage = "payload-miss";
+            } else if (line.startsWith("[exec]")) {
+                stage = "payload-exec";
+            } else if (line.startsWith("[stream] writes=")) {
+                stage = "payload-stream";
+            } else if (line.startsWith("[task] ok")) {
+                stage = "payload-task-ok";
+            }
+        }
+        if (stage == null || stage.equals(mirroredStage)) {
+            return;
+        }
+        mirroredStage = stage;
+        try {
+            run(BootGuard.markCommand(stage), true);
+        } catch (Exception ignored) {
+            // 面包屑写失败不该影响主流程
+        }
+    }
+
+    /** 从形如 `[cred] plant attempt 3/12` 的行里取 3；取不到就返回 0。 */
+    private static String attemptNumber(String line) {
+        int idx = line.indexOf("attempt ");
+        if (idx < 0) {
+            return "0";
+        }
+        String rest = line.substring(idx + "attempt ".length());
+        StringBuilder digits = new StringBuilder();
+        for (int i = 0; i < rest.length(); i++) {
+            char c = rest.charAt(i);
+            if (c >= '0' && c <= '9') {
+                digits.append(c);
+            } else {
+                break;
+            }
+        }
+        return digits.length() == 0 ? "0" : digits.toString();
     }
 
     @FunctionalInterface
@@ -195,6 +258,7 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
                 }
                 payloadLines.clear();
                 payloadStartAt = 0L;
+                mirroredStage = "";
                 callbacks.onState(State.RUNNING, operation);
             } else {
                 callbacks.onStatus("正在诊断");
@@ -592,12 +656,6 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
         }
     }
 
-    /**
-     * Runs the payload up to three times.
-     *
-     * @return null on success; otherwise a message to show. An empty message means "plain failure"
-     *         (the caller records it), a non-empty one is a fatal condition already recorded here.
-     */
     private String runPayload(String addressArgument, String boot) throws Exception {
         String args = addressArgument == null ? "" : addressArgument.trim();
         if (!args.isEmpty()) {
@@ -629,10 +687,11 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
                 if (!tail.trim().isEmpty()) {
                     callbacks.onTail(tail);
                     appendPayloadOutput(tail);
+                    mirrorPayloadStage(tail);
                 }
                 BootGuard.Outcome outcome = BootGuard.classify(tail);
                 if (outcome == BootGuard.Outcome.SUCCESS) {
-                    append(String.format(Locale.US, "[耗时] payload 成功，总耗时 %.1fs（本轮第 %d 次尝试，累计未命中 %d 次）",
+                    append(String.format(Locale.US, "[耗时] payload 成功，总耗时 %.1fs（第 %d 次尝试，累计未命中 %d 次）",
                             payloadElapsed(), attempt, misses));
                     return null;
                 }
@@ -660,6 +719,7 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
             if (exited) {
                 String tail = run("cat /data/local/tmp/uaf_replay.log 2>/dev/null", true).output;
                 appendPayloadOutput(tail);
+                mirrorPayloadStage(tail);
                 if (tail.trim().isEmpty()) {
                     append("[payload] 进程已退出且日志为空");
                 }
