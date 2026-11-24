@@ -5,11 +5,11 @@ link_bootid=0xffffffc08296ccb0
 cred_site_low21=0x6d1b4
 blob_site_a=0x35f34
 blob_site_b=0x35f34
-patches=root+caps,permissive-optional,ksud-load,caps-rounds40
-built_at=2026-11-24T05:52:11Z
+patches=root+caps,no-selinux-write,ksud-load,caps-rounds40
+built_at=2026-11-24T06:05:54Z
 agent 49440 383494fcc345fcec093c27367e869a553be0386c2424102a62f7017ac3aa8d87
 capdump 22544 cc6ea89f7cc546b8d6e122356b48fbb91454329b3c43362f8ebbe10af5858fd8
-ctest 83936 dc9de1f7b427a13c349be6926005ccebcb8cc519606208558d9eb7f276335ddc
+ctest 84048 c8ac9e0f6f6429d6ed7aa641b0f195514467bea6cc289684bb72dc4fe1c23fc0
 evread 25392 3872a09ded8399cf4caed9153910e85e3a23b93bd1dbdfeb06d550f9d1a90296
 hold 4168 7408a20a3ae2d312b15ddb2ef4d51eeb86a62fff4c5c755296bd493069f5aa81
 site_probe 38952 d20f72dfcbac709cfc9e16c57bd30b7f079c0c6daa803e87499304bdc7a5fc3f
