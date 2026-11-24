@@ -1,21 +1,21 @@
 /*
- * c99491_agent —— 被 ctest 改造 cred 的那个进程，原地完成 KernelSU 落地。
+ * c99491_agent —— 被 ctest 改造 cred 的进程，负责在 permissive 窗口内落地 KernelSU。
  *
- * 已证实的结论（本机实测）：
- *   - cred 改写后 euid=0、CapEff=0x0e00050000，但 permitted 为空；
- *   - 不带 permissive 时 finit_module 返回 EPERM，AVC 明确写：
- *       avc: denied { sys_module } capability=16 scontext=u:r:shell:s0
- *     → SELinux 的 capability 类规则不允许 shell 域使用 CAP_SYS_MODULE；
- *   - 打开 permissive 窗口后同一调用返回 EEXIST（模块已存在），
- *     证明权限门禁已通过、请求真的进入了内核。
+ * 本机实测的三条结论：
+ *   1. cred 改写后 euid=0（Uid: 0 0 2000 0）、CapEff=0x0e00050000，但 permitted 为空；
+ *   2. 不开 permissive 时 finit_module 返回 EPERM，AVC 明确：
+ *        avc: denied { sys_module } capability=16 scontext=u:r:shell:s0
+ *      → SELinux capability 类规则不允许 shell 域使用 CAP_SYS_MODULE；
+ *   3. 自己 finit_module 提取出来的 ksu.ko 返回 ENOENT（符号解析失败）——
+ *      该 KO 需要符号重定位，而 ksud 自己会读 kallsyms 完成这一步。
  *
- * 因此流程：
+ * 所以最终流程：
  *   1. 等 ctest 改好 cred（euid==0 且 CapEff 含 CAP_SYS_MODULE）
  *   2. 等 permissive 窗口（ctest 以 C99491_PERMISSIVE=1 打开）
- *   3. finit_module(/data/local/tmp/ksu.ko, "allow_shell=1")
- *   4. 成功则 fork+exec `ksud late-load`，让官方工具完成 install/features/
- *      策略与管理器拉起（此时进程 uid=0，且能力位已在 permitted/ambient 里）
- *   5. 恢复 Enforcing 并记录状态
+ *      —— permissive 下 SELinux 的 capable() 钩子放行，ksud 才能读 kallsyms 并加载；
+ *   3. 直接 exec `ksud late-load --kmi android17-6.18 --allow-shell`，
+ *      由官方工具完成 KO 重定位、install、features、策略与管理器拉起；
+ *   4. 恢复 Enforcing 并记录最终状态。
  *
  * 日志：/data/local/tmp/c99491_agent.log
  */
@@ -96,7 +96,6 @@ static void dump(FILE *f, const char *tag)
 	fclose(s);
 }
 
-/* 官方工具收尾：ksud late-load 会跳过 KO 加载，只做 install/features/策略/管理器 */
 static void run_ksud(FILE *f)
 {
 	pid_t p;
@@ -124,12 +123,13 @@ static void run_ksud(FILE *f)
 	} else {
 		fprintf(f, "ksud fork failed errno=%d\n", errno);
 	}
+	fflush(f);
 }
 
 int main(void)
 {
 	FILE *f = fopen(LOG_PATH, "w");
-	int fd, ready = 0, perm = 0, rc, saved;
+	int ready = 0, perm = 0;
 	struct stat st;
 
 	if (!f)
@@ -162,33 +162,19 @@ int main(void)
 		usleep(250000);
 	}
 	fprintf(f, "permissive_window=%d\n", perm);
+	if (stat(KO_PATH, &st) == 0)
+		fprintf(f, "ko size=%ld (仅供参考，实际由 ksud 处理)\n", (long)st.st_size);
 	fflush(f);
 
-	if (stat(KO_PATH, &st) != 0) {
-		fprintf(f, "=== abort: 缺少 %s (errno=%d) ===\n", KO_PATH, errno);
+	if (!perm) {
+		fprintf(f, "=== abort: permissive 窗口未打开 ===\n");
 		fclose(f);
 		return 3;
 	}
-	fprintf(f, "ko size=%ld\n", (long)st.st_size);
 
-	fd = open(KO_PATH, O_RDONLY);
-	if (fd < 0) {
-		fprintf(f, "open ko failed errno=%d\n", errno);
-		fclose(f);
-		return 4;
-	}
-	errno = 0;
-	rc = (int)syscall(SYS_finit_module, fd, "allow_shell=1", 0);
-	saved = errno;
-	fprintf(f, "finit_module rc=%d errno=%d (%s)\n", rc, saved, strerror(saved));
-	close(fd);
-	fflush(f);
+	run_ksud(f);
 
-	/* 模块已就绪（rc==0，或 EEXIST 表示本 boot 已加载）→ 用 ksud 收尾 */
-	if (rc == 0 || saved == EEXIST)
-		run_ksud(f);
-
-	if (perm && set_enforce(1) != 0)
+	if (set_enforce(1) != 0)
 		fprintf(f, "restore enforce failed errno=%d\n", errno);
 	fprintf(f, "enforce_after=%d\n", enforce_state());
 	fprintf(f, "su_exists=%d\n", access("/system/bin/su", X_OK) == 0);
