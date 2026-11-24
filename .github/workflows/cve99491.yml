@@ -4,6 +4,9 @@ name: cve99491
 #
 # 产物通过 base64 提交回仓库（cve99491/out/），因为手机端无法下载
 # Actions artifact；仓库已公开，这条路等价于一个只读分发点。
+#
+# 失败时同样把日志尾部提交回仓库（cve99491/out/build-failure.log）：
+# 手机端读不到 job log，只能这样定位问题。
 
 on:
   push:
@@ -17,6 +20,7 @@ on:
 
 permissions:
   contents: write
+  issues: write
 
 concurrency:
   group: cve99491-${{ github.ref }}
@@ -36,8 +40,10 @@ jobs:
           curl -fsSL https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz -o "$RUNNER_TEMP/zig.tar.xz"
           tar -xf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP"
           echo "$RUNNER_TEMP/zig-linux-x86_64-0.13.0" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/zig-linux-x86_64-0.13.0/zig" version
 
       - name: 构建
+        id: build
         run: |
           set -o pipefail
           CVE99491_CACHE="$RUNNER_TEMP/cache" \
@@ -52,11 +58,13 @@ jobs:
           cat "$RUNNER_TEMP/out/BUILDINFO.txt" >> "$GITHUB_STEP_SUMMARY"
 
       - name: 回传 base64
+        if: success()
         run: |
           set -euo pipefail
           mkdir -p cve99491/out
           cp "$RUNNER_TEMP"/out/*.b64 cve99491/out/
           cp "$RUNNER_TEMP/out/BUILDINFO.txt" cve99491/out/BUILDINFO.txt
+          rm -f cve99491/out/build-failure.log
           git config user.name "lhasa-ci"
           git config user.email "lhasa-ci@users.noreply.github.com"
           git add cve99491/out
@@ -67,8 +75,30 @@ jobs:
           git commit -m "build(cve99491): 交叉编译产物 $(date -u +%Y%m%d-%H%M)"
           git push
 
-      - name: 失败时把日志写进 issue
+      - name: 失败时提交日志尾部
         if: failure()
+        run: |
+          set -uo pipefail
+          mkdir -p cve99491/out
+          {
+            echo "commit: $GITHUB_SHA"
+            echo "job: $GITHUB_JOB  run: $GITHUB_RUN_ID"
+            echo "build-step: ${{ steps.build.outcome }}"
+            echo "=== 报错行 ==="
+            grep -nE '(^e: |error:|::error::|FAILED|cannot|No such)' "$RUNNER_TEMP/build.log" 2>/dev/null | head -40 || echo "(无匹配)"
+            echo "=== 日志尾部 ==="
+            tail -c 8000 "$RUNNER_TEMP/build.log" 2>/dev/null || echo "(无 build.log)"
+          } > cve99491/out/build-failure.log
+          tail -c 3000 cve99491/out/build-failure.log
+          git config user.name "lhasa-ci"
+          git config user.email "lhasa-ci@users.noreply.github.com"
+          git add -f cve99491/out/build-failure.log
+          git commit -m "ci(cve99491): 记录失败日志 ${GITHUB_SHA:0:8}" || echo "无需提交"
+          git push || echo "推送失败"
+
+      - name: 失败时也写 issue
+        if: failure()
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -78,10 +108,7 @@ jobs:
             echo "commit: \`$GITHUB_SHA\`"
             echo
             echo '```text'
-            grep -nE '(^e: |error:|::error::|FAILED)' "$RUNNER_TEMP/build.log" 2>/dev/null | head -40 || echo "（无匹配）"
-            echo '```'
-            echo '```text'
-            tail -c 6000 "$RUNNER_TEMP/build.log" 2>/dev/null || true
+            tail -c 6000 "$RUNNER_TEMP/build.log" 2>/dev/null || echo "(无日志)"
             echo '```'
           } > "$body"
           gh issue create --title "ci: cve99491 失败 ${GITHUB_SHA:0:8}" --body-file "$body" \
