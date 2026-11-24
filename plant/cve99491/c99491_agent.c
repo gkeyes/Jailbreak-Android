@@ -1,21 +1,20 @@
 /*
  * c99491_agent —— 被 ctest 改造 cred 的进程，负责在 permissive 窗口内落地 KernelSU。
  *
- * 本机实测的三条结论：
- *   1. cred 改写后 euid=0（Uid: 0 0 2000 0）、CapEff=0x0e00050000，但 permitted 为空；
+ * 本机实测结论链：
+ *   1. cred 改写后 Uid: 0 0 2000 0、CapEff=0x0e00050000（含 CAP_SYSLOG/SYS_MODULE）；
  *   2. 不开 permissive 时 finit_module 返回 EPERM，AVC 明确：
  *        avc: denied { sys_module } capability=16 scontext=u:r:shell:s0
- *      → SELinux capability 类规则不允许 shell 域使用 CAP_SYS_MODULE；
- *   3. 自己 finit_module 提取出来的 ksu.ko 返回 ENOENT（符号解析失败）——
- *      该 KO 需要符号重定位，而 ksud 自己会读 kallsyms 完成这一步。
+ *   3. 开 permissive 后，capability 检查放行；但自己 finit_module 提取的 ksu.ko
+ *      返回 ENOENT（符号未重定位）；
+ *   4. shell 身份下 `ksud insmod` 报 "Cannot parse kallsyms: Permission denied"
+ *      —— ksud 需要 CAP_SYSLOG 才能读 kallsyms 做重定位。
  *
- * 所以最终流程：
- *   1. 等 ctest 改好 cred（euid==0 且 CapEff 含 CAP_SYS_MODULE）
- *   2. 等 permissive 窗口（ctest 以 C99491_PERMISSIVE=1 打开）
- *      —— permissive 下 SELinux 的 capable() 钩子放行，ksud 才能读 kallsyms 并加载；
- *   3. 直接 exec `ksud late-load --kmi android17-6.18 --allow-shell`，
- *      由官方工具完成 KO 重定位、install、features、策略与管理器拉起；
- *   4. 恢复 Enforcing 并记录最终状态。
+ * 因此最终做法：在「uid=0 + CapEff 含 SYSLOG/SYS_MODULE + permissive 窗口」这三者
+ * 同时成立的进程里，依次执行：
+ *   ksud insmod /data/local/tmp/ksu.ko     ← 带 kallsyms 访问地加载并重定位
+ *   ksud late-load --kmi ... --allow-shell ← 模块 Live 后只做 install/features/策略
+ * 然后恢复 Enforcing。
  *
  * 日志：/data/local/tmp/c99491_agent.log
  */
@@ -35,7 +34,7 @@
 #define KSUD "/data/local/tmp/ksud"
 #define KMI "android17-6.18"
 
-static int cap_sys_module(void)
+static int cap_bit(int bit)
 {
 	char line[256];
 	FILE *s = fopen("/proc/self/status", "r");
@@ -50,7 +49,7 @@ static int cap_sys_module(void)
 		}
 	}
 	fclose(s);
-	return (eff & (1ULL << 16)) != 0;
+	return (eff & (1ULL << bit)) != 0;
 }
 
 static int enforce_state(void)
@@ -96,12 +95,13 @@ static void dump(FILE *f, const char *tag)
 	fclose(s);
 }
 
-static void run_ksud(FILE *f)
+/* 依次执行一条 ksud 子命令，输出追加到日志 */
+static void run_ksud(FILE *f, char *const argv[])
 {
 	pid_t p;
 	int st = 0;
 
-	fprintf(f, "--- ksud late-load ---\n");
+	fprintf(f, "--- ksud %s ---\n", argv[1]);
 	fflush(f);
 	p = fork();
 	if (p == 0) {
@@ -113,13 +113,13 @@ static void run_ksud(FILE *f)
 			if (fd > 2)
 				close(fd);
 		}
-		execl(KSUD, KSUD, "late-load", "--kmi", KMI, "--allow-shell",
-		      "--package-name", "me.weishu.kernelsu", (char *)NULL);
+		execv(KSUD, argv);
 		_exit(127);
 	}
 	if (p > 0) {
 		waitpid(p, &st, 0);
-		fprintf(f, "ksud exit=%d\n", WIFEXITED(st) ? WEXITSTATUS(st) : -1);
+		fprintf(f, "ksud %s exit=%d\n", argv[1],
+			WIFEXITED(st) ? WEXITSTATUS(st) : -1);
 	} else {
 		fprintf(f, "ksud fork failed errno=%d\n", errno);
 	}
@@ -130,7 +130,6 @@ int main(void)
 {
 	FILE *f = fopen(LOG_PATH, "w");
 	int ready = 0, perm = 0;
-	struct stat st;
 
 	if (!f)
 		return 1;
@@ -138,8 +137,9 @@ int main(void)
 	dump(f, "start");
 	fflush(f);
 
-	for (int i = 0; i < 200; i++) {
-		if (geteuid() == 0 && cap_sys_module()) {
+	/* 等 cred 落地：真实 uid=0 且 effective 里有 SYSLOG + SYS_MODULE */
+	for (int i = 0; i < 240; i++) {
+		if (getuid() == 0 && cap_bit(34) && cap_bit(16)) {
 			ready = 1;
 			break;
 		}
@@ -162,17 +162,28 @@ int main(void)
 		usleep(250000);
 	}
 	fprintf(f, "permissive_window=%d\n", perm);
-	if (stat(KO_PATH, &st) == 0)
-		fprintf(f, "ko size=%ld (仅供参考，实际由 ksud 处理)\n", (long)st.st_size);
 	fflush(f);
-
 	if (!perm) {
 		fprintf(f, "=== abort: permissive 窗口未打开 ===\n");
 		fclose(f);
 		return 3;
 	}
 
-	run_ksud(f);
+	/* 1) 带 kallsyms 访问地加载模块（ksud 自己完成符号重定位） */
+	{
+		char *ins[] = { (char *)KSUD, (char *)"insmod", (char *)KO_PATH, NULL };
+
+		run_ksud(f, ins);
+	}
+
+	/* 2) 模块 Live 后由官方工具做 install/features/策略/管理器 */
+	{
+		char *late[] = { (char *)KSUD, (char *)"late-load", (char *)"--kmi",
+				 (char *)KMI, (char *)"--allow-shell", (char *)"--package-name",
+				 (char *)"me.weishu.kernelsu", NULL };
+
+		run_ksud(f, late);
+	}
 
 	if (set_enforce(1) != 0)
 		fprintf(f, "restore enforce failed errno=%d\n", errno);
