@@ -76,7 +76,9 @@ else
   echo "  (BLOB_SITE_* 未测出，保持上游值；cred 发现阶段先用 site_probe 实测)"
 fi
 
-# —— Android system_properties 垫片（仅 wtest 的可选路径用到）——
+# —— Android system_properties 垫片 ——
+# wtest（可选 --stoprisk）与 agent 都直接调用 bionic 的两个符号；
+# musl 没有它们，这里提供空实现，只影响"通过属性触发 ctl.stop"这类可选路径。
 mkdir -p "$T/compat/sys"
 cat > "$T/compat/sys/system_properties.h" <<'EOF'
 #ifndef CVE99491_COMPAT_SYSTEM_PROPERTIES_H
@@ -87,7 +89,7 @@ int __system_property_set(const char *key, const char *value);
 #endif
 EOF
 cat > "$T/compat_sp.c" <<'EOF'
-/* 非 bionic 目标下的空实现：上游只用于可选的 --stoprisk 路径。 */
+/* 非 bionic 目标下的空实现。 */
 #define PROP_VALUE_MAX 92
 int __system_property_get(const char *key, char *value)
 {
@@ -112,13 +114,14 @@ CFLAGS=(-target aarch64-linux-musl -std=gnu11 -O2 -static -s -pthread
 build() {
   local name=$1; shift
   echo "== $name"
+  # 统一附带 system_properties 垫片：未被引用的对象不会进入最终镜像。
   # shellcheck disable=SC2068
-  $CC "${CFLAGS[@]}" "$@" -o "$OUT/$name"
+  $CC "${CFLAGS[@]}" "$@" "$T/compat_sp.c" -o "$OUT/$name"
   ls -l "$OUT/$name"
 }
 
 build site_probe "$ROOT/plant/cve99491/site_probe.c"
-build wtest      "$T/wtest.c" "$T/compat_sp.c"
+build wtest      "$T/wtest.c"
 build ctest      "$T/ctest.c"
 build agent      "$T/agent.c"
 build capdump    "$T/capdump.c"
