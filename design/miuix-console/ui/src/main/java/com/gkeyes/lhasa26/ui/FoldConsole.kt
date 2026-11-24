@@ -82,11 +82,20 @@ fun FoldConsole(
                 BoxWithConstraints(Modifier.fillMaxSize()) {
                     val safe = horizontalSafe.asPaddingValues()
                     val layoutDirection = LocalLayoutDirection.current
-                    val width = maxWidth - safe.calculateLeftPadding(layoutDirection) - safe.calculateRightPadding(layoutDirection)
+                    val density = LocalDensity.current
+                    // A fold or display-size change can update density with identical pixel constraints.
+                    val width = with(density) { constraints.maxWidth.toDp() } -
+                        safe.calculateLeftPadding(layoutDirection) - safe.calculateRightPadding(layoutDirection)
                     val rail = width >= 700.dp
-                    // Existing breakpoints (720dp of usable width after the former 96dp rail and 28dp gutters).
-                    val wide = width >= 872.dp && LocalDensity.current.fontScale <= 1.35f
-                    val start = if (rail) foldRailWidth + GlassNavigationRailDefaults.Margin else 0.dp
+                    val start = when {
+                        !rail -> 0.dp
+                        hardware -> foldRailWidth + GlassNavigationRailDefaults.Margin
+                        else -> foldRailWidth
+                    }
+                    val wide = width - start - foldWideGutter * 3 >= 720.dp && density.fontScale <= 1.35f
+                    val topBarModifier = if (rail) {
+                        Modifier.windowInsetsPadding(horizontalSafe.only(WindowInsetsSides.Start)).padding(start = start)
+                    } else Modifier
                     val actions: @Composable RowScope.() -> Unit = {
                         if (hardware) {
                             GlassIconButton(onClick = { onRequest(FoldEvent.SETTINGS) }, backdrop = body) {
@@ -106,14 +115,14 @@ fun FoldConsole(
                             if (hardware) {
                                 GlassTopAppBar(
                                     title = pageNames[page], subtitle = brandName,
-                                    contentModifier = Modifier.padding(start = start),
+                                    modifier = topBarModifier,
                                     backdrop = body, progressiveBlur = true,
                                     scrollBehavior = behavior, actions = actions,
                                 )
                             } else {
                                 TopAppBar(
                                     title = pageNames[page], subtitle = brandName,
-                                    modifier = Modifier.padding(start = start),
+                                    modifier = topBarModifier,
                                     scrollBehavior = behavior, actions = actions,
                                 )
                             }
@@ -149,7 +158,7 @@ fun FoldConsole(
                         }
                     }
                     FoldMoreMenu(menuOpen, anchor, wholePage, onDismiss = { menuOpen = false }, onRequest = onRequest)
-                    FoldDialogs(dialog, state, wholePage, onDismiss = { dialog = null }, onEvent = onEvent)
+                    FoldDialogs(dialog, state, brandName, wholePage, onDismiss = { dialog = null }, onEvent = onEvent)
                 }
             }
         }

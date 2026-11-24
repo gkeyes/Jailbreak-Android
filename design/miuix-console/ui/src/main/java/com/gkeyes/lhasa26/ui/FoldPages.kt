@@ -186,6 +186,8 @@ private fun DeviceValue(label: String, value: String, stack: Boolean) {
     }
 }
 
+internal val foldWideGutter = 16.dp
+
 @Composable
 private fun PageColumns(
     wide: Boolean,
@@ -193,7 +195,7 @@ private fun PageColumns(
     second: @Composable ColumnScope.() -> Unit,
 ) {
     if (wide) {
-        Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp), horizontalArrangement = Arrangement.spacedBy(16.dp)) {
+        Row(Modifier.fillMaxWidth().padding(horizontal = foldWideGutter), horizontalArrangement = Arrangement.spacedBy(foldWideGutter)) {
             Column(Modifier.weight(1f), content = first)
             Column(Modifier.weight(1f), content = second)
         }

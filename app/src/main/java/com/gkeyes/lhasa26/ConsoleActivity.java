@@ -2,11 +2,13 @@ package com.gkeyes.lhasa26;
 
 import android.content.ContentValues;
 import android.content.Intent;
+import android.content.res.Configuration;
 import android.net.Uri;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.provider.MediaStore;
+import android.view.WindowInsetsController;
 
 import androidx.activity.ComponentActivity;
 
@@ -107,6 +109,7 @@ public final class ConsoleActivity extends ComponentActivity
         console.setBrandName(getString(R.string.app_name));
         console.attachListener(this);
         setContentView(console);
+        updateSystemBarAppearance(getResources().getConfiguration());
 
         Shizuku.addBinderReceivedListenerSticky(binderReceivedListener);
         Shizuku.addBinderDeadListener(binderDeadListener);
@@ -117,6 +120,23 @@ public final class ConsoleActivity extends ComponentActivity
         refreshAuthorization();
         engine.refreshDeviceInfo();
         render();
+    }
+
+    @Override
+    public void onConfigurationChanged(Configuration configuration) {
+        super.onConfigurationChanged(configuration);
+        updateSystemBarAppearance(configuration);
+    }
+
+    private void updateSystemBarAppearance(Configuration configuration) {
+        WindowInsetsController controller = getWindow().getInsetsController();
+        if (controller != null) {
+            int mask = WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS
+                    | WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS;
+            boolean dark = (configuration.uiMode & Configuration.UI_MODE_NIGHT_MASK)
+                    == Configuration.UI_MODE_NIGHT_YES;
+            controller.setSystemBarsAppearance(dark ? 0 : mask, mask);
+        }
     }
 
     @Override
