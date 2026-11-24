@@ -53,7 +53,7 @@ fi
 T="$SRC/tools"
 [ -f "$T/ctest.c" ] || { echo "::error::tarball 结构异常：缺 tools/ctest.c"; exit 1; }
 
-# —— 常量注入 ——
+# —— 常量注入（表驱动：每项都必须命中）——
 patch_macro() {
   local file=$1 name=$2 value=$3
   if ! grep -qE "^#define[[:space:]]+$name[[:space:]]" "$file"; then
@@ -61,24 +61,31 @@ patch_macro() {
     exit 1
   fi
   sed -i -E "s|^#define[[:space:]]+$name[[:space:]]+.*|#define $name ${value}ULL|" "$file"
-  grep -E "^#define[[:space:]]+$name[[:space:]]" "$file" | sed 's/^/  /'
 }
 
 echo "注入本机常量："
-patch_macro "$T/wtest.c" LINK_ADD_WORKER "$LINK_ADD_WORKER"
-patch_macro "$T/wtest.c" LINK_SELINUX_STATE "$LINK_SELINUX"
+# wtest 与 ctest **都**定义了 LINK_ADD_WORKER / LINK_SELINUX_STATE
+for f in wtest.c ctest.c; do
+  patch_macro "$T/$f" LINK_ADD_WORKER "$LINK_ADD_WORKER"
+  patch_macro "$T/$f" LINK_SELINUX_STATE "$LINK_SELINUX"
+  grep -E "^#define[[:space:]]+LINK_(ADD_WORKER|SELINUX_STATE)" "$T/$f" | sed "s|^|  $f: |"
+done
 patch_macro "$T/wtest.c" LINK_BOOTID "$LINK_BOOTID"
+grep -E "^#define[[:space:]]+LINK_BOOTID" "$T/wtest.c" | sed 's/^/  wtest.c: /'
+
 patch_macro "$T/ctest.c" CRED_SITE_LOW21 "$CRED_SITE"
+grep -E "^#define[[:space:]]+CRED_SITE_LOW21" "$T/ctest.c" | sed 's/^/  ctest.c: /'
 if [ "$BLOB_A" != "0x0" ]; then
   patch_macro "$T/ctest.c" BLOB_SITE_A "$BLOB_A"
   patch_macro "$T/ctest.c" BLOB_SITE_B "$BLOB_B"
+  grep -E "^#define[[:space:]]+BLOB_SITE_" "$T/ctest.c" | sed 's/^/  ctest.c: /'
 else
-  echo "  (BLOB_SITE_* 未测出，保持上游值；cred 发现阶段先用 site_probe 实测)"
+  echo "::error::BLOB_SITE_* 未测出（应为 0x35f34 一类实测值）"
+  exit 1
 fi
 
 # —— Android system_properties 垫片 ——
-# wtest（可选 --stoprisk）与 agent 都直接调用 bionic 的两个符号；
-# musl 没有它们，这里提供空实现，只影响"通过属性触发 ctl.stop"这类可选路径。
+# wtest（可选 --stoprisk）与 agent 直接调用 bionic 的两个符号；musl 没有。
 mkdir -p "$T/compat/sys"
 cat > "$T/compat/sys/system_properties.h" <<'EOF'
 #ifndef CVE99491_COMPAT_SYSTEM_PROPERTIES_H
@@ -114,7 +121,6 @@ CFLAGS=(-target aarch64-linux-musl -std=gnu11 -O2 -static -s -pthread
 build() {
   local name=$1; shift
   echo "== $name"
-  # 统一附带 system_properties 垫片：未被引用的对象不会进入最终镜像。
   # shellcheck disable=SC2068
   $CC "${CFLAGS[@]}" "$@" "$T/compat_sp.c" -o "$OUT/$name"
   ls -l "$OUT/$name"
