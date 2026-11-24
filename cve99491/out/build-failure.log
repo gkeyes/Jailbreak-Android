@@ -1,0 +1,15 @@
+commit: f0b5822cbf5a388e893c8bed338f7b1591498187
+job: build  run: 45334962499
+build-step: failure
+=== 报错行 ===
+(无匹配)
+=== 日志尾部 ===
+下载 https://codeload.github.com/Yunnijian/CVE-2026-99491/tar.gz/67d9c0e0d9a3bdffce25ed3a2c97fd86a323ea79
+tarball 校验通过（6989183 字节）
+注入本机常量：
+  ctest.c: #define CRED_SITE_LOW21 0x6d1b4ULL
+  ctest.c: #define BLOB_SITE_A 0x35f34ULL
+  ctest.c: #define BLOB_SITE_B 0x35f34ULL
+  ctest.c: #define LINK_SELINUX_STATE 0xffffffc082959630ULL
+  ctest.c: #define LINK_ADD_WORKER 0xffffffc080f79ff4ULL
+补丁失败：try_permissive 条件化 命中 2 次
