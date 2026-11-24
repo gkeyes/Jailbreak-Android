@@ -2,22 +2,26 @@
  * c99491_load —— 单进程 KernelSU 模块加载器（B 方案核心）。
  *
  * 为什么不用 ksud：
- *   - `ksud insmod` 需要 exec 一个新的 Rust 进程，能力继承受 permitted/ambient
- *     约束，且它的报错不透明；
- *   - 我们自己 finit_module 又因 KO 的 225 个未定义符号未被内核导出而 ENOENT。
- * 因此这里**在本进程内**完成：解析 KO 的 symtab → 用离线表把未定义符号
+ *   - `ksud insmod` 要 exec 新进程，能力继承受 permitted/ambient 约束，
+ *     报错也不透明；
+ *   - 而我们自己 finit_module 又因 KO 有 225 个未导出符号而 ENOENT。
+ * 所以这里在**本进程内**完成：解析 KO 的 symtab → 用离线表把未定义符号
  * 改成 SHN_ABS 且 st_value = 链接期地址 + slide → memfd → finit_module。
  *
- * 前提（由 ctest 完成）：
- *   - 本进程 cred 已被改写：uid==0 且 CapPrm 含 CAP_SYSLOG(34)+CAP_SYS_MODULE(16)；
- *   - permissive 窗口已打开（/sys/fs/selinux/enforce == 0）。
+ * 符号表在**运行时**从文件读取（每行 `name 0xaddr`，addr 为链接期地址），
+ * 由 tools/gen_ksu_syms.js 生成，避免把 11 KB 表编进二进制。
  *
- * 用法：c99491_load --slide 0x<slide> [--ko /data/local/tmp/ksu.ko]
+ * 前提（由 ctest 完成）：
+ *   - 本进程 cred 已被改写：uid==0 且 CapPrm 含 CAP_SYSLOG(34)+CAP_SYS_MODULE(16)
+ *   - permissive 窗口已打开（/sys/fs/selinux/enforce == 0）
+ *
+ * 用法：c99491_load --slide 0x<slide> [--ko path] [--table path]
  * 日志：/data/local/tmp/c99491_load.log（每步 fsync）
  */
 #define _GNU_SOURCE 1
 #include <errno.h>
 #include <fcntl.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -26,10 +30,10 @@
 #include <time.h>
 #include <unistd.h>
 
-#include "ksu_syms.h"
-
 #define LOG_PATH "/data/local/tmp/c99491_load.log"
 #define DEFAULT_KO "/data/local/tmp/ksu.ko"
+#define DEFAULT_TABLE "/data/local/tmp/ksu_syms.txt"
+#define MAX_SYMS 512
 #define SHN_UNDEF 0
 #define SHN_ABS 0xfff1
 #define SHT_SYMTAB 2
@@ -57,6 +61,12 @@ struct sym64 {
 	unsigned short st_shndx;
 	unsigned long long st_value, st_size;
 };
+
+static struct {
+	char name[64];
+	unsigned long long addr;
+} tbl[MAX_SYMS];
+static int ntbl;
 
 static FILE *g_log;
 
@@ -116,9 +126,33 @@ static int set_enforce(int on)
 	return rc == 1 ? 0 : -1;
 }
 
+static int load_table(const char *path)
+{
+	FILE *f = fopen(path, "r");
+	char line[160];
+
+	if (!f) {
+		logf_("open table failed errno=%d (%s)\n", errno, path);
+		return -1;
+	}
+	while (fgets(line, sizeof(line), f) && ntbl < MAX_SYMS) {
+		char nm[64];
+		unsigned long long a;
+
+		if (sscanf(line, "%63s %llx", nm, &a) != 2)
+			continue;
+		snprintf(tbl[ntbl].name, sizeof(tbl[ntbl].name), "%s", nm);
+		tbl[ntbl].addr = a;
+		ntbl++;
+	}
+	fclose(f);
+	logf_("table=%s entries=%d\n", path, ntbl);
+	return ntbl;
+}
+
 int main(int argc, char **argv)
 {
-	const char *ko_path = DEFAULT_KO;
+	const char *ko_path = DEFAULT_KO, *table = DEFAULT_TABLE;
 	unsigned long long slide = 0;
 	unsigned char *img = NULL;
 	struct stat st;
@@ -139,10 +173,12 @@ int main(int argc, char **argv)
 			slide = strtoull(argv[++i], NULL, 0);
 		else if (!strcmp(argv[i], "--ko") && i + 1 < argc)
 			ko_path = argv[++i];
+		else if (!strcmp(argv[i], "--table") && i + 1 < argc)
+			table = argv[++i];
 	}
 	logf_("slide=%#llx ko=%s\n", slide, ko_path);
 
-	/* 等 ctest 把 cred 改好 */
+	/* 等 ctest 改好 cred */
 	for (int i = 0; i < 320; i++) {
 		unsigned long long prm = cap_of("CapPrm:");
 
@@ -157,6 +193,11 @@ int main(int argc, char **argv)
 		return 2;
 	}
 
+	if (load_table(table) <= 0) {
+		logf_("=== abort: 符号表不可用 ===\n");
+		return 3;
+	}
+
 	/* 等 permissive 窗口 */
 	for (int i = 0; i < 200; i++) {
 		if (enforce_now() == 0)
@@ -168,16 +209,16 @@ int main(int argc, char **argv)
 	fd = open(ko_path, O_RDONLY);
 	if (fd < 0) {
 		logf_("open ko failed errno=%d\n", errno);
-		return 3;
+		return 4;
 	}
 	if (fstat(fd, &st) != 0) {
 		logf_("stat ko failed errno=%d\n", errno);
-		return 4;
+		return 5;
 	}
 	img = malloc((size_t)st.st_size);
 	if (!img || read(fd, img, (size_t)st.st_size) != (ssize_t)st.st_size) {
 		logf_("read ko failed\n");
-		return 5;
+		return 6;
 	}
 	close(fd);
 	logf_("ko size=%ld\n", (long)st.st_size);
@@ -185,19 +226,18 @@ int main(int argc, char **argv)
 	eh = (struct ehdr64 *)img;
 	if (memcmp(eh->e_ident, "\177ELF", 4) != 0) {
 		logf_("not ELF\n");
-		return 6;
+		return 7;
 	}
 	sh = (struct shdr64 *)(img + eh->e_shoff);
 
-	/* 找 SHT_SYMTAB 与其字符串表 */
 	for (int i = 0; i < eh->e_shnum; i++) {
 		if (sh[i].sh_type == SHT_SYMTAB) {
-			syms = (struct sym64 *)(img + sh[i].sh_offset);
 			int nsym = (int)(sh[i].sh_size / sizeof(struct sym64));
 
+			syms = (struct sym64 *)(img + sh[i].sh_offset);
 			strtab = (char *)(img + sh[sh[i].sh_link].sh_offset);
 			strsize = (size_t)sh[sh[i].sh_link].sh_size;
-			logf_("symtab=%d syms=%d strsize=%zu\n", i, nsym, strsize);
+			logf_("symtab sect=%d syms=%d strsize=%zu\n", i, nsym, strsize);
 
 			for (int k = 1; k < nsym; k++) {
 				const char *nm;
@@ -208,9 +248,9 @@ int main(int argc, char **argv)
 				if (syms[k].st_name >= strsize)
 					continue;
 				nm = strtab + syms[k].st_name;
-				for (int m = 0; m < KSU_SYM_COUNT; m++) {
-					if (!strcmp(nm, ksu_syms[m].name)) {
-						addr = ksu_syms[m].addr;
+				for (int m = 0; m < ntbl; m++) {
+					if (!strcmp(nm, tbl[m].name)) {
+						addr = tbl[m].addr;
 						break;
 					}
 				}
@@ -229,19 +269,18 @@ int main(int argc, char **argv)
 	}
 	logf_("patched=%d missing=%d\n", patched, missing);
 	if (missing > 0) {
-		logf_("=== abort: 有 %d 个符号未在表中 ===\n", missing);
-		return 7;
+		logf_("=== abort: %d 个符号不在表中 ===\n", missing);
+		return 8;
 	}
 
-	/* memfd + finit_module（进程内，无 exec） */
 	memfd = (int)syscall(SYS_memfd_create, "ksu", 0);
 	if (memfd < 0) {
 		logf_("memfd_create failed errno=%d\n", errno);
-		return 8;
+		return 9;
 	}
 	if (write(memfd, img, (size_t)st.st_size) != (ssize_t)st.st_size) {
 		logf_("memfd write failed errno=%d\n", errno);
-		return 9;
+		return 10;
 	}
 	lseek(memfd, 0, SEEK_SET);
 
@@ -255,5 +294,5 @@ int main(int argc, char **argv)
 	logf_("su_exists=%d\n", access("/system/bin/su", X_OK) == 0);
 	logf_("=== done ===\n");
 	fclose(g_log);
-	return rc == 0 ? 0 : 10;
+	return rc == 0 ? 0 : 11;
 }
