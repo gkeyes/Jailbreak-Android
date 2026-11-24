@@ -7,12 +7,15 @@
  *   解析 KO symtab → 用离线表把未定义符号改成 SHN_ABS 且
  *   st_value = 链接期地址 + slide → memfd → finit_module。
  *
- * 顺序很关键（实测）：
- *   1. 等 ctest 改好 cred（uid=0 且 CapPrm 含 SYSLOG+SYS_MODULE）
- *   2. 等 permissive 窗口（enforce==0）
- *   3. **此时**才读 /proc/kallsyms 求 slide —— Enforcing 下 kptr_restrict=2
- *      会遮蔽地址（表现为全 0），必须在窗口内读
- *   4. 打补丁 → finit_module → 立刻恢复 Enforcing
+ * slide 的三种来源（按序尝试）：
+ *   1. --slide 参数
+ *   2. /data/local/tmp/slide.txt（外部写入，如 slide_probe 的产物）
+ *   3. 窗口内读 /proc/kallsyms 的 selinux_state
+ *      —— 本机厂商内核在 kptr_restrict=2 时连 root 都读不到地址，
+ *      所以读之前先把 kptr_restrict 置 0，读完恢复为 2。
+ *
+ * 前提（由 ctest 完成）：uid==0 且 CapPrm 含 CAP_SYSLOG(34)+CAP_SYS_MODULE(16)，
+ * 并且 permissive 窗口已打开（enforce==0）。
  *
  * 用法：c99491_load [--slide 0x..] [--ko path] [--table path]
  * 日志：/data/local/tmp/c99491_load.log（每步 fsync）
@@ -32,6 +35,8 @@
 #define LOG_PATH "/data/local/tmp/c99491_load.log"
 #define DEFAULT_KO "/data/local/tmp/ksu.ko"
 #define DEFAULT_TABLE "/data/local/tmp/ksu_syms.txt"
+#define SLIDE_FILE "/data/local/tmp/slide.txt"
+#define KPTR_PATH "/proc/sys/kernel/kptr_restrict"
 #define MAX_SYMS 512
 #define SHN_UNDEF 0
 #define SHN_ABS 0xfff1
@@ -125,6 +130,18 @@ static int set_enforce(int on)
 	return rc == 1 ? 0 : -1;
 }
 
+static int write_str(const char *path, const char *s)
+{
+	int fd = open(path, O_WRONLY);
+	int rc;
+
+	if (fd < 0)
+		return -1;
+	rc = (int)write(fd, s, strlen(s));
+	close(fd);
+	return rc > 0 ? 0 : -1;
+}
+
 static unsigned long long table_lookup(const char *name)
 {
 	for (int i = 0; i < ntbl; i++)
@@ -157,36 +174,72 @@ static int load_table(const char *path)
 	return ntbl;
 }
 
-/* 读 /proc/kallsyms 的 selinux_state 运行时地址，减去表中链接期地址 = slide */
+/* slide 来源 2：外部写的文件 */
+static unsigned long long slide_from_file(void)
+{
+	FILE *f = fopen(SLIDE_FILE, "r");
+	unsigned long long v = 0;
+
+	if (!f)
+		return 0;
+	if (fscanf(f, "%llx", &v) != 1)
+		v = 0;
+	fclose(f);
+	return v;
+}
+
+/* slide 来源 3：窗口内读 kallsyms（先临时关掉 kptr_restrict） */
 static unsigned long long slide_from_kallsyms(void)
 {
-	FILE *f = fopen("/proc/kallsyms", "r");
-	char line[512];
 	unsigned long long link = table_lookup("selinux_state");
+	unsigned long long a = 0;
+	int kptr = -1;
+	FILE *f;
 
-	if (!f) {
-		logf_("open kallsyms failed errno=%d\n", errno);
-		return 0;
-	}
 	if (!link) {
 		logf_("table 缺 selinux_state\n");
-		fclose(f);
 		return 0;
 	}
-	while (fgets(line, sizeof(line), f)) {
-		char nm[256], type;
-		unsigned long long a;
+	/* 记录并临时置 0（本机厂商内核只认 kptr_restrict==0） */
+	{
+		FILE *k = fopen(KPTR_PATH, "r");
 
-		if (sscanf(line, "%llx %c %255s", &a, &type, nm) != 3)
-			continue;
-		if (!strcmp(nm, "selinux_state")) {
-			logf_("kallsyms selinux_state=%#llx link=%#llx\n", a, link);
-			fclose(f);
-			return (a && a > link) ? a - link : 0;
+		if (k) {
+			if (fscanf(k, "%d", &kptr) != 1)
+				kptr = -1;
+			fclose(k);
+		}
+	}
+	if (write_str(KPTR_PATH, "0") != 0)
+		logf_("写 kptr_restrict 失败 errno=%d\n", errno);
+
+	f = fopen("/proc/kallsyms", "r");
+	if (!f) {
+		logf_("open kallsyms failed errno=%d\n", errno);
+		if (kptr >= 0)
+			write_str(KPTR_PATH, "2");
+		return 0;
+	}
+	{
+		char line[512], nm[256], type;
+
+		while (fgets(line, sizeof(line), f)) {
+			unsigned long long v;
+
+			if (sscanf(line, "%llx %c %255s", &v, &type, nm) != 3)
+				continue;
+			if (!strcmp(nm, "selinux_state")) {
+				a = v;
+				break;
+			}
 		}
 	}
 	fclose(f);
-	return 0;
+	if (kptr >= 0)
+		write_str(KPTR_PATH, "2");
+
+	logf_("kallsyms selinux_state=%#llx link=%#llx\n", a, link);
+	return (a && a > link) ? a - link : 0;
 }
 
 int main(int argc, char **argv)
@@ -244,10 +297,14 @@ int main(int argc, char **argv)
 	}
 	logf_("enforce(window)=%d\n", enforce_now());
 
-	/* 3) 窗口内求 slide（Enforcing 下 kallsyms 会被遮蔽） */
+	/* 3) 求 slide */
+	if (!slide)
+		slide = slide_from_file();
+	if (slide)
+		logf_("slide(文件)=%#llx\n", slide);
 	if (!slide) {
 		slide = slide_from_kallsyms();
-		logf_("slide=%#llx\n", slide);
+		logf_("slide(kallsyms)=%#llx\n", slide);
 	}
 	if (!slide) {
 		logf_("=== abort: 无法确定 slide ===\n");
