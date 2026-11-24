@@ -1,21 +1,20 @@
 /*
  * c99491_load —— 单进程 KernelSU 模块加载器（B 方案核心）。
  *
- * 为什么不用 ksud：
+ * 为什么不走 ksud：
  *   - `ksud insmod` 要 exec 新进程，能力继承受 permitted/ambient 约束，
- *     报错也不透明；
- *   - 而我们自己 finit_module 又因 KO 有 225 个未导出符号而 ENOENT。
- * 所以这里在**本进程内**完成：解析 KO 的 symtab → 用离线表把未定义符号
- * 改成 SHN_ABS 且 st_value = 链接期地址 + slide → memfd → finit_module。
+ *     且报错不透明；
+ *   - 自己直接 finit_module 又因 KO 的 225 个未导出符号而 ENOENT。
+ * 因此本程序在**本进程内**：解析 KO symtab → 用离线表把未定义符号改成
+ * SHN_ABS 且 st_value = 链接期地址 + slide → memfd → finit_module。
  *
- * 符号表在**运行时**从文件读取（每行 `name 0xaddr`，addr 为链接期地址），
- * 由 tools/gen_ksu_syms.js 生成，避免把 11 KB 表编进二进制。
+ * slide 的获取：优先 --slide；否则在已有 CAP_SYSLOG 的前提下读
+ * /proc/kallsyms 里 selinux_state 的运行时地址，减去表里的链接期地址得到。
  *
- * 前提（由 ctest 完成）：
- *   - 本进程 cred 已被改写：uid==0 且 CapPrm 含 CAP_SYSLOG(34)+CAP_SYS_MODULE(16)
- *   - permissive 窗口已打开（/sys/fs/selinux/enforce == 0）
+ * 前提（由 ctest 完成）：uid==0 且 CapPrm 含 CAP_SYSLOG(34)+CAP_SYS_MODULE(16)，
+ * 并且 permissive 窗口已打开。
  *
- * 用法：c99491_load --slide 0x<slide> [--ko path] [--table path]
+ * 用法：c99491_load [--slide 0x..] [--ko path] [--table path]
  * 日志：/data/local/tmp/c99491_load.log（每步 fsync）
  */
 #define _GNU_SOURCE 1
@@ -126,6 +125,14 @@ static int set_enforce(int on)
 	return rc == 1 ? 0 : -1;
 }
 
+static unsigned long long table_lookup(const char *name)
+{
+	for (int i = 0; i < ntbl; i++)
+		if (!strcmp(tbl[i].name, name))
+			return tbl[i].addr;
+	return 0;
+}
+
 static int load_table(const char *path)
 {
 	FILE *f = fopen(path, "r");
@@ -148,6 +155,32 @@ static int load_table(const char *path)
 	fclose(f);
 	logf_("table=%s entries=%d\n", path, ntbl);
 	return ntbl;
+}
+
+/* 用 kallsyms 的 selinux_state 运行时地址减去表中的链接期地址，得到 slide */
+static unsigned long long slide_from_kallsyms(void)
+{
+	FILE *f = fopen("/proc/kallsyms", "r");
+	char line[512];
+	unsigned long long link = table_lookup("selinux_state");
+
+	if (!f || !link)
+		return 0;
+	while (fgets(line, sizeof(line), f)) {
+		char nm[256], type;
+		unsigned long long a;
+
+		if (sscanf(line, "%llx %c %255s", &a, &type, nm) != 3)
+			continue;
+		if (!strcmp(nm, "selinux_state")) {
+			fclose(f);
+			if (a < link)
+				return 0;
+			return a - link;
+		}
+	}
+	fclose(f);
+	return 0;
 }
 
 int main(int argc, char **argv)
@@ -176,7 +209,6 @@ int main(int argc, char **argv)
 		else if (!strcmp(argv[i], "--table") && i + 1 < argc)
 			table = argv[++i];
 	}
-	logf_("slide=%#llx ko=%s\n", slide, ko_path);
 
 	/* 等 ctest 改好 cred */
 	for (int i = 0; i < 320; i++) {
@@ -198,6 +230,17 @@ int main(int argc, char **argv)
 		return 3;
 	}
 
+	if (!slide) {
+		slide = slide_from_kallsyms();
+		logf_("slide(自 kallsyms)=%#llx\n", slide);
+	} else {
+		logf_("slide(参数)=%#llx\n", slide);
+	}
+	if (!slide) {
+		logf_("=== abort: 无法确定 slide ===\n");
+		return 4;
+	}
+
 	/* 等 permissive 窗口 */
 	for (int i = 0; i < 200; i++) {
 		if (enforce_now() == 0)
@@ -209,16 +252,16 @@ int main(int argc, char **argv)
 	fd = open(ko_path, O_RDONLY);
 	if (fd < 0) {
 		logf_("open ko failed errno=%d\n", errno);
-		return 4;
+		return 5;
 	}
 	if (fstat(fd, &st) != 0) {
 		logf_("stat ko failed errno=%d\n", errno);
-		return 5;
+		return 6;
 	}
 	img = malloc((size_t)st.st_size);
 	if (!img || read(fd, img, (size_t)st.st_size) != (ssize_t)st.st_size) {
 		logf_("read ko failed\n");
-		return 6;
+		return 7;
 	}
 	close(fd);
 	logf_("ko size=%ld\n", (long)st.st_size);
@@ -226,7 +269,7 @@ int main(int argc, char **argv)
 	eh = (struct ehdr64 *)img;
 	if (memcmp(eh->e_ident, "\177ELF", 4) != 0) {
 		logf_("not ELF\n");
-		return 7;
+		return 8;
 	}
 	sh = (struct shdr64 *)(img + eh->e_shoff);
 
@@ -241,19 +284,14 @@ int main(int argc, char **argv)
 
 			for (int k = 1; k < nsym; k++) {
 				const char *nm;
-				unsigned long long addr = 0;
+				unsigned long long addr;
 
 				if (syms[k].st_shndx != SHN_UNDEF)
 					continue;
 				if (syms[k].st_name >= strsize)
 					continue;
 				nm = strtab + syms[k].st_name;
-				for (int m = 0; m < ntbl; m++) {
-					if (!strcmp(nm, tbl[m].name)) {
-						addr = tbl[m].addr;
-						break;
-					}
-				}
+				addr = table_lookup(nm);
 				if (!addr) {
 					missing++;
 					if (missing <= 5)
@@ -270,17 +308,17 @@ int main(int argc, char **argv)
 	logf_("patched=%d missing=%d\n", patched, missing);
 	if (missing > 0) {
 		logf_("=== abort: %d 个符号不在表中 ===\n", missing);
-		return 8;
+		return 9;
 	}
 
 	memfd = (int)syscall(SYS_memfd_create, "ksu", 0);
 	if (memfd < 0) {
 		logf_("memfd_create failed errno=%d\n", errno);
-		return 9;
+		return 10;
 	}
 	if (write(memfd, img, (size_t)st.st_size) != (ssize_t)st.st_size) {
 		logf_("memfd write failed errno=%d\n", errno);
-		return 10;
+		return 11;
 	}
 	lseek(memfd, 0, SEEK_SET);
 
@@ -294,5 +332,5 @@ int main(int argc, char **argv)
 	logf_("su_exists=%d\n", access("/system/bin/su", X_OK) == 0);
 	logf_("=== done ===\n");
 	fclose(g_log);
-	return rc == 0 ? 0 : 11;
+	return rc == 0 ? 0 : 12;
 }
