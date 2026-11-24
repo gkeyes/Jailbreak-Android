@@ -1,27 +1,25 @@
 /*
- * c99491_load —— 单进程 KernelSU 模块加载器（B 方案核心）。
+ * c99491_load —— 单进程 KernelSU 模块加载器。
  *
- * 实测结论链：
- *   - cred 改写后 uid=0 且 CapPrm 含 SYSLOG+SYS_MODULE；
- *   - Enforcing 下 finit_module 被 AVC 拒绝（denied { sys_module } capability=16）；
- *   - permissive 窗口内 finit_module 可以成功；
- *   - 但清零 selinux_state 前 8 字节会同时清掉 enforcing、initialized、
- *     policycap[0..5]，只写回 enforcing 不足以恢复，系统数分钟后仍会重启；
- *   - 解决办法：窗口内先重载运行策略（/sys/fs/selinux/policy → /load），
- *     由内核重建 initialized 与 policycap；顺序必须在模块加载之前，
- *     否则会冲掉模块注入的 ksu 域。
+ * 关键设计（本机实测得出）：
+ *   1. cred 改写后进程 uid=0 且 CapPrm 含 CAP_MAC_ADMIN(33)/CAP_SYSLOG(34)/
+ *      CAP_SYS_MODULE(16)，此时**可以合法写 /sys/fs/selinux/enforce**
+ *      （成功那次的日志即 `restore enforce rc=0`）。
+ *   2. 因此完全不需要去写 selinux_state 内存 —— 之前那样做会破坏
+ *      enforcing/initialized/policycap，导致数分钟后内核 panic。
+ *   3. 用 setenforce 开关 permissive 是合法操作，不破坏任何结构体，
+ *      窗口可以任意短。
  *
- * 完整顺序：
+ * 流程：
  *   1. 等 cred（uid=0 且 CapPrm 含 SYSLOG+SYS_MODULE）
- *   2. 等 permissive 窗口（enforce==0）
- *   3. 重载策略（重建 initialized/policycap）
- *   4. 求 slide（文件 / kallsyms / 参数）
- *   5. 解析 KO symtab，用离线表把未定义符号改成 SHN_ABS + 绝对地址
- *   6. memfd → finit_module
- *   7. 恢复 enforce=1
+ *   2. setenforce 0（失败则 abort，不冒险）
+ *   3. 求 slide（--slide / /data/local/tmp/slide.txt / kallsyms）
+ *   4. 解析 KO symtab，用离线表把 225 个未定义符号改成 SHN_ABS + 绝对地址
+ *   5. memfd → finit_module
+ *   6. setenforce 1
  *
  * 用法：c99491_load [--slide 0x..] [--ko path] [--table path]
- * 日志：/data/local/tmp/c99491_load.log（每步 fsync）
+ * 日志：/data/local/tmp/c99491_load.log（0666，便于 shell 读取）
  */
 #define _GNU_SOURCE 1
 #include <errno.h>
@@ -40,8 +38,6 @@
 #define DEFAULT_TABLE "/data/local/tmp/ksu_syms.txt"
 #define SLIDE_FILE "/data/local/tmp/slide.txt"
 #define KPTR_PATH "/proc/sys/kernel/kptr_restrict"
-#define POLICY_PATH "/sys/fs/selinux/policy"
-#define LOAD_PATH "/sys/fs/selinux/load"
 #define MAX_SYMS 512
 #define SHN_UNDEF 0
 #define SHN_ABS 0xfff1
@@ -147,50 +143,6 @@ static int write_str(const char *path, const char *s)
 	return rc > 0 ? 0 : -1;
 }
 
-/* 重载运行中的策略：读 /sys/fs/selinux/policy 再写回 /sys/fs/selinux/load。
- * 内核会据此重建 selinux_state 的 initialized 与 policycap。 */
-static int reload_policy(void)
-{
-	int in, out;
-	unsigned char *buf;
-	ssize_t total = 0, n;
-	int ok = -1;
-
-	in = open(POLICY_PATH, O_RDONLY);
-	if (in < 0) {
-		logf_("open policy failed errno=%d\n", errno);
-		return -1;
-	}
-	buf = malloc(4 * 1024 * 1024);
-	if (!buf) {
-		close(in);
-		logf_("policy malloc failed\n");
-		return -1;
-	}
-	while ((n = read(in, buf + total, 4 * 1024 * 1024 - (size_t)total)) > 0)
-		total += n;
-	close(in);
-	logf_("policy read=%ld bytes\n", (long)total);
-	if (total <= 0) {
-		free(buf);
-		return -1;
-	}
-
-	out = open(LOAD_PATH, O_WRONLY);
-	if (out < 0) {
-		logf_("open load failed errno=%d\n", errno);
-		free(buf);
-		return -1;
-	}
-	n = write(out, buf, (size_t)total);
-	logf_("policy write=%ld errno=%d (%s)\n", (long)n, errno, strerror(errno));
-	if (n == total)
-		ok = 0;
-	close(out);
-	free(buf);
-	return ok;
-}
-
 static unsigned long long table_lookup(const char *name)
 {
 	for (int i = 0; i < ntbl; i++)
@@ -292,6 +244,7 @@ int main(int argc, char **argv)
 	g_log = fopen(LOG_PATH, "w");
 	if (!g_log)
 		return 1;
+	fchmod(fileno(g_log), 0666);
 	logf_("=== c99491_load start %ld ===\n", (long)time(NULL));
 
 	for (int i = 1; i < argc; i++) {
@@ -303,7 +256,7 @@ int main(int argc, char **argv)
 			table = argv[++i];
 	}
 
-	/* 1) 等 cred */
+	/* 1) 等 cred：uid=0 且 permitted 有 SYSLOG + SYS_MODULE */
 	for (int i = 0; i < 320; i++) {
 		unsigned long long prm = cap_of("CapPrm:");
 
@@ -323,18 +276,16 @@ int main(int argc, char **argv)
 		return 3;
 	}
 
-	/* 2) 等 permissive 窗口 */
-	for (int i = 0; i < 200; i++) {
-		if (enforce_now() == 0)
-			break;
-		usleep(100000);
+	/* 2) 用合法 setenforce 打开窗口（不写 selinux_state） */
+	logf_("enforce_before=%d\n", enforce_now());
+	logf_("setenforce(0) rc=%d\n", set_enforce(0));
+	logf_("enforce_window=%d\n", enforce_now());
+	if (enforce_now() != 0) {
+		logf_("=== abort: setenforce 失败（不冒险继续）===\n");
+		return 4;
 	}
-	logf_("enforce(window)=%d\n", enforce_now());
 
-	/* 3) 重建 SELinux 状态（必须在模块加载之前） */
-	logf_("reload_policy rc=%d\n", reload_policy());
-
-	/* 4) 求 slide */
+	/* 3) 求 slide */
 	if (!slide)
 		slide = slide_from_file();
 	if (slide)
@@ -344,24 +295,28 @@ int main(int argc, char **argv)
 		logf_("slide(kallsyms)=%#llx\n", slide);
 	}
 	if (!slide) {
+		logf_("restore enforce rc=%d\n", set_enforce(1));
 		logf_("=== abort: 无法确定 slide ===\n");
-		return 4;
+		return 5;
 	}
 
-	/* 5) 读 KO 并打符号补丁 */
+	/* 4) 读 KO 并打符号补丁 */
 	fd = open(ko_path, O_RDONLY);
 	if (fd < 0) {
 		logf_("open ko failed errno=%d\n", errno);
-		return 5;
+		set_enforce(1);
+		return 6;
 	}
 	if (fstat(fd, &st) != 0) {
 		logf_("stat ko failed errno=%d\n", errno);
-		return 6;
+		set_enforce(1);
+		return 7;
 	}
 	img = malloc((size_t)st.st_size);
 	if (!img || read(fd, img, (size_t)st.st_size) != (ssize_t)st.st_size) {
 		logf_("read ko failed\n");
-		return 7;
+		set_enforce(1);
+		return 8;
 	}
 	close(fd);
 	logf_("ko size=%ld\n", (long)st.st_size);
@@ -369,7 +324,8 @@ int main(int argc, char **argv)
 	eh = (struct ehdr64 *)img;
 	if (memcmp(eh->e_ident, "\177ELF", 4) != 0) {
 		logf_("not ELF\n");
-		return 8;
+		set_enforce(1);
+		return 9;
 	}
 	sh = (struct shdr64 *)(img + eh->e_shoff);
 
@@ -407,19 +363,22 @@ int main(int argc, char **argv)
 	}
 	logf_("patched=%d missing=%d\n", patched, missing);
 	if (missing > 0) {
+		logf_("restore enforce rc=%d\n", set_enforce(1));
 		logf_("=== abort: %d 个符号不在表中 ===\n", missing);
-		return 9;
+		return 10;
 	}
 
-	/* 6) memfd + finit_module */
+	/* 5) memfd + finit_module */
 	memfd = (int)syscall(SYS_memfd_create, "ksu", 0);
 	if (memfd < 0) {
 		logf_("memfd_create failed errno=%d\n", errno);
-		return 10;
+		set_enforce(1);
+		return 11;
 	}
 	if (write(memfd, img, (size_t)st.st_size) != (ssize_t)st.st_size) {
 		logf_("memfd write failed errno=%d\n", errno);
-		return 11;
+		set_enforce(1);
+		return 12;
 	}
 	lseek(memfd, 0, SEEK_SET);
 
@@ -428,11 +387,12 @@ int main(int argc, char **argv)
 	logf_("finit_module rc=%d errno=%d (%s)\n", rc, errno, strerror(errno));
 	close(memfd);
 
-	/* 7) 恢复 Enforcing */
+	/* 6) 立刻恢复 Enforcing */
 	logf_("restore enforce rc=%d\n", set_enforce(1));
 	logf_("enforce_after=%d\n", enforce_now());
+	logf_("module_live=%d\n", access("/sys/module/kernelsu", F_OK) == 0);
 	logf_("su_exists=%d\n", access("/system/bin/su", X_OK) == 0);
 	logf_("=== done ===\n");
 	fclose(g_log);
-	return rc == 0 ? 0 : 12;
+	return rc == 0 ? 0 : 13;
 }
