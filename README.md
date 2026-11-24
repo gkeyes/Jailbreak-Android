@@ -1,23 +1,22 @@
-# Lhasa26-Android
+# next-99491 实验归档
 
-Clean-room Android refactor of the attached `lhasa26-v4.17-xmz.apk`.
+本分支记录了 2026 年 11 月 24 日在 Xiaomi 18 Fold（lhasa）上的一次临时提权实验。实验已结束，稳定使用的目标未达成。
 
-The application layer is rewritten in Java with a separated workflow engine, Shizuku command adapter, asset deployer, device information model, log export, and programmatic UI. The supplied device-specific native payloads are kept as opaque assets so the first refactor can preserve the original runtime behavior while the application code is independently maintainable.
+## 实验结果
 
-## Current scope
+当日状态记录记载了两次模块装载成功，`su` 短时可用，随后设备在 1–5 分钟内重启。现存总结没有列出完整尝试总数，无法据此计算成功率，也不足以证明整条流程可以独立、稳定地重复完成。
 
-- Android application ID: `com.gkeyes.lhasa26`
-- Minimum SDK: 26
-- Target / compile SDK: 35
-- Shizuku API: 13.1.5
-- Supported kernel profiles are the three profiles shipped in the source APK.
-- The release build is intentionally unsigned by the repository; signing belongs in the local or CI release workflow.
+## 保留的记录
 
-## Build
+| 文件 | 用途 |
+| --- | --- |
+| [当日状态](plant/cve99491/STATUS.md) | 查阅当时记录的结果和稳定性表现。 |
+| [实验复盘](docs/cve99491-lhasa-lessons.md) | 查阅当时的观测、归因和未完成项。 |
+| `plant/cve99491/README.md` | 当时交给 AI 的提示词原稿，供回顾开发决策。 |
 
-```bash
-export ANDROID_SDK_ROOT=/path/to/android-sdk
-./gradlew :app:assembleDebug
-```
+三份原稿保留当时的措辞。其中的“下一步”和工具路径属于历史上下文，部分工具在归档前已被删除。
 
-The runtime payloads under `app/src/main/assets/` came from the user-supplied APK and are device/kernel-specific. Do not publish this repository without confirming the applicable rights, device scope, and disclosure policy.
+## 版本记录
+
+- 清理前的分支快照为 `f0b7f1c8678c3bfe04c2ffe5f6b5f02066295fed`。此前历次提交仍可通过 Git 历史查阅。
+- 本实验从 `1ca0996fa1a6fd281581fdbc1d254a54b02405db` 分出。应用代码和 UI 的后续开发见 [next 分支](https://github.com/gkeyes/Jailbreak-Android/tree/next)。
