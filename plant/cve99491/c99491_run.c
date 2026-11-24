@@ -9,7 +9,7 @@
  *
  * 它做三件事：
  *   1. 记录自身 uid/euid/gid/egid 与 Cap*（证明 exec 后凭据保留情况）
- *   2. 用 fd=-1 调 finit_module，判断 Module 加载被哪一层挡住：
+ *   2. 用 fd=-1 调 finit_module，判断模块加载被哪一层挡住：
  *        EPERM  -> 能力位不足
  *        EACCES -> SELinux 拦截
  *        EBADF  -> 能力与策略都通过（只是 fd 无效），可以真正装模块
@@ -24,6 +24,7 @@
 #include <string.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #define LOG_PATH "/data/local/tmp/c99491_run.log"
@@ -60,7 +61,7 @@ int main(void)
 
 	if (!f)
 		return 1;
-	fprintf(f, "=== c99491_run %ld ===\n", (long)time(NULL) * 1L);
+	fprintf(f, "=== c99491_run %ld ===\n", (long)time(NULL));
 
 	dump_status(f);
 
