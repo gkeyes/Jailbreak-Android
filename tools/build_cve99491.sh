@@ -79,40 +79,45 @@ patch_macro "$T/ctest.c" BLOB_SITE_B "$BLOB_B"
 grep -E "^#define[[:space:]]+(LINK_|CRED_SITE|BLOB_SITE)" "$T/ctest.c" | sed 's/^/  ctest.c: /'
 
 # —— 策略补丁：补能力位、permissive 改为按需、loadksu 换成 ksud ——
+# 注意：fast 链与 all 链里这些代码各出现一次，期望次数必须写对，
+# 否则补丁会在"命中 2 次"这种地方失败（第一版就栽在这）。
 python3 - "$T/ctest.c" <<'PY'
 import sys, io
 
 path = sys.argv[1]
 src = io.open(path, encoding="utf-8").read()
 
-def sub_once(text, old, new, what):
+def sub_n(text, old, new, what, want=1):
     n = text.count(old)
-    if n != 1:
-        raise SystemExit("补丁失败：%s 命中 %d 次" % (what, n))
+    if n != want:
+        raise SystemExit("补丁失败：%s 期望 %d 次，实际 %d 次" % (what, want, n))
     return text.replace(old, new)
 
 # 1) 补全能力位（含 CAP_SYSLOG，ksud 才能自己读 kallsyms 重定位）
-src = sub_once(
+src = sub_n(
     src,
     "    patch_agent(pid, cred, 0, 1);\n",
     "    patch_agent(pid, cred, 0, 1);\n    patch_full_caps(pid, cred);\n",
     "chain_fast 补 patch_full_caps",
+    1,
 )
 
-# 2) permissive 默认跳过：只在 C99491_PERMISSIVE=1 时尝试
-src = sub_once(
+# 2) permissive 默认跳过（fast 链 + all 链各一处）
+src = sub_n(
     src,
     "    if (try_permissive(st) < 0) {",
     "    if (getenv(\"C99491_PERMISSIVE\") && try_permissive(st) < 0) {",
     "try_permissive 条件化",
+    2,
 )
 
-# 3) 装载方式：手工符号表 -> ksud late-load
-src = sub_once(
+# 3) 装载方式：手工符号表 -> ksud late-load（两处）
+src = sub_n(
     src,
     "        int n = snprintf(c, sizeof(c), \"loadksu %#llx allow_shell=1\\n\", slide);",
     "        int n = snprintf(c, sizeof(c), \"run /data/local/tmp/ksud_go.sh\\n\");",
     "loadksu -> run ksud_go.sh",
+    2,
 )
 
 io.open(path, "w", encoding="utf-8").write(src)
