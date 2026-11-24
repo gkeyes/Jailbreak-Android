@@ -1,20 +1,19 @@
 /*
  * c99491_agent —— 被 ctest 改造 cred 的进程，负责落地 KernelSU。
  *
- * 已实测确认：
- *   1. cred 改写后 Uid: 0 0 2000 0，且 CapInh/CapPrm/CapEff/CapBnd 均为
- *      0x0e00050000（含 CAP_SYSLOG=34 / CAP_SYS_MODULE=16）；
- *   2. 真实 uid=0 且 permitted 非空时 execve 走 legacy 语义 E'=P'，
- *      能力可跨 exec 保留（本版本依赖这一点）；
- *   3. SELinux permissive 只放行策略检查，不授予能力；把 selinux_state+0
- *      清零可打开窗口（enforce 变 0，且能写回 1）；
- *   4. 自己 finit_module 提取的 ksu.ko 返回 ENOENT（未做符号重定位），
- *      因此改由 ksud（它会读 kallsyms 重定位）执行。
+ * 关键约束（实测）：清零 selinux_state 前 8 字节会同时清掉
+ * enforcing / initialized / policycap。permissive 打开后系统还能活几十秒，
+ * 但窗口持续 1–3 分钟就会卡死或重启。上游做法是「窗口只覆盖一次
+ * finit_module」。因此本版本把窗口压缩到 ~1 秒：
+ *   等 cred 就绪 → 等窗口 → ksud insmod → 立刻恢复 Enforcing → 再 late-load
  *
- * 本版本重点：把 ksud 的 stdout/stderr 通过**管道**捕获后写进本日志，
- * 避免之前 dup2 到文件失败导致的“报错丢失”。
+ * 其余实测结论：
+ *   - SELinux permissive 不授予能力，cap_capable() 独立于策略；
+ *     因此必须等 CapPrm 含 SYSLOG(34)+SYS_MODULE(16) 再 exec，能力才可跨 exec；
+ *   - 自己直接 finit_module 提取的 ksu.ko 会 ENOENT（未重定位），必须由 ksud 做；
+ *   - ksud 输出用管道捕获后写入本日志（不依赖子进程写文件）。
  *
- * 日志：/data/local/tmp/c99491_agent.log
+ * 日志：/data/local/tmp/c99491_agent.log（关键步骤 fsync，尽量留证）
  */
 #define _GNU_SOURCE 1
 #include <errno.h>
@@ -93,7 +92,6 @@ static void dump(FILE *f, const char *tag)
 	fclose(s);
 }
 
-/* 只取本次新增的 kmsg，且最多 12 行 */
 static void dump_kmsg(FILE *f, const char *tag)
 {
 	int fd = open("/dev/kmsg", O_RDONLY | O_NONBLOCK);
@@ -107,23 +105,23 @@ static void dump_kmsg(FILE *f, const char *tag)
 		return;
 	}
 	lseek(fd, 0, SEEK_END);
-	while ((n = read(fd, buf, sizeof(buf) - 1)) > 0 && kept < 12) {
+	while ((n = read(fd, buf, sizeof(buf) - 1)) > 0 && kept < 10) {
 		char *p = buf, *nl;
 
 		buf[n] = 0;
-		while ((nl = strchr(p, '\n')) != NULL && kept < 12) {
+		while ((nl = strchr(p, '\n')) != NULL && kept < 10) {
 			*nl = 0;
 			if (strstr(p, "module") || strstr(p, "kernelsu") ||
-			    strstr(p, "insmod") || strstr(p, "finit") ||
-			    strstr(p, "avc"))
-				fprintf(f, "  %s\n", p), kept++;
+			    strstr(p, "insmod") || strstr(p, "finit")) {
+				fprintf(f, "  %s\n", p);
+				kept++;
+			}
 			p = nl + 1;
 		}
 	}
 	close(fd);
 }
 
-/* 用管道捕获 ksud 输出，再写进我们自己的日志（不依赖目标目录可写） */
 static int run_ksud(FILE *f, const char *tag, char *const argv[])
 {
 	int pipefd[2];
@@ -165,25 +163,25 @@ static int run_ksud(FILE *f, const char *tag, char *const argv[])
 		}
 		if (*q)
 			fprintf(f, "  [ksud %s] %s\n", tag, q);
-		fflush(f);
 	}
 	close(pipefd[0]);
 	waitpid(p, &st, 0);
 	fprintf(f, "ksud %s exit=%d\n", tag, WIFEXITED(st) ? WEXITSTATUS(st) : -1);
 	fflush(f);
+	fsync(fileno(f));
 	return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
 }
 
 int main(void)
 {
 	FILE *f = fopen(LOG_PATH, "w");
-	int ready = 0;
+	int ready = 0, perm = 0, ins_rc = -1;
 
 	if (!f)
 		return 1;
 	fprintf(f, "=== c99491_agent start %ld ===\n", (long)time(NULL));
-	dump(f, "start");
 	fflush(f);
+	fsync(fileno(f));
 
 	for (int i = 0; i < 320; i++) {
 		unsigned long long prm = read_caps("CapPrm:");
@@ -194,21 +192,41 @@ int main(void)
 		}
 		usleep(250000);
 	}
-	fprintf(f, "ready=%d (需要 CapPrm 含 bit34+bit16)\n", ready);
+	fprintf(f, "ready=%d (需要 uid=0 且 CapPrm 含 bit34+bit16)\n", ready);
 	dump(f, ready ? "patched" : "timeout");
 	fflush(f);
+	fsync(fileno(f));
 	if (!ready) {
 		fprintf(f, "=== abort: permitted 能力未落地 ===\n");
 		fclose(f);
 		return 2;
 	}
 
+	for (int i = 0; i < 120; i++) {
+		if (enforce_state() == 0) {
+			perm = 1;
+			break;
+		}
+		usleep(250000);
+	}
+	fprintf(f, "permissive_window=%d\n", perm);
+	fflush(f);
+	fsync(fileno(f));
+
+	/* 窗口内只做一件事：ksud 读 kallsyms 重定位并 insmod */
 	{
 		char *ins[] = { (char *)KSUD, (char *)"insmod", (char *)KO_PATH,
 				(char *)"allow_shell=1", NULL };
 
-		run_ksud(f, "insmod", ins);
+		ins_rc = run_ksud(f, "insmod", ins);
 	}
+
+	/* 立刻收窗：permissive 持续越久越容易挂 */
+	fprintf(f, "restore_enforce rc=%d\n", set_enforce(1));
+	fprintf(f, "enforce_after=%d\n", enforce_state());
+	fflush(f);
+	fsync(fileno(f));
+
 	dump_kmsg(f, "after-insmod");
 
 	{
@@ -216,13 +234,15 @@ int main(void)
 				 (char *)KMI, (char *)"--allow-shell", (char *)"--package-name",
 				 (char *)"me.weishu.kernelsu", NULL };
 
-		run_ksud(f, "late-load", late);
+		if (ins_rc == 0 || access("/sys/module/kernelsu", F_OK) == 0)
+			run_ksud(f, "late-load", late);
+		else
+			fprintf(f, "skip late-load: insmod rc=%d\n", ins_rc);
 	}
 
-	fprintf(f, "restore_enforce rc=%d\n", set_enforce(1));
-	fprintf(f, "enforce_after=%d\n", enforce_state());
 	fprintf(f, "su_exists=%d\n", access("/system/bin/su", X_OK) == 0);
 	fprintf(f, "=== done ===\n");
+	fflush(f);
 	fclose(f);
 	return 0;
 }
