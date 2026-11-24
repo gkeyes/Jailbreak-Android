@@ -1,18 +1,18 @@
 /*
  * c99491_load —— 单进程 KernelSU 模块加载器（B 方案核心）。
  *
- * 为什么不走 ksud：
- *   - `ksud insmod` 要 exec 新进程，能力继承受 permitted/ambient 约束，
- *     且报错不透明；
- *   - 自己直接 finit_module 又因 KO 的 225 个未导出符号而 ENOENT。
- * 因此本程序在**本进程内**：解析 KO symtab → 用离线表把未定义符号改成
- * SHN_ABS 且 st_value = 链接期地址 + slide → memfd → finit_module。
+ * 为什么不走 ksud：`ksud insmod` 要 exec 新进程，能力继承受
+ * permitted/ambient 约束、报错不透明；而自己直接 finit_module 又因 KO
+ * 有 225 个未导出符号而 ENOENT。因此本程序在**本进程内**：
+ *   解析 KO symtab → 用离线表把未定义符号改成 SHN_ABS 且
+ *   st_value = 链接期地址 + slide → memfd → finit_module。
  *
- * slide 的获取：优先 --slide；否则在已有 CAP_SYSLOG 的前提下读
- * /proc/kallsyms 里 selinux_state 的运行时地址，减去表里的链接期地址得到。
- *
- * 前提（由 ctest 完成）：uid==0 且 CapPrm 含 CAP_SYSLOG(34)+CAP_SYS_MODULE(16)，
- * 并且 permissive 窗口已打开。
+ * 顺序很关键（实测）：
+ *   1. 等 ctest 改好 cred（uid=0 且 CapPrm 含 SYSLOG+SYS_MODULE）
+ *   2. 等 permissive 窗口（enforce==0）
+ *   3. **此时**才读 /proc/kallsyms 求 slide —— Enforcing 下 kptr_restrict=2
+ *      会遮蔽地址（表现为全 0），必须在窗口内读
+ *   4. 打补丁 → finit_module → 立刻恢复 Enforcing
  *
  * 用法：c99491_load [--slide 0x..] [--ko path] [--table path]
  * 日志：/data/local/tmp/c99491_load.log（每步 fsync）
@@ -157,15 +157,22 @@ static int load_table(const char *path)
 	return ntbl;
 }
 
-/* 用 kallsyms 的 selinux_state 运行时地址减去表中的链接期地址，得到 slide */
+/* 读 /proc/kallsyms 的 selinux_state 运行时地址，减去表中链接期地址 = slide */
 static unsigned long long slide_from_kallsyms(void)
 {
 	FILE *f = fopen("/proc/kallsyms", "r");
 	char line[512];
 	unsigned long long link = table_lookup("selinux_state");
 
-	if (!f || !link)
+	if (!f) {
+		logf_("open kallsyms failed errno=%d\n", errno);
 		return 0;
+	}
+	if (!link) {
+		logf_("table 缺 selinux_state\n");
+		fclose(f);
+		return 0;
+	}
 	while (fgets(line, sizeof(line), f)) {
 		char nm[256], type;
 		unsigned long long a;
@@ -173,10 +180,9 @@ static unsigned long long slide_from_kallsyms(void)
 		if (sscanf(line, "%llx %c %255s", &a, &type, nm) != 3)
 			continue;
 		if (!strcmp(nm, "selinux_state")) {
+			logf_("kallsyms selinux_state=%#llx link=%#llx\n", a, link);
 			fclose(f);
-			if (a < link)
-				return 0;
-			return a - link;
+			return (a && a > link) ? a - link : 0;
 		}
 	}
 	fclose(f);
@@ -210,7 +216,7 @@ int main(int argc, char **argv)
 			table = argv[++i];
 	}
 
-	/* 等 ctest 改好 cred */
+	/* 1) 等 cred */
 	for (int i = 0; i < 320; i++) {
 		unsigned long long prm = cap_of("CapPrm:");
 
@@ -230,25 +236,25 @@ int main(int argc, char **argv)
 		return 3;
 	}
 
+	/* 2) 等 permissive 窗口 */
+	for (int i = 0; i < 200; i++) {
+		if (enforce_now() == 0)
+			break;
+		usleep(100000);
+	}
+	logf_("enforce(window)=%d\n", enforce_now());
+
+	/* 3) 窗口内求 slide（Enforcing 下 kallsyms 会被遮蔽） */
 	if (!slide) {
 		slide = slide_from_kallsyms();
-		logf_("slide(自 kallsyms)=%#llx\n", slide);
-	} else {
-		logf_("slide(参数)=%#llx\n", slide);
+		logf_("slide=%#llx\n", slide);
 	}
 	if (!slide) {
 		logf_("=== abort: 无法确定 slide ===\n");
 		return 4;
 	}
 
-	/* 等 permissive 窗口 */
-	for (int i = 0; i < 200; i++) {
-		if (enforce_now() == 0)
-			break;
-		usleep(100000);
-	}
-	logf_("enforce(before load)=%d\n", enforce_now());
-
+	/* 4) 读 KO 并打符号补丁 */
 	fd = open(ko_path, O_RDONLY);
 	if (fd < 0) {
 		logf_("open ko failed errno=%d\n", errno);
@@ -280,7 +286,7 @@ int main(int argc, char **argv)
 			syms = (struct sym64 *)(img + sh[i].sh_offset);
 			strtab = (char *)(img + sh[sh[i].sh_link].sh_offset);
 			strsize = (size_t)sh[sh[i].sh_link].sh_size;
-			logf_("symtab sect=%d syms=%d strsize=%zu\n", i, nsym, strsize);
+			logf_("symtab sect=%d syms=%d\n", i, nsym);
 
 			for (int k = 1; k < nsym; k++) {
 				const char *nm;
