@@ -1,19 +1,21 @@
 /*
- * c99491_agent —— 被 ctest 改造 cred 的那个进程，原地加载 KernelSU 模块。
+ * c99491_agent —— 被 ctest 改造 cred 的那个进程，原地完成 KernelSU 落地。
  *
- * 设计动机（有硬证据）：
- *   - agent 被改 cred 后有 euid=0、CapEff=0x0e00050000，但 CapPrm=0；
- *   - exec 会按 permitted/ambient 重算，能力全清（实测 CapPrm/CapEff 归零）；
- *   - finit_module 返回 EPERM，AVC 明确写了
+ * 已证实的结论（本机实测）：
+ *   - cred 改写后 euid=0、CapEff=0x0e00050000，但 permitted 为空；
+ *   - 不带 permissive 时 finit_module 返回 EPERM，AVC 明确写：
  *       avc: denied { sys_module } capability=16 scontext=u:r:shell:s0
- *     即 SELinux 的 capability 类规则不允许 shell 域用 CAP_SYS_MODULE。
+ *     → SELinux 的 capability 类规则不允许 shell 域使用 CAP_SYS_MODULE；
+ *   - 打开 permissive 窗口后同一调用返回 EEXIST（模块已存在），
+ *     证明权限门禁已通过、请求真的进入了内核。
  *
- * 因此流程改为：
- *   1. 轮询等 euid==0 且 CapEff 含 CAP_SYS_MODULE（ctest 改 cred 后即满足）
- *   2. 等 permissive 窗口（由 ctest 以 C99491_PERMISSIVE=1 打开）：
- *      轮询 /sys/fs/selinux/enforce 变为 0
- *   3. 打开 /data/local/tmp/ksu.ko 并 finit_module
- *   4. 立刻把 enforce 写回 1（本进程有 CAP_MAC_ADMIN），并记录结果
+ * 因此流程：
+ *   1. 等 ctest 改好 cred（euid==0 且 CapEff 含 CAP_SYS_MODULE）
+ *   2. 等 permissive 窗口（ctest 以 C99491_PERMISSIVE=1 打开）
+ *   3. finit_module(/data/local/tmp/ksu.ko, "allow_shell=1")
+ *   4. 成功则 fork+exec `ksud late-load`，让官方工具完成 install/features/
+ *      策略与管理器拉起（此时进程 uid=0，且能力位已在 permitted/ambient 里）
+ *   5. 恢复 Enforcing 并记录状态
  *
  * 日志：/data/local/tmp/c99491_agent.log
  */
@@ -24,11 +26,14 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
 #define LOG_PATH "/data/local/tmp/c99491_agent.log"
 #define KO_PATH "/data/local/tmp/ksu.ko"
+#define KSUD "/data/local/tmp/ksud"
+#define KMI "android17-6.18"
 
 static int cap_sys_module(void)
 {
@@ -45,7 +50,7 @@ static int cap_sys_module(void)
 		}
 	}
 	fclose(s);
-	return (eff & (1ULL << 16)) != 0; /* CAP_SYS_MODULE = 16 */
+	return (eff & (1ULL << 16)) != 0;
 }
 
 static int enforce_state(void)
@@ -91,6 +96,36 @@ static void dump(FILE *f, const char *tag)
 	fclose(s);
 }
 
+/* 官方工具收尾：ksud late-load 会跳过 KO 加载，只做 install/features/策略/管理器 */
+static void run_ksud(FILE *f)
+{
+	pid_t p;
+	int st = 0;
+
+	fprintf(f, "--- ksud late-load ---\n");
+	fflush(f);
+	p = fork();
+	if (p == 0) {
+		int fd = open(LOG_PATH, O_WRONLY | O_APPEND);
+
+		if (fd >= 0) {
+			dup2(fd, 1);
+			dup2(fd, 2);
+			if (fd > 2)
+				close(fd);
+		}
+		execl(KSUD, KSUD, "late-load", "--kmi", KMI, "--allow-shell",
+		      "--package-name", "me.weishu.kernelsu", (char *)NULL);
+		_exit(127);
+	}
+	if (p > 0) {
+		waitpid(p, &st, 0);
+		fprintf(f, "ksud exit=%d\n", WIFEXITED(st) ? WEXITSTATUS(st) : -1);
+	} else {
+		fprintf(f, "ksud fork failed errno=%d\n", errno);
+	}
+}
+
 int main(void)
 {
 	FILE *f = fopen(LOG_PATH, "w");
@@ -103,7 +138,6 @@ int main(void)
 	dump(f, "start");
 	fflush(f);
 
-	/* 1) 等 ctest 把 cred 改好 */
 	for (int i = 0; i < 200; i++) {
 		if (geteuid() == 0 && cap_sys_module()) {
 			ready = 1;
@@ -120,7 +154,6 @@ int main(void)
 		return 2;
 	}
 
-	/* 2) 等 permissive 窗口（ctest 以 C99491_PERMISSIVE=1 打开） */
 	for (int i = 0; i < 120; i++) {
 		if (enforce_state() == 0) {
 			perm = 1;
@@ -149,12 +182,15 @@ int main(void)
 	saved = errno;
 	fprintf(f, "finit_module rc=%d errno=%d (%s)\n", rc, saved, strerror(saved));
 	close(fd);
+	fflush(f);
 
-	/* 3) 立刻恢复 Enforcing（本进程有 CAP_MAC_ADMIN） */
+	/* 模块已就绪（rc==0，或 EEXIST 表示本 boot 已加载）→ 用 ksud 收尾 */
+	if (rc == 0 || saved == EEXIST)
+		run_ksud(f);
+
 	if (perm && set_enforce(1) != 0)
 		fprintf(f, "restore enforce failed errno=%d\n", errno);
 	fprintf(f, "enforce_after=%d\n", enforce_state());
-	fprintf(f, "module_kernelsu=%d\n", access("/sys/module/kernelsu", F_OK) == 0);
 	fprintf(f, "su_exists=%d\n", access("/system/bin/su", X_OK) == 0);
 	fprintf(f, "=== done ===\n");
 	fclose(f);
