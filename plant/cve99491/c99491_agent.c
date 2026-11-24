@@ -1,20 +1,20 @@
 /*
- * c99491_agent —— 被 ctest 改造 cred 的进程，负责在 permissive 窗口内落地 KernelSU。
+ * c99491_agent —— 被 ctest 改造 cred 的进程，负责落地 KernelSU。
  *
- * 本机实测结论链：
- *   1. cred 改写后 Uid: 0 0 2000 0、CapEff=0x0e00050000（含 CAP_SYSLOG/SYS_MODULE）；
- *   2. 不开 permissive 时 finit_module 返回 EPERM（AVC：denied { sys_module }）；
- *   3. permissive 下自行 finit_module 提取的 KO 返回 ENOENT（符号未重定位）；
- *   4. shell 身份 `ksud insmod` 报 Cannot parse kallsyms（需要 CAP_SYSLOG）；
- *   5. uid=0 + caps + permissive 的 agent 里 `ksud insmod` 仍返回 EPERM ——
- *      具体原因需要内核日志，因此本版本增加 /dev/kmsg 抓取与独立输出文件。
+ * 关键结论（本机逐条实测）：
+ *   1. cred 改写后 Uid: 0 0 2000 0、CapEff=0x0e00050000；
+ *   2. SELinux permissive **不会授予 capability**：cap_capable() 与策略无关，
+ *      所以只把 caps 写进 effective 不够 —— exec 出去的 ksud 依然 EPERM；
+ *   3. exec 会按 permitted/ambient 重算，因此必须等 patch_full_caps 把
+ *      **CapPrm** 也写进去（实测 ctest 的 caps 轮次里出现过 prm=1 amb=1）；
+ *   4. 真实 uid=0 + permitted 非空时，exec 后 E'=P'（legacy 语义），
+ *      ksud 才能拿到 CAP_SYSLOG(34) 读 kallsyms、CAP_SYS_MODULE(16) 装模块。
+ *
+ * 所以等待条件改为：uid==0 且 CapPrm 同时含 bit34 与 bit16。
  *
  * 输出：
- *   /data/local/tmp/c99491_agent.log   自身状态与流程
- *   /data/local/tmp/ksud_<cmd>.log     每条 ksud 命令的完整 stdout/stderr
- *   agent 日志内附 kmsg 中与 module/avc 相关的最近记录
- *
- * 日志：见上。
+ *   /data/local/tmp/c99491_agent.log     自身状态（kmsg 只取新增部分）
+ *   /data/local/tmp/ksud_<cmd>.log       每条 ksud 命令的完整输出
  */
 #define _GNU_SOURCE 1
 #include <errno.h>
@@ -32,22 +32,22 @@
 #define KSUD "/data/local/tmp/ksud"
 #define KMI "android17-6.18"
 
-static int cap_bit(int bit)
+static unsigned long long read_caps(const char *key)
 {
 	char line[256];
 	FILE *s = fopen("/proc/self/status", "r");
-	unsigned long long eff = 0;
+	unsigned long long v = 0;
 
 	if (!s)
 		return 0;
 	while (fgets(line, sizeof(line), s)) {
-		if (!strncmp(line, "CapEff:", 7)) {
-			sscanf(line + 7, "%llx", &eff);
+		if (!strncmp(line, key, strlen(key))) {
+			sscanf(line + strlen(key), "%llx", &v);
 			break;
 		}
 	}
 	fclose(s);
-	return (eff & (1ULL << bit)) != 0;
+	return v;
 }
 
 static int enforce_state(void)
@@ -93,34 +93,37 @@ static void dump(FILE *f, const char *tag)
 	fclose(s);
 }
 
-/* 把 /dev/kmsg 中与模块/SELinux 相关的最近若干行写入日志 */
+/* 只取本次运行新增的 kmsg，且只保留与模块相关的少量行 */
 static void dump_kmsg(FILE *f, const char *tag)
 {
 	int fd = open("/dev/kmsg", O_RDONLY | O_NONBLOCK);
-	char buf[8192];
+	char buf[4096];
 	ssize_t n;
+	int kept = 0;
 
 	fprintf(f, "--- kmsg(%s) ---\n", tag);
 	if (fd < 0) {
 		fprintf(f, "open /dev/kmsg failed errno=%d\n", errno);
 		return;
 	}
-	/* 只读尾部：持续读到没有更多数据 */
-	while ((n = read(fd, buf, sizeof(buf) - 1)) > 0) {
+	lseek(fd, 0, SEEK_END);
+	while ((n = read(fd, buf, sizeof(buf) - 1)) > 0 && kept < 12) {
 		char *p = buf, *nl;
 
 		buf[n] = 0;
-		while ((nl = strchr(p, '\n')) != NULL) {
+		while ((nl = strchr(p, '\n')) != NULL && kept < 12) {
 			*nl = 0;
-			if (strstr(p, "module") || strstr(p, "avc") || strstr(p, "kernelsu"))
+			if (strstr(p, "module") || strstr(p, "kernelsu") ||
+			    strstr(p, "insmod") || strstr(p, "finit")) {
 				fprintf(f, "%s\n", p);
+				kept++;
+			}
 			p = nl + 1;
 		}
 	}
 	close(fd);
 }
 
-/* 执行一条 ksud 子命令；输出写入独立文件，避免与主日志交错丢失 */
 static void run_ksud(FILE *f, const char *tag, char *const argv[])
 {
 	char out_path[128];
@@ -146,8 +149,6 @@ static void run_ksud(FILE *f, const char *tag, char *const argv[])
 	if (p > 0) {
 		waitpid(p, &st, 0);
 		fprintf(f, "ksud %s exit=%d\n", tag, WIFEXITED(st) ? WEXITSTATUS(st) : -1);
-	} else {
-		fprintf(f, "ksud fork failed errno=%d\n", errno);
 	}
 	fflush(f);
 }
@@ -155,7 +156,7 @@ static void run_ksud(FILE *f, const char *tag, char *const argv[])
 int main(void)
 {
 	FILE *f = fopen(LOG_PATH, "w");
-	int ready = 0, perm = 0;
+	int ready = 0;
 
 	if (!f)
 		return 1;
@@ -163,35 +164,23 @@ int main(void)
 	dump(f, "start");
 	fflush(f);
 
-	for (int i = 0; i < 240; i++) {
-		if (getuid() == 0 && cap_bit(34) && cap_bit(16)) {
+	/* 等 uid=0 且 CapPrm 含 SYSLOG(34) + SYS_MODULE(16) */
+	for (int i = 0; i < 320; i++) {
+		unsigned long long prm = read_caps("CapPrm:");
+
+		if (getuid() == 0 && (prm & (1ULL << 34)) && (prm & (1ULL << 16))) {
 			ready = 1;
 			break;
 		}
 		usleep(250000);
 	}
-	fprintf(f, "ready=%d\n", ready);
+	fprintf(f, "ready=%d (需要 CapPrm 含 bit34+bit16)\n", ready);
 	dump(f, ready ? "patched" : "timeout");
 	fflush(f);
 	if (!ready) {
-		fprintf(f, "=== abort: 凭据未落地 ===\n");
+		fprintf(f, "=== abort: permitted 能力未落地 ===\n");
 		fclose(f);
 		return 2;
-	}
-
-	for (int i = 0; i < 120; i++) {
-		if (enforce_state() == 0) {
-			perm = 1;
-			break;
-		}
-		usleep(250000);
-	}
-	fprintf(f, "permissive_window=%d\n", perm);
-	fflush(f);
-	if (!perm) {
-		fprintf(f, "=== abort: permissive 窗口未打开 ===\n");
-		fclose(f);
-		return 3;
 	}
 
 	{
@@ -209,7 +198,6 @@ int main(void)
 
 		run_ksud(f, "late-load", late);
 	}
-	dump_kmsg(f, "after-late");
 
 	fprintf(f, "restore_enforce rc=%d\n", set_enforce(1));
 	fprintf(f, "enforce_after=%d\n", enforce_state());
