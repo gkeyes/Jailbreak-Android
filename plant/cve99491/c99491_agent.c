@@ -1,20 +1,20 @@
 /*
  * c99491_agent —— 被 ctest 改造 cred 的进程，负责落地 KernelSU。
  *
- * 关键结论（本机逐条实测）：
- *   1. cred 改写后 Uid: 0 0 2000 0、CapEff=0x0e00050000；
- *   2. SELinux permissive **不会授予 capability**：cap_capable() 与策略无关，
- *      所以只把 caps 写进 effective 不够 —— exec 出去的 ksud 依然 EPERM；
- *   3. exec 会按 permitted/ambient 重算，因此必须等 patch_full_caps 把
- *      **CapPrm** 也写进去（实测 ctest 的 caps 轮次里出现过 prm=1 amb=1）；
- *   4. 真实 uid=0 + permitted 非空时，exec 后 E'=P'（legacy 语义），
- *      ksud 才能拿到 CAP_SYSLOG(34) 读 kallsyms、CAP_SYS_MODULE(16) 装模块。
+ * 已实测确认：
+ *   1. cred 改写后 Uid: 0 0 2000 0，且 CapInh/CapPrm/CapEff/CapBnd 均为
+ *      0x0e00050000（含 CAP_SYSLOG=34 / CAP_SYS_MODULE=16）；
+ *   2. 真实 uid=0 且 permitted 非空时 execve 走 legacy 语义 E'=P'，
+ *      能力可跨 exec 保留（本版本依赖这一点）；
+ *   3. SELinux permissive 只放行策略检查，不授予能力；把 selinux_state+0
+ *      清零可打开窗口（enforce 变 0，且能写回 1）；
+ *   4. 自己 finit_module 提取的 ksu.ko 返回 ENOENT（未做符号重定位），
+ *      因此改由 ksud（它会读 kallsyms 重定位）执行。
  *
- * 所以等待条件改为：uid==0 且 CapPrm 同时含 bit34 与 bit16。
+ * 本版本重点：把 ksud 的 stdout/stderr 通过**管道**捕获后写进本日志，
+ * 避免之前 dup2 到文件失败导致的“报错丢失”。
  *
- * 输出：
- *   /data/local/tmp/c99491_agent.log     自身状态（kmsg 只取新增部分）
- *   /data/local/tmp/ksud_<cmd>.log       每条 ksud 命令的完整输出
+ * 日志：/data/local/tmp/c99491_agent.log
  */
 #define _GNU_SOURCE 1
 #include <errno.h>
@@ -93,7 +93,7 @@ static void dump(FILE *f, const char *tag)
 	fclose(s);
 }
 
-/* 只取本次运行新增的 kmsg，且只保留与模块相关的少量行 */
+/* 只取本次新增的 kmsg，且最多 12 行 */
 static void dump_kmsg(FILE *f, const char *tag)
 {
 	int fd = open("/dev/kmsg", O_RDONLY | O_NONBLOCK);
@@ -114,43 +114,64 @@ static void dump_kmsg(FILE *f, const char *tag)
 		while ((nl = strchr(p, '\n')) != NULL && kept < 12) {
 			*nl = 0;
 			if (strstr(p, "module") || strstr(p, "kernelsu") ||
-			    strstr(p, "insmod") || strstr(p, "finit")) {
-				fprintf(f, "%s\n", p);
-				kept++;
-			}
+			    strstr(p, "insmod") || strstr(p, "finit") ||
+			    strstr(p, "avc"))
+				fprintf(f, "  %s\n", p), kept++;
 			p = nl + 1;
 		}
 	}
 	close(fd);
 }
 
-static void run_ksud(FILE *f, const char *tag, char *const argv[])
+/* 用管道捕获 ksud 输出，再写进我们自己的日志（不依赖目标目录可写） */
+static int run_ksud(FILE *f, const char *tag, char *const argv[])
 {
-	char out_path[128];
+	int pipefd[2];
 	pid_t p;
 	int st = 0;
+	char buf[1024];
+	ssize_t n;
 
-	snprintf(out_path, sizeof(out_path), "/data/local/tmp/ksud_%s.log", tag);
-	fprintf(f, "--- ksud %s (out=%s) ---\n", tag, out_path);
+	fprintf(f, "--- ksud %s ---\n", tag);
 	fflush(f);
+	if (pipe(pipefd) != 0) {
+		fprintf(f, "pipe failed errno=%d\n", errno);
+		return -1;
+	}
 	p = fork();
 	if (p == 0) {
-		int fd = open(out_path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
-
-		if (fd >= 0) {
-			dup2(fd, 1);
-			dup2(fd, 2);
-			if (fd > 2)
-				close(fd);
-		}
+		close(pipefd[0]);
+		dup2(pipefd[1], 1);
+		dup2(pipefd[1], 2);
+		close(pipefd[1]);
 		execv(KSUD, argv);
+		fprintf(stderr, "execv failed errno=%d\n", errno);
 		_exit(127);
 	}
-	if (p > 0) {
-		waitpid(p, &st, 0);
-		fprintf(f, "ksud %s exit=%d\n", tag, WIFEXITED(st) ? WEXITSTATUS(st) : -1);
+	close(pipefd[1]);
+	if (p < 0) {
+		close(pipefd[0]);
+		fprintf(f, "fork failed errno=%d\n", errno);
+		return -1;
 	}
+	while ((n = read(pipefd[0], buf, sizeof(buf) - 1)) > 0) {
+		char *q = buf, *nl;
+
+		buf[n] = 0;
+		while ((nl = strchr(q, '\n')) != NULL) {
+			*nl = 0;
+			fprintf(f, "  [ksud %s] %s\n", tag, q);
+			q = nl + 1;
+		}
+		if (*q)
+			fprintf(f, "  [ksud %s] %s\n", tag, q);
+		fflush(f);
+	}
+	close(pipefd[0]);
+	waitpid(p, &st, 0);
+	fprintf(f, "ksud %s exit=%d\n", tag, WIFEXITED(st) ? WEXITSTATUS(st) : -1);
 	fflush(f);
+	return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
 }
 
 int main(void)
@@ -164,7 +185,6 @@ int main(void)
 	dump(f, "start");
 	fflush(f);
 
-	/* 等 uid=0 且 CapPrm 含 SYSLOG(34) + SYS_MODULE(16) */
 	for (int i = 0; i < 320; i++) {
 		unsigned long long prm = read_caps("CapPrm:");
 
