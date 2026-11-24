@@ -1,20 +1,19 @@
 /*
  * c99491_agent —— 被 ctest 改造 cred 的那个进程，原地加载 KernelSU 模块。
  *
- * 设计动机（实测结论）：
+ * 设计动机（有硬证据）：
  *   - agent 被改 cred 后有 euid=0、CapEff=0x0e00050000，但 CapPrm=0；
- *   - 只要 exec 一次，内核就按 permitted/ambient 重算，能力全部清空
- *     （实测 CapPrm/CapEff 归零）；
- *   - finit_module(fd=-1) 返回 EPERM 而不是 EACCES，说明缺的是能力位，
- *     不是 SELinux 策略。
- *   所以不要在子进程里调 shell 或工具，而是在**同一个进程内**直接用
- *   已经拿到的 effective 能力调 finit_module。
+ *   - exec 会按 permitted/ambient 重算，能力全清（实测 CapPrm/CapEff 归零）；
+ *   - finit_module 返回 EPERM，AVC 明确写了
+ *       avc: denied { sys_module } capability=16 scontext=u:r:shell:s0
+ *     即 SELinux 的 capability 类规则不允许 shell 域用 CAP_SYS_MODULE。
  *
- * 流程：
- *   1. 轮询 /proc/self/status，等 euid==0 且 CapEff 含 CAP_SYS_MODULE
- *   2. 打开 /data/local/tmp/ksu.ko（由 ksud 从管理器 APK 提取）
- *   3. finit_module(fd, "allow_shell=1", 0)
- *   4. 记录结果与 /sys/module/kernelsu 是否存在
+ * 因此流程改为：
+ *   1. 轮询等 euid==0 且 CapEff 含 CAP_SYS_MODULE（ctest 改 cred 后即满足）
+ *   2. 等 permissive 窗口（由 ctest 以 C99491_PERMISSIVE=1 打开）：
+ *      轮询 /sys/fs/selinux/enforce 变为 0
+ *   3. 打开 /data/local/tmp/ksu.ko 并 finit_module
+ *   4. 立刻把 enforce 写回 1（本进程有 CAP_MAC_ADMIN），并记录结果
  *
  * 日志：/data/local/tmp/c99491_agent.log
  */
@@ -49,12 +48,38 @@ static int cap_sys_module(void)
 	return (eff & (1ULL << 16)) != 0; /* CAP_SYS_MODULE = 16 */
 }
 
+static int enforce_state(void)
+{
+	int fd = open("/sys/fs/selinux/enforce", O_RDONLY);
+	char c = 0;
+
+	if (fd < 0)
+		return -1;
+	if (read(fd, &c, 1) != 1)
+		c = 0;
+	close(fd);
+	return c == '0' ? 0 : 1;
+}
+
+static int set_enforce(int on)
+{
+	int fd = open("/sys/fs/selinux/enforce", O_WRONLY);
+	int rc;
+
+	if (fd < 0)
+		return -1;
+	rc = (int)write(fd, on ? "1" : "0", 1);
+	close(fd);
+	return rc == 1 ? 0 : -1;
+}
+
 static void dump(FILE *f, const char *tag)
 {
 	char line[256];
 	FILE *s = fopen("/proc/self/status", "r");
 
-	fprintf(f, "--- %s pid=%d ppid=%d ---\n", tag, (int)getpid(), (int)getppid());
+	fprintf(f, "--- %s pid=%d ppid=%d enforce=%d ---\n",
+		tag, (int)getpid(), (int)getppid(), enforce_state());
 	if (!s)
 		return;
 	while (fgets(line, sizeof(line), s)) {
@@ -69,9 +94,7 @@ static void dump(FILE *f, const char *tag)
 int main(void)
 {
 	FILE *f = fopen(LOG_PATH, "w");
-	int fd, ready = 0;
-	long rc;
-	int saved;
+	int fd, ready = 0, perm = 0, rc, saved;
 	struct stat st;
 
 	if (!f)
@@ -80,15 +103,15 @@ int main(void)
 	dump(f, "start");
 	fflush(f);
 
-	/* 等 ctest 把 cred 改好：最多 30 秒 */
-	for (int i = 0; i < 120; i++) {
+	/* 1) 等 ctest 把 cred 改好 */
+	for (int i = 0; i < 200; i++) {
 		if (geteuid() == 0 && cap_sys_module()) {
 			ready = 1;
 			break;
 		}
 		usleep(250000);
 	}
-	fprintf(f, "ready=%d waited_ms=%d\n", ready, 0);
+	fprintf(f, "ready=%d\n", ready);
 	dump(f, ready ? "patched" : "timeout");
 	fflush(f);
 	if (!ready) {
@@ -96,6 +119,17 @@ int main(void)
 		fclose(f);
 		return 2;
 	}
+
+	/* 2) 等 permissive 窗口（ctest 以 C99491_PERMISSIVE=1 打开） */
+	for (int i = 0; i < 120; i++) {
+		if (enforce_state() == 0) {
+			perm = 1;
+			break;
+		}
+		usleep(250000);
+	}
+	fprintf(f, "permissive_window=%d\n", perm);
+	fflush(f);
 
 	if (stat(KO_PATH, &st) != 0) {
 		fprintf(f, "=== abort: 缺少 %s (errno=%d) ===\n", KO_PATH, errno);
@@ -111,11 +145,15 @@ int main(void)
 		return 4;
 	}
 	errno = 0;
-	rc = syscall(SYS_finit_module, fd, "allow_shell=1", 0);
+	rc = (int)syscall(SYS_finit_module, fd, "allow_shell=1", 0);
 	saved = errno;
-	fprintf(f, "finit_module rc=%ld errno=%d (%s)\n", rc, saved, strerror(saved));
+	fprintf(f, "finit_module rc=%d errno=%d (%s)\n", rc, saved, strerror(saved));
 	close(fd);
 
+	/* 3) 立刻恢复 Enforcing（本进程有 CAP_MAC_ADMIN） */
+	if (perm && set_enforce(1) != 0)
+		fprintf(f, "restore enforce failed errno=%d\n", errno);
+	fprintf(f, "enforce_after=%d\n", enforce_state());
 	fprintf(f, "module_kernelsu=%d\n", access("/sys/module/kernelsu", F_OK) == 0);
 	fprintf(f, "su_exists=%d\n", access("/system/bin/su", X_OK) == 0);
 	fprintf(f, "=== done ===\n");
