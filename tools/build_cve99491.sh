@@ -80,14 +80,17 @@ grep -E "^#define[[:space:]]+(LINK_|CRED_SITE|BLOB_SITE)" "$T/ctest.c" | sed 's/
 
 # —— 策略补丁 ——
 # 默认路径（不设 C99491_PERMISSIVE）完全不写 selinux_state：
-# 实测在 Enforcing 下往 selinux_state 写会卡死设备，必须先去掉这条路径。
+# 实测在 Enforcing 下往 selinux_state 写会卡死设备。
+# 命中次数已在本地用 node 数过：1 / 2 / 2(regex) / 2 / 1。
 python3 - "$T/ctest.c" <<'PY'
-import sys, io
+import io
+import re
+import sys
 
 path = sys.argv[1]
 src = io.open(path, encoding="utf-8").read()
 
-def sub_n(text, old, new, what, want=1):
+def sub_n(text, old, new, what, want):
     n = text.count(old)
     if n != want:
         raise SystemExit("补丁失败：%s 期望 %d 次，实际 %d 次" % (what, want, n))
@@ -111,14 +114,14 @@ src = sub_n(
     2,
 )
 
-# 3) initialized 循环里的写同样关掉（这是上次卡死的嫌疑点）
-src = sub_n(
+# 3) initialized 写同样关掉（两处缩进不同：8 与 12，必须用正则）
+src, n = re.subn(
+    r"uaf_write_once\(st \+ 1, 1024, 0\);",
+    "if (getenv(\"C99491_PERMISSIVE\")) uaf_write_once(st + 1, 1024, 0);",
     src,
-    "            uaf_write_once(st + 1, 1024, 0);\n",
-    "            if (getenv(\"C99491_PERMISSIVE\")) uaf_write_once(st + 1, 1024, 0);\n",
-    "initialized 写按需",
-    2,
 )
+if n != 2:
+    raise SystemExit("补丁失败：initialized 写期望 2 次，实际 %d 次" % n)
 
 # 4) 装载方式：手工符号表 -> ksud late-load
 src = sub_n(
