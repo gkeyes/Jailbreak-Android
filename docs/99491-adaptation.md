@@ -139,3 +139,18 @@ CRED_ORACLE_OK
 - 无 panic、boot_id 未变；child 仍 uid=2000（只改了 euid），caps 未动；
 - 该 boot 已 PARKED，按规则必须重启后再跑 `--stage=root`（fsuid/caps/AVC/selinux 窗口/ksud late-load）。
 - 里程碑意义：漏洞的 8 字节写原语已**实际改变 cred**，从"能写"进入"能提权"。
+
+## 2026-11-26 00:35 direct root 阶段：cred/caps/permissive 全过，ksud late-load 未生效
+真机（boot 7bb9df39/续跑同 boot）：
+```
+[+] cred cand=0xffffff81181160c0 euid=0 (uaf_writes=1)
+[*] ids: uid=0 euid=0 gid=0 egid=0
+[+] fsuid=0
+[+] caps bit16(CAP_SYS_MODULE)
+[!] permissive window opened at selinux_state-1
+[step] direct root: exec late-load in the elevated child (cli=/data/local/tmp/ksud kmi=android17-6.18)
+[-] direct root: kernelsu not Live after 30s
+```
+- egid 问题已修（补 cred+0x18 零词），ids 全 0；
+- ksud CLI 已 exec（无错误输出）；模块未 Live。已加诊断：child 打印 exec 目标/errno，
+  父进程打印 child waitpid 状态，模块轮询 30s→60s；产物 sha 5c3aa97d。

