@@ -14,6 +14,7 @@
 #   bash plant/99491/build.sh --self-test    # 编译后跑 exp --self-test / --help（仅 aarch64 主机）
 #   bash plant/99491/build.sh --check        # 只跑 gen_profile.py --check
 #   bash plant/99491/build.sh --json PATH --out DIR
+#   bash plant/99491/build.sh --src plant/99491/exp_direct.c   # 显式指定源码（沙箱故障恢复期用）
 #   PROFILE_JSON=... bash plant/99491/build.sh
 #
 # 产物：<out>/exp（默认 build/99491/exp），打印大小与 sha256。
@@ -24,6 +25,7 @@ OUT="$ROOT/build/99491"
 JSON="${PROFILE_JSON:-$ROOT/app/src/main/assets/lhasa_99491_profile.json}"
 GEN_ONLY=0
 SELF_TEST=0
+SRC_OVERRIDE=""
 
 usage() {
     sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'
@@ -35,6 +37,7 @@ while [ $# -gt 0 ]; do
         --out) OUT="${2:?--out 需要目录}"; shift 2 ;;
         --check) GEN_ONLY=1; shift ;;
         --self-test) SELF_TEST=1; shift ;;
+        --src) SRC_OVERRIDE="${2:?--src 需要路径}"; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         *) echo "未知参数：$1（-h 查看用法）" >&2; exit 2 ;;
     esac
@@ -77,10 +80,13 @@ else
     exit 1
 fi
 
-echo "== 3/4 编译 exp.c"
+echo "== 3/4 编译"
 mkdir -p "$OUT"
 SRC="$ROOT/plant/99491/exp.c"
 [ -r "$SRC" ] || SRC="$ROOT/plant/99491/exp_direct.c"
+if [ -n "$SRC_OVERRIDE" ]; then
+    SRC="$SRC_OVERRIDE"
+fi
 echo "源码：$SRC"
 "${CC[@]}" "${CFLAGS[@]}" "$SRC" -o "$OUT/exp"
 chmod 755 "$OUT/exp"

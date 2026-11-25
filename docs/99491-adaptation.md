@@ -109,3 +109,19 @@ TRIGGER_PROBE_OK  → getenforce_after=Permissive
    - 仍需解决：cred 地址来源（kprobe 在本机 EBUSY，改用 5.15 的 tracefs kmem raw ring 泄漏）、以及 endgame（ksud late-load 而不是打补丁 .ko）。
 4. 设备状态：本次运行后处于 Permissive + PARKED，必须重启恢复；无 panic、boot_id 未变。
 5. 参考实现：ChaYeWuu/XRING-CVE-2026-99491（XRING O1 家族，docs/02-exploit-chain.md P0–P6、docs/05-pitfalls.md）已落地到 `/root/workspace/_xring/`。
+
+## 2026-11-26 00:05 cred 地址泄漏成功（direct 引擎，leak-only）
+6.18 的 `kmem_cache_alloc` tracepoint 字段布局与 5.15 参考不同（新增 `__string(name)`），
+旧解析偏移全部错位。按 Linux 6.18 `include/trace/events/kmem.h` 重写后真机命中：
+```
+[dbg] credrec pid=28695 reqA=184 site=0xffffffed5ae6d1b4 ptr=0xffffff80481efa80
+[+] cred leak candidate=0xffffff80481efa80
+CRED_LEAK_ONLY_OK
+```
+- `reqA=184`（cred_jar object_size）唯一候选；
+- `site` 低 21 位 = `0x6d1b4`，与 profile 里 `prepare_creds+0x2c` 的 `cred_site_low21` 完全一致
+  （profile 标定的 call-site 偏移被真机证实）；
+- 该阶段只读、无 UAF 写。下一步：`--stage=cred`（去掉 CRED_LEAK_ONLY）做 euid oracle 真写。
+
+## 注：GitHub 备份检查点
+- `e1aa201`（初次备份）→ 本次再提交：6.18 kmem 解析修复、leak-only 开关、README_direct、构建/恢复记录。

