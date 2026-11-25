@@ -36,26 +36,66 @@
 | `direct_resolve_ksud()` | 解析 ksud loader（env/`--ksud`/profile/`/data/local/tmp/ksud`/`/data/adb/ksud`） |
 | `direct_read_module_live()` | 轮询 `/proc/modules` 的 `kernelsu ... Live` |
 | `run_direct_cred()` / `run_direct_root()` | 两个新阶段入口 |
-| `wait_child_main()` 新命令 | `'F'` → 回报 `setfsuid(-1)`（不改 cred）；`'K'` → 子进程原地 exec `late-load` |
+| `direct_install_ksud()` | 把 ksud 复制到 `/data/adb/ksud`（0755；KSU sucompat 前提） |
+| `direct_patch_module()` | `.symtab` 的 UND→`SHN_ABS`，`st_value=link+slide` |
+| `direct_ko_load_file()` / `direct_ko_load_main()` | memfd + `finit_module(flags=0)`；EEXIST 视为成功 |
+| `wait_child_main()` 新命令 | `'F'` → 回报 `setfsuid(-1)`（不改 cred）；`'K'` → 子进程原地 exec `late-load`（cli 后端）；`'M'` → 子进程执行 ko 后端（fd3 先收 8 字节 slide） |
 
 ## 3. CLI 与阶段
 
 ```sh
 ./exp --stage=cred --profile ... --workdir ...    # 只做泄漏+euid oracle
-./exp --stage=root --profile ... --workdir ...    # cred+fsuid0+caps+permissive+ksud late-load+su 验收
+./exp --stage=root --profile ... --workdir ...    # cred+fsuid0+caps+permissive+**ko 后端**+su 验收
 ./exp --stage=root --no-ksu ...                   # 停在窗口前（会恢 Enforcing）
 CVE99491_ENGINE=direct  # 当前仅 cred/root 阶段使用；full 仍是旧 real_cred 链
 ```
 
 - `cred`：`[+] cred leak: child=… cred=0x… (N bytes)` → `[*] euid try …` →
   `[+] cred cand=0x… euid=0 (uaf_writes=…)` → `CRED_ORACLE_OK`；退出 0。
-- `root`：上面 + `[+] fsuid=0` + `[+] caps bit16(CAP_SYS_MODULE)` +
-  `[!] permissive window opened at selinux_state-1 (fallback path; …)` + `MODULE_LOADED` +
-  `[f] module_live=1 enforce=1` + `[f] su_check=…`；`--no-ksu` 时停在窗口并恢复 Enforcing。
+- `root`：上面 + 全 id 归零/`[+] fsuid=0` + `[+] caps bit16(CAP_SYS_MODULE)` +
+  `[!] permissive window opened at selinux_state-1 (fallback path; …)` → **KSU endgame**（见 §3.1）→
+  `MODULE_LOADED` + `[f] module_live=1 enforce=1` + `[f] su_check=…`；
+  `--no-ksu` 时停在窗口并恢复 Enforcing。
 - 失败一律 `PARKED` + 退出 1；任何阶段结束后**必须重启**再跑下一次 fire run。
 - 新标记：`[p] engine=direct`、`[+] cred cand=… euid=0`、`CRED_ORACLE_OK`、
   `[+] fsuid=0`、`[+] caps bit16(CAP_SYS_MODULE)`、`[!] permissive window …`；
   `MODULE_LOADED` / `[f] module_live=1 enforce=1` / `[f] su_check=…` / `PARKED` 沿用原契约。
+
+### 3.1 KSU endgame 后端（`CVE99491_KSU_BACKEND`，默认 `ko`）
+
+`ksud late-load` 在本机失败（`kptr_restrict=2`，伪造 cred 无 `CAP_SYSLOG`，ksud 读
+kallsyms 解析符号返回 0）。改为同家族已验证的 **KO 直载**：
+
+```sh
+CVE99491_KSU_BACKEND=ko        # 默认；显式 ko 时失败不回退
+CVE99491_KSU_KO=/data/local/tmp/kernelsu-android17-6.18.ko   # 或默认候选路径
+CVE99491_KSUD_BIN=/data/local/tmp/ksud                       # 或默认候选；会复制到 /data/adb/ksud
+```
+
+流程（全部在已提权的**子进程**内，euid/fsuid0 + permissive 窗口）：
+
+1. `direct_install_ksud()`：把 ksud 二进制复制到 **`/data/adb/ksud`**（0755；KSU sucompat
+   以该路径存在为前提，不看 SELinux 标签）。
+2. `direct_patch_module()`：解析 `kernelsu.ko` 的 `.symtab`，把每个 `SHN_UNDEF` 符号按
+   `ksu_symbols.inc` 改为 `st_shndx=SHN_ABS`、`st_value=link+slide`（slide 由本链 KASLR
+   泄漏、经 fd3 传给子进程）。缺符号 >2 个即拒绝加载。
+3. `memfd_create` + 写入 + `finit_module(fd, "", 0)`（**flags 必须 0**；`MODULE_INIT_IGNORE_VERMAGIC`
+   会 ENOEXEC）；`EEXIST` 视为已加载成功。
+4. 父进程轮询 `/proc/modules` 出现 `kernelsu ... Live` → `MODULE_LOADED`，恢复 Enforcing，
+   `su -c id` 验收。
+
+`ksu_symbols.inc` 格式（生成进 `plant/99491/`，build.sh 的 `-I` 已包含该目录；缺失时编译仍通过、
+ko 后端打印 “symbol table missing” 并自动回退 CLI）：
+
+```c
+/* auto-generated from the event boot's kallsyms (link-time VAs) */
+static const struct ksu_symbol ksu_patch_symbols[] = {
+    { "sym_a", 0xffffffc0801234b8ULL },
+    { "sym_b", 0xffffffc0801abcdeULL },
+    /* ... 全部 kernelsu.ko 的 UND 符号 ... */
+};
+```
+
 
 ## 4. 关键实现选择（与 5.15 参考的差异/理由）
 
@@ -94,6 +134,12 @@ bash plant/99491/build.sh --self-test --src plant/99491/exp_direct.c \
 
 - 每次 UAF 写入约 0.5–1s（含建对/等待/回收/spray/drain），cred oracle 最多 ~4 写/候选；
   UAF 未命中可能没有写效果（脚本按标记判定，不盲目重试整链）。
+- **ko 后端前提**：`ksu_symbols.inc` 必须来自**同一 boot 导出的 link-time kallsyms**；`kernelsu.ko`
+  必须与 `android17-6.18` KMI 匹配；patch 数应在 ~230–260 量级，`missing>2` 会拒绝加载。
+  `direct_install_ksud()` 写 `/data/adb/ksud` 依赖 permissive 窗口 + euid/fsuid0（失败只告警，
+  但 `su` 验收会失败）。
+- `CVE99491_KSU_BACKEND` 未设置时默认先 ko，ko 失败自动回退 `cli`（ksud late-load）；
+  显式 `=ko` 时失败即 fail-closed（`PARKED`），显式 `=cli` 时只用旧路径。
 - `selinux_state-1` 窗口期间系统短暂 permissive（会立刻载模块并恢复；失败则重启恢复）。
 - `root` 阶段首次验证要点：ksud loader 是否存在于测试 boot（无 KSU 时需推 assets ksud 或
   传 `--ksud`）；`su` 二进制是否在 `/system/bin/su` 或 `/data/adb/ksu/bin/su`；模块 Live 后
