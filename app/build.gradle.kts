@@ -13,7 +13,7 @@ val releaseSigningNames = listOf(
     "LHASA_KEY_ALIAS",
     "LHASA_KEY_PASSWORD",
 )
-val expectedReleaseSignerSha256 = "c8a20a023c2ed36ae144327f7f254ff082b965806b4388fc5c55809be81bb7cc"
+val expectedReleaseSignerSha256 = "bba588fabfdf9ed2b5652dc78b033822e1c39b162025be1d5e04e18e4f66bbac"
 val releaseSigningValues = releaseSigningNames.associateWith { System.getenv(it).orEmpty() }
 val releaseKeystoreFile = releaseSigningValues.getValue("LHASA_KEYSTORE")
     .takeIf { it.isNotBlank() }

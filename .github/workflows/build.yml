@@ -34,7 +34,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  LHASA_SIGNING_CERT_SHA256: 'c8a20a023c2ed36ae144327f7f254ff082b965806b4388fc5c55809be81bb7cc'
+  LHASA_SIGNING_CERT_SHA256: 'bba588fabfdf9ed2b5652dc78b033822e1c39b162025be1d5e04e18e4f66bbac'
 
 jobs:
   build:
