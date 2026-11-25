@@ -128,7 +128,9 @@ jobs:
             exit 1
           }
           cat /tmp/certs.txt
-          cert=$(sed -n 's/^Signer #[0-9][0-9]* certificate SHA-256 digest: //p' /tmp/certs.txt | tr '[:upper:]' '[:lower:]' | tr -d ':')
+          # apksigner 新旧版本输出格式不同：旧版是 "Signer #1 certificate SHA-256 digest: ..."，
+          # build-tools 36+ 是 "V2 Signer: certificate SHA-256 digest: ..."；统一取该行最后一个字段。
+          cert=$(grep -m1 'certificate SHA-256 digest' /tmp/certs.txt | awk '{print $NF}' | tr '[:upper:]' '[:lower:]' | tr -d ':' || true)
           if [ "$cert" != "$LHASA_SIGNING_CERT_SHA256" ]; then
             echo "::error::The APK signer does not match the fixed release identity"
             exit 1
@@ -259,7 +261,9 @@ jobs:
             cat /tmp/certs.txt
             exit 1
           fi
-          cert=$(sed -n 's/^Signer #[0-9][0-9]* certificate SHA-256 digest: //p' /tmp/certs.txt | tr '[:upper:]' '[:lower:]' | tr -d ':')
+          # apksigner 新旧版本输出格式不同：旧版是 "Signer #1 certificate SHA-256 digest: ..."，
+          # build-tools 36+ 是 "V2 Signer: certificate SHA-256 digest: ..."；统一取该行最后一个字段。
+          cert=$(grep -m1 'certificate SHA-256 digest' /tmp/certs.txt | awk '{print $NF}' | tr '[:upper:]' '[:lower:]' | tr -d ':' || true)
           if [ "$cert" != "$LHASA_SIGNING_CERT_SHA256" ]; then
             echo "::error::The APK signer does not match the fixed release identity"
             exit 1
