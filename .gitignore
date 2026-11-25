@@ -27,3 +27,7 @@ keystore.properties
 .env
 .env.*
 
+
+# Python 缓存
+__pycache__/
+*.pyc

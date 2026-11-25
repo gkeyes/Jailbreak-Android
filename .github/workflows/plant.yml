@@ -11,7 +11,9 @@ on:
     branches: [ next ]
     paths:
       - 'plant/**'
+      - 'tools/99491/**'
       - 'app/src/main/assets/**'
+      - 'app/src/main/assets/lhasa_99491_profile.json'
       - 'tools/plant_build.sh'
       - 'tools/build_xring.sh'
       - 'tools/gen_xr_profiles.py'
@@ -45,6 +47,22 @@ jobs:
           curl -fsSL https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz -o "$RUNNER_TEMP/zig.tar.xz"
           tar -xf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP"
           echo "$RUNNER_TEMP/zig-linux-x86_64-0.13.0" >> "$GITHUB_PATH"
+
+      - name: 校验并编译 CVE-2026-99491 real_cred 链
+        id: cve99491
+        run: |
+          set -euo pipefail
+          python3 tools/99491/gen_profile.py --check \
+            --json app/src/main/assets/lhasa_99491_profile.json
+          bash plant/99491/build.sh --self-test
+          ls -l build/99491/exp
+
+      - name: 上传 99491 产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: cve99491-exp
+          path: build/99491/exp
+          if-no-files-found: error
 
       - name: 编译 plant 源码
         id: compile

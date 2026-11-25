@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "updatedAt": "2026-11-23",
+  "updatedAt": "2026-11-25",
   "project": "Lhasa26-Android",
   "scope": "app/src/main/assets/",
   "rule": "凡是会被打进 APK 的文件都必须在此登记。未登记文件由 tools/check_assets.py 报警（--strict 下为失败）。",
@@ -114,6 +114,28 @@
       "usedBy": "构建期输入：tools/gen_xr_profiles.py 用它生成 xr98260_profiles.c 并编进上游产物；运行期不再部署",
       "status": "data",
       "action": "OTA 换内核时只需在此追加一行 release=..."
+    },
+    {
+      "name": "lhasa_99491_profile.json",
+      "path": "app/src/main/assets/lhasa_99491_profile.json",
+      "size": 3440,
+      "gitBlobSha1": "03adca16e6d09d947aecffded9ba58f2fb407c1f",
+      "sha256": "ecf40bb8d4490804bbf15223dabdacfa793f41039d57ad9e9d61fda2f8caf0f9",
+      "origin": "device-calibrated",
+      "calibration": {
+        "device": "lhasa 2608BPX34C (Xiaomi 18 Fold)",
+        "kernelRelease": "6.18.21-android17-5-g805aa6adea19-abogki565292102-4k",
+        "kernelBuild": "#1 SMP PREEMPT Wed Sep 23 09:23:45 UTC 2026",
+        "spl": "2026-10-01",
+        "method": "root 只读 /proc/kallsyms + /sys/kernel/btf/vmlinux；符号=运行地址-slide 交叉校验（selinux_state / uhid_device_add_worker / prepare_creds+0x2c 三项与现有 profile 及上游 lhasa 记录逐位一致）",
+        "crossCheck": "Yunnijian/CVE-2026-99491 PYB110 6.18.21 profile（全部几何/偏移逐项相同，仅符号地址不同）",
+        "jsonSha256": "ecf40bb8d4490804bbf15223dabdacfa793f41039d57ad9e9d61fda2f8caf0f9"
+      },
+      "license": "GPL-2.0-only",
+      "inApk": true,
+      "usedBy": "core/Cve99491Profile（AssetManager 解析 release+verified）；plant/99491/exp 运行时 --profile 读取同一内容（设备侧 /data/local/tmp/cve99491/profile.json）",
+      "status": "calibrated-pending",
+      "action": "2026-11-25 真机标定；verified=0 待 S6/S7 全链验证后改 1，并同步 updatedAt"
     }
   ]
 }

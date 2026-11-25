@@ -28,6 +28,84 @@ public final class BootGuard {
     }
 
     /**
+     * CVE-2026-99491（real_cred 链）的标记分类。
+     *
+     * <p>和 98260 的 {@link #classify(String)} 完全分开：99491 的标记契约见
+     * docs/99491-test-plan.md §10（{@code [p] profile_ok}、{@code [p] anchor slide=}、
+     * {@code [+] swap uid=0}、{@code [+] cred == real_cred}、{@code [+] setcon}、
+     * {@code [f] module_live=1 enforce=1}、{@code [f] su_check=uid=0 … u:r=ksu:s0}、
+     * {@code PARKED}、{@code MODULE_LOADED}）。98260 的标记数组一个都不动。
+     */
+    public enum Cve99491Outcome {
+        /** 还没看到可归因的 99491 标记。 */
+        NONE,
+        /** 最终 su 校验命中 ksu 域：整条链接管。 */
+        SUCCESS,
+        /** 写前失败 / 可安全重试。 */
+        RETRY_SAFE,
+        /** 二进制报告 PARKED：本 boot 不再写内核。 */
+        PARKED,
+        /** 中止：panic / holding zombie / 明确 abort。 */
+        ABORT_BOOT
+    }
+
+    /** 99491 写后失败的归因种类；token 会写进 {@link #FAILED_FILE}，两条链共享 dirty 判定。 */
+    public enum Cve99491Failure {
+        /** 写内核之后失败：dirty boot。 */
+        WRITE_FAILURE("dirty99491"),
+        /** PARKED：本次开机不再写内核。 */
+        PARKED("parked99491"),
+        /** payload 报告节点挂树等不可重跑的中止。 */
+        ABORT("abort");
+
+        public final String token;
+
+        Cve99491Failure(String token) {
+            this.token = token;
+        }
+    }
+
+    /** 99491 写阶段标记：出现任意一个就说明内核已被写过（不再允许回退 98260）。 */
+    private static final String[] CVE99491_WRITE_MARKERS = {
+            "[+] swap",
+            "[+] cred",
+            "[+] setcon",
+            "[f] module_live",
+            "[f] su_check",
+            "MODULE_LOADED"
+    };
+
+    /** 99491 写前失败标记：安全重试/回退。 */
+    private static final String[] CVE99491_RETRY_MARKERS = {
+            "leak failed",
+            "anchor failed",
+            "oracle miss",
+            "[p] retry",
+            "[p] failed",
+            "[p] precheck failed",
+            "PROFILE_MISMATCH"
+    };
+
+    /** 99491 中止标记：和 98260 共用的 panic/挂树，再加 99491 专属的 abort 行。 */
+    private static final String[] CVE99491_ABORT_MARKERS = {
+            "holding zombie",
+            "Kernel panic",
+            "kernel panic",
+            "BUG: unable to handle",
+            "Internal error",
+            "ABORT_BOOT",
+            "[!] abort",
+            "[p] abort"
+    };
+
+    private static final String CVE99491_SU_CHECK_PREFIX = "[f] su_check=";
+    private static final String CVE99491_MODULE_LIVE = "[f] module_live=1";
+    private static final String CVE99491_KSU_CONTEXT = "u:r=ksu:s0";
+    private static final String CVE99491_KSU_CONTEXT_ALT = "u:r:ksu:s0";
+    private static final String CVE99491_PARKED = "PARKED";
+    private static final String CVE99491_MODULE_LOADED = "MODULE_LOADED";
+
+    /**
      * Written by the launch wrapper as `&lt;pgid&gt;:&lt;boot_id&gt;`.
      *
      * The boot id is essential: /data/local/tmp survives reboots, and a stale pgid can be reused by
@@ -104,6 +182,121 @@ public final class BootGuard {
         return Outcome.CONTINUE;
     }
 
+    /**
+     * 99491 标记分类。优先级：中止 &gt; PARKED &gt; 成功 &gt; 可重试 &gt; 未命中。
+     * 中止必须赢过同一条 tail 里的成功标记（先 panic 后补打的输出不能算成功）。
+     */
+    public static Cve99491Outcome classifyCve99491(String tail) {
+        if (tail == null || tail.isEmpty()) {
+            return Cve99491Outcome.NONE;
+        }
+        if (containsAny(tail, CVE99491_ABORT_MARKERS)) {
+            return Cve99491Outcome.ABORT_BOOT;
+        }
+        if (tail.contains(CVE99491_PARKED)) {
+            return Cve99491Outcome.PARKED;
+        }
+        if (isCve99491SuCheckOk(tail)) {
+            return Cve99491Outcome.SUCCESS;
+        }
+        if (containsAny(tail, CVE99491_RETRY_MARKERS)) {
+            return Cve99491Outcome.RETRY_SAFE;
+        }
+        return Cve99491Outcome.NONE;
+    }
+
+    /** `[f] su_check=uid=0 … u:r=ksu:s0` 必须同一行同时出现 uid=0 与 ksu 域。 */
+    public static boolean isCve99491SuCheckOk(String tail) {
+        if (tail == null) {
+            return false;
+        }
+        for (String raw : tail.split("\\n")) {
+            String line = raw.trim();
+            if (line.startsWith(CVE99491_SU_CHECK_PREFIX)
+                    && line.contains("uid=0")
+                    && (line.contains(CVE99491_KSU_CONTEXT) || line.contains(CVE99491_KSU_CONTEXT_ALT))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** 是否已出现任意"写内核之后"的标记（决定能否回退 98260）。 */
+    public static boolean hasCve99491KernelWrite(String tail) {
+        return containsAny(tail, CVE99491_WRITE_MARKERS);
+    }
+
+    public static boolean hasCve99491ModuleLive(String tail) {
+        return tail != null && tail.contains(CVE99491_MODULE_LIVE);
+    }
+
+    public static boolean hasCve99491ModuleLoaded(String tail) {
+        return tail != null && tail.contains(CVE99491_MODULE_LOADED);
+    }
+
+    /** 是否出现 99491 专属中止标记（panic / holding zombie / abort）。 */
+    public static boolean hasCve99491Abort(String tail) {
+        return containsAny(tail, CVE99491_ABORT_MARKERS);
+    }
+
+    /**
+     * 写 99491 失败记录：`&lt;boot_id&gt; &lt;token&gt;`。
+     *
+     * <p>写进和 98260 同一个 {@link #FAILED_FILE}——两条链共享 dirty 标记：99491 写后失败后，
+     * 98260 的 {@link #parseFailure} 也会因为未知 kind 而 BLOCKED，反之 98260 的 abort/enforcing
+     * 记录也会让 99491 链在预检阶段被 {@link #hasDirtyBoot} 拦下。
+     */
+    public static String recordCve99491FailureCommand(String bootId, Cve99491Failure kind) {
+        if (bootId == null || bootId.isEmpty()) {
+            return "true";
+        }
+        String token = kind == null ? Cve99491Failure.WRITE_FAILURE.token : kind.token;
+        return "echo '" + sanitize(bootId) + " " + token + "' > " + FAILED_FILE;
+    }
+
+    /**
+     * 本次开机是否有任何一条链留下过 dirty 记录。
+     *
+     * <p>记录来自 98260 的 abort/enforcing/permissive，或 99491 的 dirty99491/parked99491。
+     * 一旦有记录，说明内核对不上"干净状态"，99491 不能开跑。
+     */
+    public static boolean hasDirtyBoot(String failedFileContent, String currentBootId) {
+        if (failedFileContent == null || failedFileContent.trim().isEmpty()) {
+            return false;
+        }
+        String[] parts = failedFileContent.trim().split("\\s+");
+        if (parts.length < 2) {
+            return false;
+        }
+        if (currentBootId != null && !currentBootId.isEmpty()
+                && !currentBootId.equals(parts[0])) {
+            return false;
+        }
+        return true;
+    }
+
+    /** dirty boot 的人话原因；没有 dirty 记录时返回空串。 */
+    public static String dirtyReason(String failedFileContent, String currentBootId) {
+        if (!hasDirtyBoot(failedFileContent, currentBootId)) {
+            return "";
+        }
+        String kind = failedFileContent.trim().split("\\s+")[1];
+        switch (kind) {
+            case "abort":
+                return "本次开机已有提权链触发节点挂树/内核报错（abort），禁止再写内核";
+            case "enforcing":
+                return "本次开机 98260 已在写内核后失败（enforcing），内核状态不干净";
+            case "permissive":
+                return "本次开机 98260 已切入 SELinux 窗口（permissive），内核已被写过";
+            case "dirty99491":
+                return "本次开机 99491 已在写内核后失败（dirty99491），两条链共享 dirty 标记";
+            case "parked99491":
+                return "本次开机 99491 已 PARKED（parked99491），本 boot 不再写内核";
+            default:
+                return "本次开机已有失败记录（" + kind + "），本 boot 禁止再写内核";
+        }
+    }
+
     public static boolean isSupportedKernel(String kernel) {
         return KernelSupport.isSupported(kernel);
     }
@@ -173,6 +366,8 @@ public final class BootGuard {
             label = detail.isEmpty()
                     ? "主利用（uaf_plant_replay）"
                     : "主利用 · 具体阶段 " + describePayloadStage(detail);
+        } else if (stage.startsWith("99491")) {
+            label = describeCve99491Stage(stage);
         } else {
             switch (stage) {
                 case "ksu":
@@ -190,6 +385,30 @@ public final class BootGuard {
             }
         }
         return "上次运行停在「" + label + "」阶段，没有正常结束——如果是重启造成的，那就是这个阶段把设备带走的。";
+    }
+
+    private static String describeCve99491Stage(String stage) {
+        String detail = stage.startsWith("99491-") ? stage.substring("99491-".length()) : stage;
+        switch (detail) {
+            case "profile":
+            case "precheck":
+                return "99491 预检/校验 profile（未写内核）";
+            case "deploy":
+                return "99491 资产部署（未写内核）";
+            case "run":
+                return "99491 分阶段二进制（real_cred 写原语/SELinux 窗口，可能已写内核）";
+            case "write":
+                return "99491 real_cred 写原语（已写内核）";
+            case "selinux":
+                return "99491 SELinux 切换窗口（已写内核）";
+            case "ksu":
+            case "module":
+                return "99491 KernelSU late-load（已写内核）";
+            case "final":
+                return "99491 最终校验（su_check/module_live）";
+            default:
+                return "99491 · " + detail;
+        }
     }
 
     private static String describePayloadStage(String detail) {

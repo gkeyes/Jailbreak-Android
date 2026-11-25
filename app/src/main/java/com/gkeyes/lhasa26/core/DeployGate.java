@@ -60,6 +60,11 @@ public final class DeployGate {
         failure = error;
     }
 
+    /** Failure reported by the staging task, if any. Diagnostics only: it never changes the outcome. */
+    public Throwable failure() {
+        return failure;
+    }
+
     /** Waits for the worker and settles exactly once. */
     public Result await(Thread worker) throws InterruptedException {
         long deadline = System.currentTimeMillis() + timeoutMs;

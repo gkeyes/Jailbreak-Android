@@ -35,6 +35,7 @@ import top.yukonga.miuix.kmp.basic.Card
 import top.yukonga.miuix.kmp.basic.Icon
 import top.yukonga.miuix.kmp.basic.LinearProgressIndicator
 import top.yukonga.miuix.kmp.basic.SmallTitle
+import top.yukonga.miuix.kmp.basic.Switch
 import top.yukonga.miuix.kmp.basic.Text
 import top.yukonga.miuix.kmp.basic.TextButton
 import top.yukonga.miuix.kmp.icon.MiuixIcons
@@ -65,6 +66,7 @@ internal fun FoldPages(
         })
         1 -> PageColumns(wide, {
             SystemPanel(state, onEvent)
+            RootPathPanel(state, onEvent)
         }, {
             GroupCard("设备维护") {
                 Operation("清理临时文件") { onEvent(FoldEvent.CLEAN) }
@@ -167,6 +169,50 @@ private fun SystemPanel(state: FoldUiState, onEvent: (FoldEvent) -> Unit) {
             text = "接口诊断", onClick = { onEvent(FoldEvent.DIAGNOSE) }, enabled = state.diagnosticEnabled,
             modifier = Modifier.fillMaxWidth().padding(start = 16.dp, end = 16.dp, bottom = 16.dp),
         )
+    }
+}
+
+/**
+ * 提权路径选择。
+ *
+ * 98260 是默认稳定路径；99491（CVE-2026-99491 real_cred）只有在 profile 通过
+ * release 精确匹配 + verified 校验后才允许选中，否则禁用并显示原因（fail-closed）。
+ * 事件只带 [FoldEvent.PATH_SELECT]：宿主按当前值取反，UI 不持有第二份路径状态，
+ * 持久化值始终是唯一事实源。
+ */
+@Composable
+private fun RootPathPanel(state: FoldUiState, onEvent: (FoldEvent) -> Unit) {
+    GroupCard("提权路径") {
+        val timerSelected = state.rootPath != ROOT_PATH_WACOM_99491
+        BasicComponent(
+            title = "98260 · 定时器 UAF",
+            summary = if (timerSelected) "当前路径 · 已验证 · 默认" else "稳定回退路径",
+            insideMargin = PaddingValues(vertical = 8.dp),
+            endActions = {
+                Switch(checked = timerSelected, onCheckedChange = {
+                    if (it && !state.running) onEvent(FoldEvent.PATH_SELECT)
+                })
+            },
+        )
+        if (state.rootPathAvailable) {
+            val cveSelected = !timerSelected
+            BasicComponent(
+                title = "99491 · WACOM real_cred",
+                summary = if (cveSelected) "当前路径 · 实验（opt-in）" else "实验（opt-in）· profile 已校验",
+                insideMargin = PaddingValues(vertical = 8.dp),
+                endActions = {
+                    Switch(checked = cveSelected, onCheckedChange = {
+                        if (it && !state.running) onEvent(FoldEvent.PATH_SELECT)
+                    })
+                },
+            )
+        } else {
+            BasicComponent(
+                title = "99491 · WACOM real_cred",
+                summary = "未适配 · " + state.rootPathNote.ifBlank { "profile 校验中" },
+                insideMargin = PaddingValues(vertical = 8.dp),
+            )
+        }
     }
 }
 

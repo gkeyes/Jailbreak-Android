@@ -2,6 +2,7 @@ package com.gkeyes.lhasa26;
 
 import android.content.ContentValues;
 import android.content.Intent;
+import android.content.pm.ApplicationInfo;
 import android.content.res.Configuration;
 import android.net.Uri;
 import android.os.Bundle;
@@ -14,6 +15,7 @@ import androidx.activity.ComponentActivity;
 
 import com.gkeyes.lhasa26.core.DeviceSnapshot;
 import com.gkeyes.lhasa26.core.LogRedactor;
+import com.gkeyes.lhasa26.core.RootPath;
 import com.gkeyes.lhasa26.core.ShizukuExecutor;
 import com.gkeyes.lhasa26.core.WorkflowCallbacks;
 import com.gkeyes.lhasa26.core.WorkflowEngine;
@@ -39,6 +41,9 @@ public final class ConsoleActivity extends ComponentActivity
         implements WorkflowCallbacks, FoldConsoleView.Listener {
 
     private static final int REQUEST_SHIZUKU = 1001;
+
+    /** 提权路径的持久化键，仿 keep_on：SharedPreferences(MODE_PRIVATE)。 */
+    private static final String PREF_ROOT_PATH = "root_path";
 
     /**
      * 完整框架重启：zygote 会全新拉起，Zygisk 因此在 zygote 启动时重新注入，
@@ -86,6 +91,13 @@ public final class ConsoleActivity extends ComponentActivity
     private boolean keepScreenOn = true;
     private long startAt;
 
+    /** 当前选中的提权路径（持久化到 root_path，默认 98260）。 */
+    private RootPath selectedRootPath = RootPath.TIMER_98260;
+    /** 99491 profile 是否可用（fail-closed：未校验/校验中一律按不可用处理）。 */
+    private boolean cve99491Available;
+    private String cve99491Reason = "";
+    private boolean availabilityRequested;
+
     private final Runnable ticker = new Runnable() {
         @Override
         public void run() {
@@ -103,6 +115,12 @@ public final class ConsoleActivity extends ComponentActivity
         super.onCreate(savedInstanceState);
         executor = new ShizukuExecutor();
         engine = new WorkflowEngine(getAssets(), executor, this);
+        // 真机标定阶段：debug 包允许 verified=0 的 99491 profile 带警告运行；release 包一律 fail-closed。
+        engine.setUnverifiedProfileAllowed(isDebuggableBuild());
+        // 路径选择持久化仿 keep_on：存 string，读不到/非法值回落 98260。
+        selectedRootPath = RootPath.fromKey(
+                getPreferences(MODE_PRIVATE).getString(PREF_ROOT_PATH, null));
+        engine.setRootPath(selectedRootPath);
 
         console = new FoldConsoleView(this);
         console.setId(0x4c415353);
@@ -168,6 +186,26 @@ public final class ConsoleActivity extends ComponentActivity
         }
     }
 
+    /** debug 包：允许 verified=0 的 99491 profile 带警告运行（真机标定阶段）。 */
+    private boolean isDebuggableBuild() {
+        try {
+            return (getApplicationInfo().flags & ApplicationInfo.FLAG_DEBUGGABLE) != 0;
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    /** 当前路径是否可运行：98260 恒可用；99491 取决于 profile 可用性（fail-closed）。 */
+    private boolean isSelectedPathAvailable() {
+        return selectedRootPath != RootPath.WACOM_99491 || cve99491Available;
+    }
+
+    private void persistRootPath() {
+        getPreferences(MODE_PRIVATE).edit()
+                .putString(PREF_ROOT_PATH, selectedRootPath.key())
+                .apply();
+    }
+
     private void refreshAuthorization() {
         runOnUiThread(() -> {
             boolean wasGranted = shizukuGranted;
@@ -181,6 +219,18 @@ public final class ConsoleActivity extends ComponentActivity
                 }
             }
             authorization = !shizukuAlive ? "未运行" : (shizukuGranted ? "已授权" : "需要授权");
+            if (shizukuGranted) {
+                if (!availabilityRequested && engine != null) {
+                    availabilityRequested = true;
+                    engine.refreshRootPathAvailability();
+                }
+            } else {
+                availabilityRequested = false;
+                cve99491Available = false;
+                cve99491Reason = shizukuAlive
+                        ? "等待 Shizuku 授权后校验 99491 profile"
+                        : "需要先启动 Shizuku 并授权，才能校验 99491 profile";
+            }
             refreshActionLabel();
             render();
             if (shizukuGranted && !wasGranted && "—".equals(kernel) && engine != null) {
@@ -203,12 +253,22 @@ public final class ConsoleActivity extends ComponentActivity
             actionLabel = "全部完成";
             return;
         }
+        if (state == WorkflowEngine.State.PARKED) {
+            actionLabel = "已 PARKED · 请重启设备";
+            return;
+        }
+        if (!isSelectedPathAvailable()) {
+            actionLabel = "99491 未适配 · 请切换路径";
+            return;
+        }
         if (!shizukuAlive) {
             actionLabel = "开启 Shizuku 并授权";
         } else if (!shizukuGranted) {
             actionLabel = "授权 Shizuku";
         } else {
-            actionLabel = "一键临时 ROOT";
+            actionLabel = selectedRootPath == RootPath.WACOM_99491
+                    ? "一键临时 ROOT · 99491"
+                    : "一键临时 ROOT";
         }
     }
 
@@ -216,12 +276,15 @@ public final class ConsoleActivity extends ComponentActivity
         if (console == null) {
             return;
         }
+        boolean pathAvailable = isSelectedPathAvailable();
         FoldUiState state = new FoldUiState(
                 status, privilege, authorization, actionLabel, stepText, elapsed,
                 device, build, kernel, compatibility,
                 sessionLog.toString(), latest,
-                !running, true, !running, running, running && !stepText.isEmpty(),
-                keepScreenOn, 0f, versionName());
+                !running && pathAvailable, true, !running && pathAvailable, running,
+                running && !stepText.isEmpty(),
+                keepScreenOn, 0f, versionName(),
+                selectedRootPath.key(), cve99491Available, cve99491Reason);
         console.render(state);
     }
 
@@ -262,6 +325,14 @@ public final class ConsoleActivity extends ComponentActivity
         switch (event) {
             case PRIMARY: {
                 if (!ensureShizukuOrPrompt()) {
+                    break;
+                }
+                if (!isSelectedPathAvailable()) {
+                    toast(cve99491Reason.isEmpty()
+                            ? "99491 未适配：profile 未通过校验"
+                            : "99491 不可用：" + cve99491Reason);
+                    refreshActionLabel();
+                    render();
                     break;
                 }
                 WorkflowEngine.State state = engine.getState();
@@ -309,6 +380,30 @@ public final class ConsoleActivity extends ComponentActivity
                 applyKeepScreenOn();
                 render();
                 break;
+            case PATH_SELECT: {
+                if (running) {
+                    toast("正在运行，暂不能切换提权路径");
+                    break;
+                }
+                RootPath next = selectedRootPath == RootPath.TIMER_98260
+                        ? RootPath.WACOM_99491
+                        : RootPath.TIMER_98260;
+                if (next == RootPath.WACOM_99491 && !cve99491Available) {
+                    toast(cve99491Reason.isEmpty()
+                            ? "99491 未适配：profile 未通过校验"
+                            : "99491 不可用：" + cve99491Reason);
+                    break;
+                }
+                selectedRootPath = next;
+                engine.setRootPath(next);
+                persistRootPath();
+                status = next == RootPath.WACOM_99491
+                        ? "已切换到 99491（CVE-2026-99491 · 实验路径 · opt-in）"
+                        : "已切换到 98260（默认路径 · 稳定）";
+                refreshActionLabel();
+                render();
+                break;
+            }
             default:
                 break;
         }
@@ -335,8 +430,19 @@ public final class ConsoleActivity extends ComponentActivity
     }
 
     private void exportLog() {
+        String activePath = engine == null ? selectedRootPath.key() : engine.getActivePath().key();
+        String profileSha = engine == null ? "" : engine.getProfileSha256();
+        String stageLabel = engine == null ? "" : engine.getLastStepLabel();
+        String chainElapsed = engine == null || engine.getChainElapsedMs() <= 0L
+                ? elapsed
+                : String.format(Locale.US, "%.1fs", engine.getChainElapsedMs() / 1000.0);
         String header = "app=" + versionName() + "\npackage=" + getPackageName()
                 + "\ndevice=" + device + " / " + build + "\nkernel=" + kernel
+                + "\nroot_path=" + selectedRootPath.key()
+                + "\nactive_path=" + activePath
+                + "\nprofile_sha256=" + (profileSha.isEmpty() ? "—" : profileSha)
+                + "\nstage=" + (stageLabel.isEmpty() ? "—" : stageLabel)
+                + "\nelapsed=" + (chainElapsed.isEmpty() ? "—" : chainElapsed)
                 + "\nexport=" + new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(new Date())
                 + "\n\n";
         String payload = LogRedactor.redact(header + sessionLog);
@@ -431,6 +537,20 @@ public final class ConsoleActivity extends ComponentActivity
             build = snapshot.build;
             kernel = snapshot.kernel;
             compatibility = snapshot.isKernelSupported() ? "已适配" : "未适配";
+            // 99491 profile 的 release 匹配依赖设备内核版本，拿到内核后重新校验一次（fail-closed）。
+            if (shizukuGranted && engine != null) {
+                engine.refreshRootPathAvailability();
+            }
+            render();
+        });
+    }
+
+    @Override
+    public void onRootPathAvailability(boolean available, String reason) {
+        runOnUiThread(() -> {
+            cve99491Available = available;
+            cve99491Reason = reason == null ? "" : reason;
+            refreshActionLabel();
             render();
         });
     }
@@ -464,6 +584,11 @@ public final class ConsoleActivity extends ComponentActivity
                 case FAILED:
                     running = false;
                     privilege = "失败";
+                    handler.removeCallbacks(ticker);
+                    break;
+                case PARKED:
+                    running = false;
+                    privilege = "已 PARKED（本 boot 不再写内核）";
                     handler.removeCallbacks(ticker);
                     break;
                 default:

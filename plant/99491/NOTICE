@@ -1,0 +1,52 @@
+CVE-2026-99491 6.18.21 (PYB110) port and fixes
+Copyright (C) 2026 Yunnijian
+License: GPL-2.0-only
+
+The 5.15 reference port retained under upstream/CVE-2026-99491 is from:
+https://github.com/woshigenm/CVE-2026-99491
+License: GPL-2.0-only
+
+The 468-entry kernel symbol table is generated from the recovered symbols of
+the exact 6.18.21-android17-5-g7fcbffcad3e1-ab16353812-4k build; addresses are
+not portable to another kernel build.
+
+tools/realcred/ carries the real_cred chain (forged init_cred + ksud
+late-load) and its runner. exp.c derives from the FANXIAOCHAO reference port
+of CVE-2026-99491 and is distributed under GPL-2.0-only like the rest of
+this tree.
+
+--------------------------------------------------------------------------
+lhasa port (branch next-99491-realcred), Copyright (C) 2026 Lhasa26 contributors
+License: GPL-2.0-only
+
+Upstream files imported verbatim or adapted into this directory:
+
+  Yunnijian/CVE-2026-99491
+    commit : 1923ac893d582e4b87b748ea033be4a004d894b1
+    license: GPL-2.0-only (LICENSE in this directory is the upstream copy)
+    files  : tools/realcred/exp.c          (git blob 9c58379f3dd475bfef7df20f2a4529ffe13b97cf)
+             tools/realcred/profile.h
+             tools/realcred/parked.h
+             tools/realcred/README.md
+             tools/realcred/build.sh
+             tools/realcred/pyb110-61821-cve99491-profile.json (schema reference only;
+             all pyb110 constants are replaced by lhasa calibration)
+
+  woshigenm/CVE-2026-99491-FANXIAOCHAO
+    commit : a5d970935dac14b7c8b0aff865322c656c8d550e
+    license: GPL-2.0-only
+    purpose: three-mode / oracle / PARKED design and exp.c lineage reference
+
+Local modifications (still GPL-2.0-only, see plant/99491/README.md section 9):
+  - real_cred-only CLI with --stage=leak|oracle|write|selinux|full gates;
+  - machine-parsable log marker contract for the App;
+  - profile.h generated from app/src/main/assets/lhasa_99491_profile.json by
+    tools/99491/gen_profile.py (no kernel constant is hard-coded in exp.c);
+  - compiled-in profile fallback + runtime profile/builtin consistency check
+    (PROFILE_MISMATCH);
+  - profile-driven ksud loader selection (assets ksud first, manager libksud
+    second) and profile-gated vendor HAL policy repair;
+  - CVE99491_CHAIN_DEBUG read-only self-cell diagnostics.
+
+No upstream copyright header was removed. parked.h is imported unchanged.
+

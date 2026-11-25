@@ -2,6 +2,8 @@ package com.gkeyes.lhasa26.core;
 
 import android.content.res.AssetManager;
 
+import java.io.ByteArrayOutputStream;
+import java.io.InputStream;
 import java.util.HashMap;
 import java.util.LinkedHashSet;
 import java.util.Locale;
@@ -16,11 +18,22 @@ import java.util.concurrent.Executors;
  * state handling are our code.
  */
 public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
-    public enum State { IDLE, RUNNING, ROOTED, KSU_PENDING, COMPLETE, FAILED }
+    public enum State { IDLE, RUNNING, ROOTED, KSU_PENDING, COMPLETE, FAILED, PARKED }
 
     public static final String[] STEP_LABELS = {
             "校验内核", "部署程序", "测量内核地址", "等待系统空闲",
             "提权执行", "结果验证", "KernelSU 接管"
+    };
+
+    /**
+     * 99491（CVE-2026-99491 real_cred 链）的步骤标签。
+     *
+     * <p>按路径分开，UI 的进度条文案随路径变化；98260 继续用上面的 {@link #STEP_LABELS}，
+     * 一个字都不改。两套长度一致（7 步），{@link #onStep} 的下标语义保持兼容。
+     */
+    public static final String[] STEP_LABELS_99491 = {
+            "校验 profile", "部署资产", "预检", "KASLR anchor",
+            "real_cred 写原语", "SELinux 切换", "KernelSU 接管"
     };
 
     private static final long IDLE_AVAILABLE_KB = 1500000L;
@@ -34,9 +47,20 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
     private static final String ROOTD_SOCKET = "/data/local/tmp/pc98260-root.sock";
     private static final String SU_CLIENT = "/data/local/tmp/pc98260-su";
     private static final String KSUD_FILE = "/data/local/tmp/ksud";
-    private static final String EXPLOIT_BINARIES = "uaf_plant_replay slide_probe reach_probe";
+    private static final String EXPLOIT_BINARIES = "uaf_plant_replay slide_probe reach_probe cve99491_exp";
     private static final int SLIDE_PROBE_TIMEOUT_S = 12;
     private static final int DIAGNOSE_TIMEOUT_S = 25;
+    /**
+     * 99491 链部署超时：cve99491_exp（独立静态 ELF）+ profile 经 Shizuku 管道投放，
+     * 资产比 98260 的探针大，8s 不够；按路径可配置（docs/99491-test-plan.md §4）。
+     */
+    private static final long CVE99491_DEPLOY_TIMEOUT_MS = 30000L;
+    /** 99491 分阶段二进制整体超时（clean boot 参考 1.4s，冷启动/慢 IO 留足余量）。 */
+    private static final int CVE99491_TIMEOUT_S = 120;
+    private static final String CVE99491_BINARY = "/data/local/tmp/cve99491_exp";
+    private static final String CVE99491_PROFILE = "/data/local/tmp/" + Cve99491Profile.ASSET_NAME;
+    private static final String CVE99491_RUN_LOG = "/data/local/tmp/cve99491_run.log";
+    private final AssetManager assets;
     private final CommandExecutor executor;
     private final AssetDeployer deployer;
     private final WorkflowCallbacks callbacks;
@@ -58,8 +82,19 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
     private volatile String enforceBeforeRun = "";
     private volatile String selinuxAfterRoot = "?";
     private volatile long lastDeviceRefresh;
+    /** 用户选择的路径（持久化值）；运行中被分派链使用。 */
+    private volatile RootPath rootPath = RootPath.DEFAULT;
+    /** 本次实际执行的路径；发生 98260 回退后会变成 TIMER_98260，日志导出靠它归因。 */
+    private volatile RootPath activePath = RootPath.DEFAULT;
+    /** 最近一次 99491 profile 可用性判定（fail-closed，null 表示还没校验过）。 */
+    private volatile Cve99491Profile.Status cve99491Status;
+    /** debug 构建允许 verified=0 的 profile 带警告运行（真机标定用）；release 恒 false。 */
+    private volatile boolean unverifiedProfileAllowed;
+    private volatile long chainElapsedMs;
+    private volatile String lastStepLabel = "";
 
     public WorkflowEngine(AssetManager assets, CommandExecutor executor, WorkflowCallbacks callbacks) {
+        this.assets = assets;
         this.executor = executor;
         this.callbacks = callbacks;
         this.deployer = new AssetDeployer(assets, executor, this);
@@ -69,8 +104,142 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
         return state;
     }
 
+    /** 用户选择的提权路径（默认 98260）。 */
+    public RootPath getRootPath() {
+        return rootPath;
+    }
+
+    /** 宿主切换路径；只影响下一次运行，不打断正在跑的任务。 */
+    public void setRootPath(RootPath path) {
+        if (path != null) {
+            rootPath = path;
+        }
+    }
+
+    /** 本次实际执行的路径；99491 写前失败自动回退后为 TIMER_98260。 */
+    public RootPath getActivePath() {
+        return activePath;
+    }
+
+    /** 最近一次 99491 profile 可用性判定；还未校验时为 null（UI 按不可用处理）。 */
+    public Cve99491Profile.Status getCve99491Status() {
+        return cve99491Status;
+    }
+
+    /**
+     * debug 构建允许 verified=0 的 profile 带警告运行（真机标定阶段）。
+     *
+     * <p>release 构建绝不能打开：宿主用 {@code ApplicationInfo.FLAG_DEBUGGABLE} 判断后传入。
+     */
+    public void setUnverifiedProfileAllowed(boolean allowed) {
+        unverifiedProfileAllowed = allowed;
+    }
+
+    public boolean isUnverifiedProfileAllowed() {
+        return unverifiedProfileAllowed;
+    }
+
+    /** 最近一次读取到的 profile sha256；98260 或未校验时为空串。 */
+    public String getProfileSha256() {
+        Cve99491Profile.Status status = cve99491Status;
+        return status == null || status.sha256 == null ? "" : status.sha256;
+    }
+
+    /** 最近一次完整链路的耗时（从点击到结束/失败），日志导出用。 */
+    public long getChainElapsedMs() {
+        return chainElapsedMs;
+    }
+
+    /** 最近一次推进到的步骤标签，日志导出/状态同步用。 */
+    public String getLastStepLabel() {
+        return lastStepLabel;
+    }
+
+    /** 按路径取步骤标签（防御性拷贝，调用方改不动常量表）。 */
+    public static String[] stepLabels(RootPath path) {
+        if (path == RootPath.WACOM_99491) {
+            return STEP_LABELS_99491.clone();
+        }
+        return STEP_LABELS.clone();
+    }
+
+    /** 部署超时按路径可配置：99491 的资产更大，放宽到 {@link #CVE99491_DEPLOY_TIMEOUT_MS}。 */
+    public static long deployTimeoutMs(RootPath path) {
+        return path == RootPath.WACOM_99491 ? CVE99491_DEPLOY_TIMEOUT_MS : DEPLOY_TIMEOUT_MS;
+    }
+
     public boolean startRoot() {
-        return start("root", this::runRootChain, true);
+        return start("root", this::runSelectedRootChain, true);
+    }
+
+    /** 按当前选择分派；99491 的写前失败会自动回退到 98260（D4）。 */
+    private void runSelectedRootChain() throws Exception {
+        if (rootPath == RootPath.WACOM_99491) {
+            activePath = RootPath.WACOM_99491;
+            append(RootPath.WACOM_99491.channel() + " 路径选择：" + RootPath.WACOM_99491.label()
+                    + "（CVE-2026-99491，opt-in）");
+            runCve99491Chain();
+            return;
+        }
+        activePath = RootPath.TIMER_98260;
+        runRootChain();
+    }
+
+    /**
+     * 异步校验 99491 profile 的可用性（release 精确匹配 + verified）。
+     *
+     * <p>fail-closed：资产缺失、JSON 损坏、设备内核读不到、release 不匹配、未 verified 都判不可用。
+     * 结果通过 {@link WorkflowCallbacks#onRootPathAvailability(boolean, String)} 回给宿主。
+     */
+    public void refreshRootPathAvailability() {
+        try {
+            worker.execute(() -> {
+                Cve99491Profile.Status status;
+                try {
+                    status = evaluateCve99491Status();
+                } catch (Throwable error) {
+                    status = Cve99491Profile.check("", null);
+                }
+                cve99491Status = status;
+                try {
+                    callbacks.onRootPathAvailability(status.available, status.reason);
+                } catch (Throwable ignored) {
+                    // UI 回调失败不能影响主流程。
+                }
+            });
+        } catch (RuntimeException ignored) {
+            // worker 已关闭（应用退出中），忽略。
+        }
+    }
+
+    private Cve99491Profile.Status evaluateCve99491Status() {
+        String release = "";
+        if (executor.isAvailable()) {
+            try {
+                release = run("uname -r", true).output.trim();
+            } catch (Throwable ignored) {
+                release = "";
+            }
+        }
+        return Cve99491Profile.check(release, readAsset(Cve99491Profile.ASSET_NAME),
+                unverifiedProfileAllowed);
+    }
+
+    /** 读 APK 内资产；不存在/读失败返回 null（交给 Cve99491Profile 变成明确错误）。 */
+    private byte[] readAsset(String name) {
+        try (InputStream input = assets.open(name)) {
+            ByteArrayOutputStream output = new ByteArrayOutputStream();
+            byte[] buffer = new byte[8192];
+            int count;
+            while ((count = input.read(buffer)) >= 0) {
+                if (count > 0) {
+                    output.write(buffer, 0, count);
+                }
+            }
+            return output.toByteArray();
+        } catch (Throwable ignored) {
+            return null;
+        }
     }
 
     public boolean retryKernelSu() {
@@ -246,6 +415,8 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
             busy = true;
             startedAt = System.currentTimeMillis();
             currentStep = -1;
+            chainElapsedMs = 0L;
+            lastStepLabel = "";
             if (ownsState) {
                 state = State.RUNNING;
                 synchronized (logLock) {
@@ -282,6 +453,7 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
             } finally {
                 busy = false;
                 if (ownsState) {
+                    chainElapsedMs = System.currentTimeMillis() - startedAt;
                     cleanupBinaries(state == State.ROOTED || state == State.KSU_PENDING);
                 }
             }
@@ -338,6 +510,12 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
         String recorded = preflight.getOrDefault("FAILED", "").trim();
         BootGuard.Retry retry = BootGuard.parseFailure(recorded, boot);
         if (retry == BootGuard.Retry.BLOCKED) {
+            // 99491 链留下的 dirty 记录（dirty99491/parked99491）对 98260 同样生效：
+            // 两条链共享 dirty 标记，但错误信息要按路径说清楚。
+            String sharedDirty = BootGuard.dirtyReason(recorded, boot);
+            if (sharedDirty.contains("99491")) {
+                throw new IllegalStateException("[98260] " + sharedDirty + "。请重启设备后再试。");
+            }
             throw new IllegalStateException(
                     "本次开机已发生节点挂树（holding zombie）或内核报错，禁止重跑——重跑会对已释放节点二次 rb_erase，"
                             + "直接 panic。请重启设备后再试。");
@@ -420,6 +598,318 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
                 (System.currentTimeMillis() - chainStart) / 1000.0));
         append("[下一步] 自动接管 KernelSU（会加载内核模块，可能重启）。");
         runKernelSuStep();
+    }
+
+    // ---- 99491（CVE-2026-99491 real_cred）链 ----
+
+    /**
+     * 99491 链：部署资产 → 预检 → 运行分阶段二进制 → 解析标记 → 接管 KernelSU。
+     *
+     * <p>失败处置严格按 D4：只有"零内核写之前"失败允许自动回退 98260；写后失败置 dirty boot
+     * 并要求重启；PARKED 则本 boot 不再写、也不回退。两条链共享同一个 dirty 标记文件。
+     * 98260 的逻辑不在这里，{@link #runRootChain()} 保持原样。
+     */
+    private void runCve99491Chain() throws Exception {
+        String channel = RootPath.WACOM_99491.channel();
+        activePath = RootPath.WACOM_99491;
+        step(0);
+        status(channel + " 校验 profile");
+        Map<String, String> preflight = fetchPreflightSnapshot();
+        String kernel = preflight.getOrDefault("UNAME", "");
+        String boot = preflight.getOrDefault("BOOT", "");
+        String recorded = preflight.getOrDefault("FAILED", "").trim();
+        enforceBeforeRun = preflight.getOrDefault("ENFORCE", "");
+        String identity = oneLine(preflight.getOrDefault("ID", ""));
+        rootBeforeRun = preflight.getOrDefault("SU", "").contains("uid=0") || identity.contains("uid=0");
+        append(channel + " [基线] id=" + identity + " · SELinux=" + enforceBeforeRun);
+        append(channel + " uname -r = " + kernel);
+        if (!BootGuard.isSupportedKernel(kernel)) {
+            append(channel + " " + BootGuard.kernelWarning(kernel));
+        }
+
+        if (rootBeforeRun) {
+            clearRunMarker();
+            run(BootGuard.clearStageCommand(), true);
+            state = State.COMPLETE;
+            selinuxAfterRoot = enforceNow();
+            append(channel + " [跳过] 检测到 su 已可用且为 uid=0 —— 本机已由 KernelSU 接管。");
+            append(channel + " [跳过] 不再执行 99491；如需重新验证请先重启设备。");
+            callbacks.onState(State.COMPLETE,
+                    "99491 无需执行：已由 KernelSU 接管 · SELinux " + selinuxAfterRoot);
+            return;
+        }
+
+        String dirty = BootGuard.dirtyReason(recorded, boot);
+        if (!dirty.isEmpty()) {
+            throw new IllegalStateException(channel + " " + dirty + " · 本 boot 禁止再写内核，请重启设备后再试");
+        }
+        if (payloadProcessCount() > 0) {
+            throw new IllegalStateException(channel + " 上次运行的进程仍在运行，请重启设备后重试。");
+        }
+        String hint = BootGuard.leftoverStageHint(preflight.getOrDefault("STAGE", ""));
+        if (!hint.isEmpty()) {
+            append(channel + " [上次] " + hint);
+        }
+
+        // profile 可用性：release 精确匹配 + verified。失败即 fail-closed，不运行任何二进制。
+        Cve99491Profile.Status profileStatus = Cve99491Profile.check(
+                kernel, readAsset(Cve99491Profile.ASSET_NAME), unverifiedProfileAllowed);
+        cve99491Status = profileStatus;
+        if (!profileStatus.available) {
+            append(channel + " profile 不可用：" + profileStatus.reason);
+            throw new IllegalStateException(channel + " 99491 profile 不可用（fail-closed，未写入内核）："
+                    + profileStatus.reason);
+        }
+        append(channel + " [p] profile_ok release=" + profileStatus.release
+                + " sha256=" + profileStatus.sha256 + " · " + profileStatus.reason);
+
+        writeRunMarker(boot);
+        writeStageQuietly("99491-deploy");
+        step(1);
+        status(channel + " 部署资产");
+        DeployGate deployed = deployAssets(RootPath.WACOM_99491,
+                deployTimeoutMs(RootPath.WACOM_99491));
+        if (deployed.outcome() != DeployGate.Result.READY) {
+            boolean deployAlive = deployed.isWorkerAlive();
+            append(channel + " [部署] 未就绪（" + deployed.outcome() + "）"
+                    + (deployAlive ? "，部署线程仍存活" : "，线程已退出"));
+            Throwable cause = deployed.failure();
+            if (cause != null) {
+                append(channel + " [部署] 原因：" + friendly(cause));
+            }
+            run(BootGuard.clearStageCommand(), true);
+            if (deployAlive) {
+                throw new IllegalStateException(channel + " 部署线程取消后仍未退出——禁止回退或继续，"
+                        + "请重启设备后再试");
+            }
+            fallbackTo98260(channel + " 资产部署失败（" + deployed.outcome() + "）");
+            return;
+        }
+
+        // D3：模块 late-load 由 99491 二进制自身完成（--stage=full 内部调用 ksud late-load）。
+        // 这里先按需补投 ksud，保证 /data/local/tmp/ksud 存在。若 plant 侧改成 App 外部 late-load，
+        // 再把这一步拆成独立阶段（TODO 已同步给 Lead）。
+        try {
+            stageKsudIfNeeded();
+        } catch (Exception error) {
+            append(channel + " [部署] ksud 投放失败（模块 late-load 可能不可用）：" + friendly(error));
+        }
+
+        step(2);
+        status(channel + " 预检");
+        writeStageQuietly("99491-run");
+        String arguments = "--stage=full --profile " + CVE99491_PROFILE + " --workdir /data/local/tmp";
+        append(channel + " 运行 " + CVE99491_BINARY + " " + arguments);
+        CommandResult binary = run(BootGuard.withTimeout(CVE99491_TIMEOUT_S,
+                CVE99491_BINARY + " " + arguments + " > " + CVE99491_RUN_LOG + " 2>&1"), false);
+        if (binary.exitCode == BootGuard.TIMEOUT_EXIT) {
+            append(channel + " 二进制超过 " + CVE99491_TIMEOUT_S + " 秒被 timeout 终止");
+        }
+        String output = run("cat " + CVE99491_RUN_LOG + " 2>/dev/null", true).output;
+        if (output == null || output.trim().isEmpty()) {
+            output = binary.output == null ? "" : binary.output;
+        }
+        appendCve99491Output(output);
+        stepForCve99491Output(output);
+        BootGuard.Cve99491Outcome outcome = BootGuard.classifyCve99491(output);
+        append(channel + " 标记分类=" + outcome);
+        if (outcome == BootGuard.Cve99491Outcome.SUCCESS) {
+            boolean recheck = verifyCve99491Su();
+            finishCve99491Success(channel, recheck);
+            return;
+        }
+        RootPathDecision.Decision decision = RootPathDecision.decide(output, binary.exitCode);
+        append(channel + " 裁决=" + decision + " · " + RootPathDecision.describe(decision));
+        if (decision == RootPathDecision.Decision.DIRTY_BOOT
+                && BootGuard.hasCve99491ModuleLive(output) && verifyCve99491Su()) {
+            // 模块已 live 但二进制没打出最终 su_check 行：外部 su 复核通过就按成功处理，
+            // 不把一个已接管的内核误标成 dirty（那会逼用户白重启一次）。
+            finishCve99491Success(channel, true);
+            return;
+        }
+        settleCve99491Failure(channel, decision, boot);
+    }
+
+    /** 99491 部署门：超时按路径可配置，语义沿用 DeployGate（READY 必须显式完成）。 */
+    private DeployGate deployAssets(RootPath path, long timeoutMs) throws InterruptedException {
+        final DeployGate gate = new DeployGate(timeoutMs);
+        Thread deploy = new Thread(() -> {
+            try {
+                deployer.stageAll(path);
+                gate.markCompleted();
+            } catch (Throwable error) {
+                gate.fail(error);
+            }
+        }, "lhasa-deploy-" + path.key());
+        deploy.start();
+        DeployGate.Result result = gate.await(deploy);
+        if (result != DeployGate.Result.READY) {
+            // 和 98260 相同的收尾顺序：先停写入、确认线程退出，再决定回退/失败。
+            deployer.cancel();
+            deploy.interrupt();
+            try {
+                deploy.join(DEPLOY_JOIN_MS);
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+            }
+        }
+        return gate;
+    }
+
+    /** 外部复核 `su -c id`；二进制标记是主证据，这里只做二次确认并写日志。 */
+    private boolean verifyCve99491Su() {
+        try {
+            // 经 Shizuku 的 sh 再套一层 su 引号容易坏，所以拆成三条独立命令：
+            // 每条只有一个参数层级，失败时也能定位是哪一项没通过。
+            CommandResult id = run("/system/bin/su -c id", false);
+            CommandResult enforce = run("/system/bin/su -c getenforce", false);
+            CommandResult context = run("/system/bin/su -c 'cat /proc/self/attr/current'", false);
+            String joined = oneLine(id.output) + " · " + oneLine(enforce.output)
+                    + " · " + oneLine(context.output);
+            boolean uid = isRoot(id.output);
+            boolean ksuDomain = containsKsuContext(context.output) || containsKsuContext(id.output);
+            append("[99491] [f] su 复核 uid=" + uid + " ksu=" + ksuDomain + " → " + joined);
+            return uid && ksuDomain;
+        } catch (Throwable error) {
+            append("[99491] [f] su 复核失败：" + friendly(error));
+            return false;
+        }
+    }
+
+    private static boolean containsKsuContext(String output) {
+        return output != null
+                && (output.contains("u:r=ksu:s0") || output.contains("u:r:ksu:s0"));
+    }
+
+    private void finishCve99491Success(String channel, boolean recheck) throws Exception {
+        run(BootGuard.clearFailureCommand(), true);
+        clearRunMarker();
+        run(BootGuard.clearStageCommand(), true);
+        state = State.COMPLETE;
+        selinuxAfterRoot = enforceNow();
+        append(channel + " [f] module_live / [f] su_check 命中：KernelSU 模块已接管");
+        append(channel + " 临时提权链（real_cred）成功，本次未使用 98260");
+        append(channel + " SELinux " + selinuxAfterRoot);
+        append(String.format(Locale.US, "[耗时] 99491 链从点击到接管 %.1fs · path=%s",
+                (System.currentTimeMillis() - startedAt) / 1000.0, RootPath.WACOM_99491.key()));
+        callbacks.onStatus("99491 已完成 · KernelSU 已接管 · SELinux " + selinuxAfterRoot);
+        callbacks.onState(State.COMPLETE, recheck
+                ? "99491 全部完成 · su 复核通过 · SELinux " + selinuxAfterRoot
+                : "99491 二进制报告已接管 · su 复核未通过（Shizuku 可能断开）· SELinux " + selinuxAfterRoot);
+    }
+
+    /** 按裁决落地：回退 98260 / PARKED / dirty boot。 */
+    private void settleCve99491Failure(String channel, RootPathDecision.Decision decision, String boot)
+            throws Exception {
+        switch (decision) {
+            case FALLBACK_98260:
+                fallbackTo98260(channel + " 零内核写之前失败");
+                return;
+            case PARKED:
+                recordCve99491Failure(BootGuard.Cve99491Failure.PARKED, boot);
+                run(BootGuard.clearStageCommand(), true);
+                state = State.PARKED;
+                append(channel + " 已 PARKED：本 boot 不再写内核，请重启设备后再试 99491");
+                callbacks.onState(State.PARKED, "99491 已 PARKED · 请重启设备后再试");
+                return;
+            case DIRTY_BOOT:
+                recordCve99491Failure(BootGuard.Cve99491Failure.WRITE_FAILURE, boot);
+                run(BootGuard.clearStageCommand(), true);
+                state = State.FAILED;
+                append(channel + " 写内核后失败：本次开机已置 dirty（两条链共享），禁止重跑");
+                append(channel + " 必须重启设备；重启前不要再点任何提权按钮");
+                callbacks.onState(State.FAILED, "99491 写内核后失败 · dirty boot · 必须重启设备");
+                return;
+            case SUCCESS:
+            default:
+                // 二进制报告成功但外部复核失败：按已接管处理，避免把成功误报成 dirty。
+                finishCve99491Success(channel, false);
+        }
+    }
+
+    /**
+     * 记录 99491 失败并绑定 boot_id（归因：上次/本次开机）。
+     *
+     * <p>优先用预检里读到的 boot_id：失败后 Shizuku 可能已断开，再读一次会拿不到记录，
+     * 而 dirty 标记恰恰是"这次开机不能重跑"的唯一凭据。
+     */
+    private void recordCve99491Failure(BootGuard.Cve99491Failure kind, String bootId) {
+        try {
+            String boot = bootId == null ? "" : bootId.trim();
+            if (boot.isEmpty()) {
+                boot = run("cat /proc/sys/kernel/random/boot_id 2>/dev/null", true).output.trim();
+            }
+            if (boot.isEmpty()) {
+                append("[99491] 警告：读不到 boot_id，dirty 记录未写入；请重启设备后再试任何提权链");
+                return;
+            }
+            run(BootGuard.recordCve99491FailureCommand(boot, kind), true);
+            append("[99491] 已记录本次失败：" + kind.token + "（boot_id=" + boot + "）");
+        } catch (Exception ignored) {
+            // 记录失败不能掩盖原始错误；UI 仍会提示必须重启。
+        }
+    }
+
+    /** 写前失败的自动回退：切回 98260 链继续，内核此时应处于干净状态。 */
+    private void fallbackTo98260(String reason) throws Exception {
+        append("[99491] " + reason);
+        append("[回退] 符合 D4：零内核写之前失败 → 自动回退 98260（定时器链），无需重启");
+        callbacks.onStatus("99491 写前失败 · 自动回退 98260");
+        activePath = RootPath.TIMER_98260;
+        mirroredStage = "";
+        payloadLines.clear();
+        run(BootGuard.clearStageCommand(), true);
+        runRootChain();
+    }
+
+    /** 99491 二进制输出统一带 `[99491] ` 通道前缀（§10），并按行去重（轮询会重复读到同一行）。 */
+    private void appendCve99491Output(String text) {
+        if (text == null || text.trim().isEmpty()) {
+            return;
+        }
+        for (String line : text.split("\\n")) {
+            String trimmed = line.trim();
+            if (trimmed.isEmpty()) {
+                continue;
+            }
+            if (payloadLines.add(trimmed)) {
+                append("[99491] " + trimmed);
+            }
+        }
+    }
+
+    /** 按二进制内部标记推进步骤，让 UI 进度条与日志对齐。 */
+    private void stepForCve99491Output(String text) {
+        if (text == null || text.isEmpty()) {
+            return;
+        }
+        int target = -1;
+        for (String raw : text.split("\\n")) {
+            String line = raw.trim();
+            if (line.startsWith("[p] profile_ok")) {
+                target = Math.max(target, 2);
+            } else if (line.startsWith("[p] anchor")) {
+                target = Math.max(target, 3);
+            } else if (line.startsWith("[+] setcon")) {
+                target = Math.max(target, 5);
+            } else if (line.startsWith("[+] ")) {
+                target = Math.max(target, 4);
+            } else if (line.startsWith("MODULE_LOADED") || line.startsWith("[f] module_live")
+                    || line.startsWith("[f] su_check")) {
+                target = Math.max(target, 6);
+            }
+        }
+        if (target >= 0 && target != currentStep) {
+            step(target);
+        }
+    }
+
+    private void writeStageQuietly(String stage) {
+        try {
+            run(BootGuard.markCommand(stage), true);
+        } catch (Exception ignored) {
+            // 面包屑写失败不该影响主流程。
+        }
     }
 
     private boolean hasUsableTempRoot() {
@@ -980,7 +1470,10 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
 
     private void step(int value) {
         currentStep = value;
-        callbacks.onStep(value, value >= 0 && value < STEP_LABELS.length ? STEP_LABELS[value] : "全部完成");
+        String[] labels = stepLabels(activePath);
+        String label = value >= 0 && value < labels.length ? labels[value] : "全部完成";
+        lastStepLabel = label;
+        callbacks.onStep(value, label);
     }
 
     private void status(String text) {
