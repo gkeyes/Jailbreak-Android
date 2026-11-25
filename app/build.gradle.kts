@@ -72,10 +72,10 @@ android {
         applicationId = "com.gkeyes.lhasa26"
         minSdk = 37
         targetSdk = 37
-        // 0.4.0-dev：自有探针替换 + CI 只读化之后的第一版。
+        // 0.4.1-dev：新固定签名身份的首个发布版（折叠屏布局/系统栏对比度修复 + 自适应图标）。
         // 每次发布都要 bump，否则 Releases 里会一直覆盖同一个 tag。
-        versionCode = 307
-        versionName = "0.4.0-dev"
+        versionCode = 308
+        versionName = "0.4.1-dev"
         resourceConfigurations += listOf("zh", "en")
     }
 
