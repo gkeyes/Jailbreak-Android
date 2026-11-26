@@ -10,6 +10,7 @@ import org.junit.Test;
 
 import java.util.Arrays;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Set;
 
 /**
@@ -90,6 +91,12 @@ public class WorkflowEngineLabelsTest {
         assertTrue(command, command.contains(
                 "CVE99491_KSU_KO=/data/local/tmp/kernelsu-android17-6.18.ko"));
         assertTrue(command, command.contains("CVE99491_TIMING=1"));
+        // T2d：no-permissive 路径（SELinux 全程 Enforcing，真机验证中；失败可回退旧路径）
+        assertTrue(command, command.contains("CVE99491_KSU_NO_PERMISSIVE=1"));
+        assertFalse("回退开关：旧路径不应带 no-permissive env",
+                WorkflowEngine.cve99491RunCommand(false)
+                        .contains("CVE99491_KSU_NO_PERMISSIVE=1"));
+        assertTrue(WorkflowEngine.cve99491RunCommand(false).contains("--stage=root"));
         assertTrue(command, command.contains("--stage=root"));
         assertTrue(command, command.contains("./cve99491_exp"));
         assertTrue(command, command.contains("--profile ./lhasa_99491_profile.json"));
@@ -100,5 +107,35 @@ public class WorkflowEngineLabelsTest {
                 && !command.contains("--stage=root"));
         assertEquals("/data/local/tmp/kernelsu-android17-6.18.ko",
                 WorkflowEngine.cve99491KsuKoPath());
+    }
+
+    /**
+     * 最终外部命令顺序（T2c）：先跑 exp `--stage=root`；只有当模块已 Live 且 su context
+     * 不是 ksu 时，才追加一次 ksud userspace 收尾。两条命令各自带齐自己的参数。
+     */
+    @Test
+    public void cve99491CommandSequenceIsExploitThenOptionalKsudFinish() {
+        String finish = WorkflowEngine.cve99491KsuFinishCommand();
+        assertEquals(KsuUserspaceFinisher.FINISH_COMMAND, finish);
+        assertTrue(finish, finish.startsWith("su -c '"));
+        assertTrue(finish, finish.contains("/data/adb/ksud late-load"));
+        assertTrue("必须显式 --allow-shell", finish.contains("--allow-shell"));
+        assertTrue("必须显式 --kmi android17-6.18", finish.contains("--kmi android17-6.18"));
+        // T2d：no-permissive 路径下 exp 写不了 /data/adb，收尾命令要先经 su 幂等安装 ksud
+        assertTrue(finish, finish.contains("[ -x /data/adb/ksud ] || cp"));
+        assertTrue(finish, finish.contains("cp /data/local/tmp/ksud /data/adb/ksud"));
+        assertTrue(finish, finish.contains("chmod 755 /data/adb/ksud"));
+
+        List<String> sequence = WorkflowEngine.cve99491CommandSequence();
+        assertEquals(2, sequence.size());
+        assertEquals(WorkflowEngine.cve99491RunCommand(), sequence.get(0));
+        assertEquals(finish, sequence.get(1));
+
+        // 收尾命令绝不能混进 exp 调用：exp 执行时模块还没 Live。
+        String exploit = WorkflowEngine.cve99491RunCommand();
+        assertFalse(exploit, exploit.contains("late-load"));
+        assertFalse(exploit, exploit.contains("/data/adb/ksud"));
+        // exp 侧只引用 ko/ksud 的资产路径（/data/local/tmp），不执行 ksud。
+        assertTrue(exploit, exploit.contains("CVE99491_KSUD_BIN=/data/local/tmp/ksud"));
     }
 }

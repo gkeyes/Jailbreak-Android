@@ -4,6 +4,7 @@ import android.content.res.AssetManager;
 
 import java.io.ByteArrayOutputStream;
 import java.io.InputStream;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -56,6 +57,14 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
      * 管道投放；按路径可配置（docs/99491-test-plan.md §4）。
      */
     private static final long CVE99491_DEPLOY_TIMEOUT_MS = 60000L;
+    /**
+     * no-permissive 路径（真机验证中）：exp 不打开 SELinux permissive 窗口，SELinux 全程 Enforcing。
+     *
+     * <p>该路径下 exp 无法提前写 /data/adb/ksud（shell 域被拒），ksud 安装由模块 Live 后的
+     * {@link KsuUserspaceFinisher} 经 su 完成。若真机验证被拒，去掉这个 env 即回到旧路径；
+     * finisher 的两段式命令两种路径都兼容，不需要改分类逻辑。
+     */
+    public static final String CVE99491_NO_PERMISSIVE_ENV = "CVE99491_KSU_NO_PERMISSIVE=1";
     /**
      * 99491 direct 引擎整体上限：cred 泄漏/UAF 写/窗口/60s 模块 Live 轮询都在里面，
      * 用异步 launch + 轮询（不受 CommandExecutor 单命令 120s 上限约束）。
@@ -179,17 +188,27 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
      * 99491 的最终设备命令（Lead 真机验收通过的形态）。
      *
      * <p>`CVE99491_KSU_BACKEND=ko`（KO 直载后端，失败不回退 cli）、`CVE99491_KSUD_BIN`/
-     * `CVE99491_KSU_KO` 指向已校验的资产、`CVE99491_TIMING=1` 打时间戳；`--stage=root` 做
-     * cred+fsuid+caps+permissive+KO 载入+su 验收。相对路径依赖 cwd = {@link #CVE99491_DIR}。
+     * `CVE99491_KSU_KO` 指向已校验的资产、`CVE99491_TIMING=1` 打时间戳；默认再带
+     * `CVE99491_KSU_NO_PERMISSIVE=1`（SELinux 全程 Enforcing，不破坏 App 的 SELinux 状态），
+     * `--stage=root` 做 cred+fsuid+caps+KO 载入+su 验收。相对路径依赖 cwd = {@link #CVE99491_DIR}。
      *
      * <p>公开成静态方法是为了让 JVM 单测能锁住 env/参数，防止以后改坏。
      */
     public static String cve99491RunCommand() {
+        return cve99491RunCommand(true);
+    }
+
+    /**
+     * 同上，显式控制 no-permissive 路径（真机若验证被拒，宿主/后续版本传 false 即回退旧路径，
+     * 其余流程与 finisher 两段式命令都不需要改）。
+     */
+    public static String cve99491RunCommand(boolean noPermissive) {
         return "cd " + CVE99491_DIR
                 + " && env CVE99491_KSU_BACKEND=ko"
                 + " CVE99491_KSUD_BIN=" + KSUD_FILE
                 + " CVE99491_KSU_KO=" + CVE99491_KSU_KO
                 + " CVE99491_TIMING=1"
+                + (noPermissive ? " " + CVE99491_NO_PERMISSIVE_ENV : "")
                 + " ./" + AssetIntegrity.CVE99491_EXP_ASSET
                 + " --stage=root --profile ./" + Cve99491Profile.ASSET_NAME
                 + " --workdir .";
@@ -203,6 +222,31 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
     /** 99491 期望的 KO 路径（单测/日志用）。 */
     public static String cve99491KsuKoPath() {
         return CVE99491_KSU_KO;
+    }
+
+    /**
+     * 模块已 Live 后的 ksud userspace 收尾命令。
+     *
+     * <p>真机 ROOT12：ko 加载后 su 可用但 context=kernel，KSU 的 sepolicy/features 需要
+     * ksud late-load 的 userspace 阶段才完成（98260 走的正是 ksud 全流程）。该步骤只允许在
+     * 模块已 Live 时执行，绝不用于 exp 失败/写前阶段。
+     */
+    public static String cve99491KsuFinishCommand() {
+        return KsuUserspaceFinisher.finishCommand();
+    }
+
+    /**
+     * 99491 的最终外部命令序列（单测锁顺序）：
+     * <ol>
+     *   <li>[0] exp `--stage=root`（direct 引擎 + ko 后端）；</li>
+     *   <li>[1] 可能的 ksud userspace 收尾（仅当模块已 Live 且 su context 不是 ksu 时执行一次）。</li>
+     * </ol>
+     */
+    public static List<String> cve99491CommandSequence() {
+        List<String> sequence = new ArrayList<>();
+        sequence.add(cve99491RunCommand());
+        sequence.add(cve99491KsuFinishCommand());
+        return sequence;
     }
 
     public boolean startRoot() {
@@ -751,20 +795,37 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
         String output = runResult.output;
         stepForCve99491Output(output);
         BootGuard.Cve99491Outcome outcome = BootGuard.classifyCve99491(output);
+        RootPathDecision.Decision decision = RootPathDecision.decide(output, runResult.timedOut);
         append(channel + " 标记分类=" + outcome + (runResult.timedOut ? "（轮询超时）" : ""));
-        if (outcome == BootGuard.Cve99491Outcome.SUCCESS) {
-            boolean accepted = verifyCve99491Acceptance();
-            boolean live = kernelSuModuleLiveNow();
-            finishCve99491Success(channel, accepted, live);
+        append(channel + " 裁决=" + decision + " · " + RootPathDecision.describe(decision));
+        // no-permissive 路径的期望：全程 Enforcing。这里只记录观测值，不改变失败分类
+        // （真机若验证 no-permissive 被拒会回退旧路径，分类逻辑保持双可用）。
+        String enforceAfterExp = enforceNow();
+        append(channel + " [SELinux] exp 结束后 getenforce=" + enforceAfterExp
+                + (BootGuard.isEnforcing(enforceAfterExp)
+                ? "（no-permissive 路径：全程 Enforcing）"
+                : "（警告：期望全程 Enforcing，当前非 Enforcing；仅记录，不改变裁决）"));
+
+        // 模块已 Live：先做一次已加载证据判定（标记优先，/proc/modules 兜底），
+        // 只有这一步可能触发 ksud userspace 收尾；exp 失败/写前阶段绝不执行。
+        boolean moduleLoaded = BootGuard.hasCve99491ModuleLoaded(output)
+                || BootGuard.hasCve99491ModuleLive(output)
+                || kernelSuModuleLiveNow();
+        if (moduleLoaded) {
+            KsuUserspaceFinisher.Verdict verdict = runKsuUserspaceFinisher(channel);
+            if (verdict.success) {
+                finishCve99491Success(channel, verdict, true);
+                return;
+            }
+            append(channel + " [ksud] 收尾后 su 验收仍未通过（uid≠0 或 context 不安全）→ fail-closed");
+            // 模块已 Live 说明内核已被写过：收尾失败一律 dirty，绝不回退 98260、也不在本 boot 重试。
+            settleCve99491Failure(channel, RootPathDecision.Decision.DIRTY_BOOT, boot);
             return;
         }
-        RootPathDecision.Decision decision = RootPathDecision.decide(output, runResult.timedOut);
-        append(channel + " 裁决=" + decision + " · " + RootPathDecision.describe(decision));
-        if (decision == RootPathDecision.Decision.DIRTY_BOOT
-                && BootGuard.hasCve99491ModuleLive(output) && verifyCve99491Acceptance()) {
-            // 模块已 live 但二进制没打出最终 su_check 行：外部 su 验收通过就按成功处理，
-            // 不把一个已接管的内核误标成 dirty（那会逼用户白重启一次）。
-            finishCve99491Success(channel, true, true);
+        if (outcome == BootGuard.Cve99491Outcome.SUCCESS) {
+            // 边界情况：看起来 su_check 命中却没有 module 标记（正常不会发生）——沿用 App 侧 su 复核。
+            boolean accepted = verifyCve99491Acceptance();
+            finishCve99491Success(channel, accepted, false);
             return;
         }
         settleCve99491Failure(channel, decision, boot);
@@ -908,7 +969,72 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
         }
     }
 
+    /**
+     * 模块已 Live 后的 ksud userspace 收尾（T2c）。
+     *
+     * <p>真机 ROOT12：ko 后端把模块 finit_module 进内核后模块 Live、su 可用且 uid=0，
+     * 但 context 仍是 kernel——KSU 的 sepolicy/features 初始化由 ksud late-load 的 userspace
+     * 阶段完成。所以这里执行一次
+     * {@code su -c '/data/adb/ksud late-load --allow-shell --kmi android17-6.18'}，
+     * 等 10s 轮询后再复验 `su -c 'id; getenforce'`。
+     *
+     * <p>收尾失败不回滚已加载的模块，也不在这里判非法；最终是否成功交给
+     * {@link KsuUserspaceFinisher} 的验收规则（uid=0 + context 非 shell/untrusted 即成功，
+     * context 不是 ksu 时降级标注）。
+     */
+    private KsuUserspaceFinisher.Verdict runKsuUserspaceFinisher(String channel) {
+        append(channel + " [ksud] 模块已 Live → 检查 su SELinux context"
+                + "（必要时补一次 ksud userspace 收尾）");
+        KsuUserspaceFinisher.Runner runner = new KsuUserspaceFinisher.Runner() {
+            @Override
+            public String runSuId() throws Exception {
+                return readSuIdEnforceOutput();
+            }
+
+            @Override
+            public String runFinish() throws Exception {
+                append(channel + " [ksud] 执行收尾：" + KsuUserspaceFinisher.finishCommand());
+                CommandResult result = run(KsuUserspaceFinisher.finishCommand(), false);
+                append(channel + " [ksud] 收尾命令 rc=" + result.exitCode
+                        + " · " + oneLine(result.output));
+                return result.output == null ? "" : result.output;
+            }
+
+            @Override
+            public void sleepMs(long millis) throws InterruptedException {
+                Thread.sleep(millis);
+            }
+        };
+        KsuUserspaceFinisher.Verdict verdict = KsuUserspaceFinisher.finishIfNeeded(true, runner);
+        append(channel + " [ksud] 收尾结果=" + verdict.result + " · " + verdict.detail);
+        append(channel + " [ksud] 最终 su：" + verdict.suIdLine
+                + (verdict.enforce.isEmpty() ? "" : " · SELinux=" + verdict.enforce)
+                + (verdict.finishError.isEmpty() ? "" : " · 收尾错误=" + verdict.finishError));
+        return verdict;
+    }
+
+    /** `su -c 'id; getenforce'`（收尾前后都用这一条；只用一层引号，避免 Shizuku sh 嵌套坏掉）。 */
+    private String readSuIdEnforceOutput() throws Exception {
+        CommandResult result = run("if [ -x /system/bin/su ]; then /system/bin/su -c 'id; getenforce'; "
+                + "elif [ -x /data/adb/ksu/bin/su ]; then /data/adb/ksu/bin/su -c 'id; getenforce'; "
+                + "else echo no-su; fi", false);
+        return result.output == null ? "" : result.output;
+    }
+
+    private void finishCve99491Success(String channel, KsuUserspaceFinisher.Verdict verdict,
+                                       boolean moduleLive) throws Exception {
+        finishCve99491Success(channel, verdict.success, moduleLive, verdict.contextNote,
+                verdict.degraded, verdict.finishAttempted, verdict.finishError);
+    }
+
     private void finishCve99491Success(String channel, boolean accepted, boolean moduleLive)
+            throws Exception {
+        finishCve99491Success(channel, accepted, moduleLive, "", false, false, "");
+    }
+
+    private void finishCve99491Success(String channel, boolean accepted, boolean moduleLive,
+                                       String contextNote, boolean degraded,
+                                       boolean finishAttempted, String finishError)
             throws Exception {
         run(BootGuard.clearFailureCommand(), true);
         clearRunMarker();
@@ -916,19 +1042,36 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
         state = State.COMPLETE;
         selinuxAfterRoot = enforceNow();
         append(channel + " [f] su_check / MODULE_LOADED 命中：KernelSU 模块已接管");
+        if (finishAttempted) {
+            append(channel + " [ksud] 已执行 userspace 收尾（late-load --allow-shell --kmi "
+                    + KsuUserspaceFinisher.KMI + "）"
+                    + (finishError.isEmpty() ? "" : "；收尾命令报错：" + finishError));
+        }
         append(channel + " 模块已 Live："
                 + (moduleLive
-                ? "App 复核 /proc/modules 确认，跳过 App 侧 late-load（不重复加载）"
-                : "二进制报告已加载（App 复核 /proc/modules 未命中，未重复 late-load）"));
+                ? "App 复核 /proc/modules 确认，跳过 App 侧重复 late-load"
+                : "二进制报告已加载（App 复核 /proc/modules 未命中）"));
+        if (accepted && degraded) {
+            append(channel + " su 可用（uid=0）但 " + contextNote + " → 按确认规则降级放行");
+        } else if (accepted) {
+            append(channel + " su 验收通过："
+                    + (contextNote.isEmpty() ? "uid=0 · u:r=ksu:s0" : contextNote));
+        }
         append(channel + " 临时提权链（direct 引擎 + ko 后端）成功，本次未使用 98260");
         append(channel + " SELinux " + selinuxAfterRoot);
         append(String.format(Locale.US, "[耗时] 99491 链从点击到接管 %.1fs · path=%s",
                 (System.currentTimeMillis() - startedAt) / 1000.0, RootPath.WACOM_99491.key()));
         callbacks.onStatus("99491 已完成 · KernelSU 已接管 · SELinux " + selinuxAfterRoot);
-        callbacks.onState(State.COMPLETE, accepted
-                ? "99491 全部完成 · su 验收通过（uid=0 · u:r=ksu:s0）· SELinux " + selinuxAfterRoot
-                : "99491 二进制报告已接管 · App 侧 su 验收未通过（Shizuku 可能断开）· SELinux "
-                        + selinuxAfterRoot);
+        String message;
+        if (!accepted) {
+            message = "99491 二进制报告已接管 · App 侧 su 验收未通过（Shizuku 可能断开）· SELinux "
+                    + selinuxAfterRoot;
+        } else if (degraded) {
+            message = "99491 完成 · su uid=0 · " + contextNote + " · SELinux " + selinuxAfterRoot;
+        } else {
+            message = "99491 全部完成 · su 验收通过（uid=0 · u:r=ksu:s0）· SELinux " + selinuxAfterRoot;
+        }
+        callbacks.onState(State.COMPLETE, message);
     }
 
     /** 按裁决落地：回退 98260 / PARKED / dirty boot。 */
