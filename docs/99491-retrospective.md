@@ -100,6 +100,31 @@
    - 每次"重启一次再跑"都是用户的实际成本；应在下真机前把离线能做的验证做足
      （源码阅读、离线模拟、单变量设计、脚本自检）。
 
+## 二·补充：其他一直在花时间处理的项（完整清单）
+
+除了第零节的 `selinux_state` 问题，下面这些也在持续消耗时间；很多属于"环境/工具链债务"，
+本可以在动手前一次性处理掉。
+
+| # | 现象 | 实际代价 | 原因 | 后来怎么处理 / 教训 |
+|---|---|---|---|---|
+| 1 | DSH 文件沙箱损坏：`plant/99491/exp.c`、`README.md`、`.git/index`、部分 `.git/objects` 变成不可读/不可改 | 多次无法 commit/push、源码差点丢失，需要从会话日志恢复、重建文件 | 宿主文件沙箱在长时间运行/重启后损坏 | 恢复为 `exp_direct.c`/`README_recovered.md`；改用"重新 clone + 同步文件"推送；**重要文件要尽快推远端** |
+| 2 | 手机命令通道不稳定：`android_shell` 先能用后失效（"无法保存或读取任务状态"），MT MCP 拒连 | 无法直接以 shell 跑设备命令，只能"手工 Harness + `/sdcard` 文件交换" | 手机操控/Shizuku 状态绑定 App 内任务，重启/异常后失效 | 全部设备操作改为 LHASA Harness 固定脚本；**通道不可靠时要把"脚本自包含 + 落盘日志"作为前提** |
+| 3 | Harness 显示"一直执行中" | 多次以为脚本没跑完，反复等待/中断 | `head` 管道被 daemon 子进程持有；exp 忽略 SIGTERM 导致 `timeout` 杀不掉 | 改成文件重定向（不用管道）+ 后台运行 + 定时 `kill -9` + 进度输出 |
+| 4 | 重启后"访问手机文件"与 Shizuku 状态重置 | 每次测试前都要用户手动开权限/开 Shizuku/开 Harness；我这边读不到日志 | Android 权限与会话状态不持久 | 每次测试说明"三步准备"；脚本把结果落 `/sdcard`，用户转发日志兜底 |
+| 5 | tracefs cred 泄漏解析失败（`R=0`） | 多轮真机调试 | 6.18 `kmem_cache_alloc` 记录多了 `__string(name)`，旧 `p+24=bytes_req` 解析错位；hello 等待时间太短 | 改为按 call_site/size 双路径解析 + raw ring dump + 轮询 hello ≤3s |
+| 6 | KASLR 校验逻辑错误 | 泄漏结果被误判失败 | 误把 runtime 地址与 link-time `[stext,etext)` 比较 | 改为 `[stext+slide, etext+slide)` |
+| 7 | UAF 回收/写入偶发 miss | 单步成功率不足，需重试 | spray 时序与内核回收竞争 | 写后 probe 校验 + 重试；accept misses as normal |
+| 8 | 每次失败必须重启（PARKED/fire guard） | 实验成本被放大数倍 | 写原语的内核写有风险，fail-closed 要求 dirty boot 不得重试 | 设计"写前/写后"分级；**预写失败才可回退，写后失败必须重启** |
+| 9 | `ksud late-load` 静默失败 | 数轮真机 | daemonize 无 stdout、错误只进 logcat；`kptr_restrict=2` 需 CAP_SYSLOG；exec 丢 caps | 读源码后改为"不 exec 的 ko 后端 + finit_module"，并尝试过 kptr 清零（后被 `ksuinit` 自己写 1 覆盖而放弃） |
+| 10 | no-permissive 尝试（Enforcing 下直接加载） | 一轮真机 + 分析 | `finit_module` 在 Enforcing 下 EPERM（SELinux 检查），必须短暂 permissive | 证伪后回到 permissive 路径，但把"开窗只改 enforcing"作为前提 |
+| 11 | App 参数 bug：`--workdir .` 相对路径 | 一轮 App 真机 | exp 路径校验要求 `/data/local/tmp/` 绝对路径；App 侧没对齐契约 | 命令改绝对路径 + 单测锁定（反断言相对路径不再出现） |
+| 12 | profile `verified=0` 使 release 构建禁用 99491 | 差点交付一个"release 用不了 99491"的 APK | release fail-closed 只接受 verified=1，debug 才放宽 | 真机打通后标 `verified=1` 并更新台账；**打包前按目标构建类型检查 profile 门禁** |
+| 13 | 成功被误分类为 PARKED/DIRTY | App 日志误报，用户以为失败 | exp 成功路径也会打印 `PARKED marker set` 信息行，分类先匹配了 PARKED | 分类顺序改为 `MODULE_LOADED+module_live=1` 优先 SUCCESS，并加回归测试 |
+| 14 | debug 签名与 release 签名不兼容 | 用户安装云端 APK 需要先卸载旧版 | 两个 APK 用不同签名 key | 交付说明写清"先卸载再安装"；正式发布统一使用 release 证书 |
+| 15 | CI 分支门禁 | 云端构建无法在开发分支触发 | `build.yml` 只允许 `next` 分支 | 手动触发 + 给开发分支加白名单（不改 `next` 行为） |
+| 16 | 证据丢失：logcat 环形缓冲被冲掉、`root_out.txt` 被下一次运行覆盖 | 多次无法归因，只能再做一轮真机 | 日志没有及时落盘/命名区分 | 每次运行用 `boot_id` 命名并立即 cp 到 `/sdcard`；先抓证据再做操作 |
+| 17 | 健康检查方法本身有 bug | 误判"系统坏了"两次 | 用 force-stop 系统设置后立即启动（易失败）；组件名写错（`com.miui.calculator/.Calculator` 不存在） | 改用非系统 App + 前后进程对比 + 重试；**验证工具本身也要先验证** |
+
 ## 三、真正的技术难点
 
 1. **无 kprobe 的 6.18 内核上做信息泄露**
