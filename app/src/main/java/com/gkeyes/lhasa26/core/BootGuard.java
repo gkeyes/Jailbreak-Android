@@ -210,6 +210,14 @@ public final class BootGuard {
         if (containsAny(tail, CVE99491_ABORT_MARKERS)) {
             return Cve99491Outcome.ABORT_BOOT;
         }
+        // The direct engine prints "PARKED marker set ..." on the success path too;
+        // a live module (MODULE_LOADED + module_live=1 enforce=1) must win over the
+        // generic PARKED line, otherwise a successful takeover is classified dirty.
+        if (tail.contains("MODULE_LOADED")
+                && tail.contains("module_live=1")
+                && tail.contains("enforce=1")) {
+            return Cve99491Outcome.SUCCESS;
+        }
         if (isCve99491SuCheckOk(tail)) {
             return Cve99491Outcome.SUCCESS;
         }
