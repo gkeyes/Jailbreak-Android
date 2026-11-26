@@ -1,3 +1,6 @@
+> 注：本文件是**过程记录**（按时间追加）。最终可用流程/证据汇总见 `docs/99491-solution.md`，
+> 经验复盘见 `docs/99491-retrospective.md`。
+
 # CVE-2026-99491 适配记录（测试证据）
 
 > 计划：`docs/99491-test-plan.md`。分支：`next-99491-realcred`。

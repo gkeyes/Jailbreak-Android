@@ -5,6 +5,13 @@
 > `_xring/02-exploit-chain.md`、`_xring/05-pitfalls.md`、
 > `_99491-upstream/upstream/{poc.c,exp.c,exp.md}`（5.15 参考，含 tracefs cred 泄漏）。
 
+## 0. 最终状态（先看这里）
+
+真机已打通：`finit_module result=0` → `MODULE_LOADED` → `su` 为
+`uid=0 … u:r=ksu:s0`，且运行后其它 App 正常打开。
+完整流程/证据/复盘见 `docs/99491-solution.md` 与 `docs/99491-retrospective.md`；
+本文只描述 direct 引擎/ko 后端的实现细节。
+
 ## 1. 定位
 
 `exp_direct.c` 保留原 real_cred/fake-handle 链全部代码，并新增 `CVE99491_ENGINE=direct`
@@ -135,14 +142,18 @@ bash plant/99491/build.sh --self-test --src plant/99491/exp_direct.c \
 - 每次 UAF 写入约 0.5–1s（含建对/等待/回收/spray/drain），cred oracle 最多 ~4 写/候选；
   UAF 未命中可能没有写效果（脚本按标记判定，不盲目重试整链）。
 - **ko 后端前提**：`ksu_symbols.inc` 必须来自**同一 boot 导出的 link-time kallsyms**；`kernelsu.ko`
-  必须与 `android17-6.18` KMI 匹配；patch 数应在 ~230–260 量级，`missing>2` 会拒绝加载。
-  `direct_install_ksud()` 写 `/data/adb/ksud` 依赖 permissive 窗口 + euid/fsuid0（失败只告警，
-  但 `su` 验收会失败）。
-- `CVE99491_KSU_BACKEND` 未设置时默认先 ko，ko 失败自动回退 `cli`（ksud late-load）；
-  显式 `=ko` 时失败即 fail-closed（`PARKED`），显式 `=cli` 时只用旧路径。
-- `selinux_state-1` 窗口期间系统短暂 permissive（会立刻载模块并恢复；失败则重启恢复）。
-- `root` 阶段首次验证要点：ksud loader 是否存在于测试 boot（无 KSU 时需推 assets ksud 或
-  传 `--ksud`）；`su` 二进制是否在 `/system/bin/su` 或 `/data/adb/ksu/bin/su`；模块 Live 后
-  KSU 注入策略是否需要厂商 HAL 修复（本引擎未做，失败可后续加）。
-- 待 Lead 标定后可切换：AVC 节点开窗（`selinux_avc`、avc_node 分配点）、`input_dev_sw_off`
-  （干净 V0 词）、KSU manager 拉起/GRANT_ROOT（若 `su -c id` 需要）。
+  必须与 `android17-6.18` KMI 匹配；本机实测 patch=225、`missing=0`，`missing>2` 会拒绝加载。
+  finit 前由提权子进程把 ksud 复制到 `/data/adb/ksud`（KSU sucompat 前提），失败只告警。
+- **finit_module 参数**：`allow_shell=1`（与 `ksud --allow-shell` 一致；缺失时 KSU 不给 shell 发 su）。
+- `CVE99491_KSU_BACKEND`：最终流程（App）显式传 `=ko`，失败即 fail-closed（`PARKED`）；
+  未设置时引擎仍保留开发期"ko 失败回退 cli"的行为，仅用于调试，不要在发布流程里依赖它。
+- **开窗（已修正）**：默认把**零词组**写到 `selinux_state-7`——8 字节里只有 `enforcing`
+  落在结构体内，`initialized`/`policy`/mutex 不变；加载成功后 KernelSU 自己恢复 Enforcing。
+  `CVE99491_SEL_OPEN_LEGACY=1` 才会用旧的 `selinux_state-1` V1 词（会污染结构体后续字段，
+  会把 KSU 策略注入弄坏，仅用于复现历史失败）。
+- **成功路径**：配合 `CVE99491_SKIP_SU_CHECK=1`，模块 Loaded 后不执行 exp 内部 su 检查、
+  也不执行失败路径的破坏性 restore；`su` 验收由 App/脚本侧完成。
+- `root` 阶段验收要点：`/proc/modules` 出现 `kernelsu ... Live`；`/system/bin/su -c id`
+  返回 `uid=0 … u:r=ksu:s0`（至少 uid=0）；运行后其它 App 必须仍能正常启动。
+- 后续工作：AVC 节点开窗（完全避免 permissive 全局窗口）、`input_dev_sw_off` 干净 V0 词、
+  KSU manager 拉起/GRANT_ROOT 的更多机型适配。

@@ -1,3 +1,8 @@
+> ⚠️ **历史文档（仅存档）**：本文件是从会话日志恢复的旧 `README.md`/`exp.c` 内容，
+> 描述的是 Yunnijian fake-handle/outq 老链；实现已被 `plant/99491/exp_direct.c` 的
+> direct 固定词引擎取代。最终可用流程见 `docs/99491-solution.md` 与
+> `plant/99491/README_direct.md`，**不要按本文档操作**。
+
 # plant/99491 — CVE-2026-99491 `real_cred` 链（lhasa 移植）
 
 > 本目录是 [计划 `docs/99491-test-plan.md`](../../docs/99491-test-plan.md) §4 的 T1 交付：

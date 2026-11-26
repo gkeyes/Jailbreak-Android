@@ -103,7 +103,7 @@ JSON 可选带 `stext/etext`；若带，必须与参考表该行一致，否则 
 - `cve99491_profile_builtin()`：编译内置 profile（运行时缺失 `<workdir>/profile.json` 时的回落）；
 - `cve99491_profile_pm_assumed()`：PackageManager 缺省值的显式兜底（上游同款）。
 
-`plant/99491/exp.c` 只 include 这个头，不内嵌任何地址/偏移/几何 ⇒ OTA 换内核时只改 JSON + 重跑
+`plant/99491/exp_direct.c` 只 include 这个头，不内嵌任何地址/偏移/几何 ⇒ OTA 换内核时只改 JSON + 重跑
 `build.sh`，源码零改动。
 
 ---
@@ -114,9 +114,10 @@ JSON 可选带 `stext/etext`；若带，必须与参考表该行一致，否则 
 2. 把值写进 `app/src/main/assets/lhasa_99491_profile.json`（只改这个文件）；
 3. `python3 tools/99491/gen_profile.py --check --json app/src/main/assets/lhasa_99491_profile.json` → 0 FAIL；
 4. `bash plant/99491/build.sh` → 重新生成 `profile.h` 并编译（CI 用 zig，本机回退 gcc）；
-5. 真机 `--stage=leak` → `oracle` → `write` → `selinux` → `full`（每阶段预期输出见
-   `plant/99491/README.md` §4/§5；一次一脚本、不调参重试）；
-6. S6/S7 全绿后把 `verified` 改 `1`，重新 `build.sh`；发布门禁加 `--require-verified`。
+5. 真机 `--stage=leak` → `oracle` → `write` → `selinux` → `root`（每阶段预期输出见
+   `plant/99491/README_direct.md`；一次一脚本、不调参重试）；
+6. S7（三次冷启动）回归后把 `verified` 保持 `1`，重新 `build.sh`；发布门禁用 `--require-verified`。
+   本机 2026-11-26 已完成 99491 全链真机打通（su=u:r=ksu:s0、App 正常），S7 剩余次数在补。
 
 > 只要改了 JSON（哪怕只是 `verified` 或 `label`），都必须重新 `build.sh`：运行期会用
 > `profile_compare_builtin()` 逐字段比对显式 `--profile` JSON 与编译内置 profile，

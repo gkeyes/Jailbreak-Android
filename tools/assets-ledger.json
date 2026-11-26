@@ -141,15 +141,15 @@
       "name": "cve99491_exp",
       "path": "app/src/main/assets/cve99491_exp",
       "size": 800696,
-      "gitBlobSha1": "b4c75b3bf0211e65b6cc15b31ac4e6d6cf1fdf70",
-      "sha256": "b6e67810402eb115490cb3d22c67a00dfcd7caabad731b795867302fce167bd9",
+      "gitBlobSha1": "2d143f1be8d3e8fa608a34133a0e9307af5dd881",
+      "sha256": "2b8843ce5b1498e2f20f56933c9533808c16194283717e4a61dcf5de7359b921",
       "origin": "repo-build",
       "sourceDraft": "plant/99491/exp_direct.c（direct 引擎 + ko 后端）",
       "license": "GPL-3.0",
       "inApk": true,
       "usedBy": "core/AssetDeployer → /data/local/tmp/cve99491/cve99491_exp；core/WorkflowEngine 99491 链执行 --stage=root",
       "status": "pinned",
-      "action": "修改 plant/99491/exp_direct.c 后用 plant/99491/build.sh 重建并更新 sha（out16：selinux_state-7 零词组开窗）"
+      "action": "修改 plant/99491/exp_direct.c 后用 plant/99491/build.sh 重建（out17：ver=1 header + sel-7 零词组），并更新 sha"
     },
     {
       "name": "kernelsu-android17-6.18.ko",

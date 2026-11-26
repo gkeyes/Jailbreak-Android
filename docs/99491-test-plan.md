@@ -1,3 +1,7 @@
+> 注：本文件是**历史测试计划**（写于真机打通前）。最终流程、根因与经验见
+> `docs/99491-solution.md` 与 `docs/99491-retrospective.md`；endgame 已由 `ksud late-load` 改为
+> “ko 后端：UND→SHN_ABS + memfd + finit_module”，开窗改为 `selinux_state-7` 零词组。
+
 # 第二条提权链（CVE-2026-99491 real_cred）测试与适配计划
 
 > 状态：已批准（2026-11-25），执行分支 `next-99491-realcred`（从 `next` @349bc20 切出）。

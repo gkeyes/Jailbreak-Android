@@ -3,18 +3,19 @@
 这里放的是**会被打进 APK** 的原生程序与数据。任何新增/替换都必须同步台账，
 否则 `tools/check_assets.py --strict`（CI 第一步）会直接失败。
 
-| 文件 | 大小 | 来源 | 是否有源码 | 状态 |
-|---|---|---|---|---|
-| `ksud` | 4,990,848 | 上游 KernelSU，**未对接到任何 Release** | 上游开源 | 换成 `tools/ksud.lock.properties` 锁定的 v3.3.1 官方产物 |
-| `uaf_plant_replay` | 88,488 | 预编译 | **无**（`plant/` 里没有对应 .c） | 黑盒，需补源码或明确标注不可重建 |
-| `reach_probe` | 51,368 | 预编译 | 草稿 `plant/reach_probe.c` | 草稿未接入构建 |
-| `slide_probe` | 44,776 | 预编译 | 草稿 `plant/slide_probe.c` | 草稿未接入构建 |
-| `perf_slide` | 31,840 | 预编译 | 草稿 `plant/perf_slide.c` | 草稿未接入构建 |
-| `pc98260-su` | 28,416 | 预编译 | 草稿 `plant/pc98260-su.c` | 草稿未接入构建 |
-| `lhasa_profile.txt` | 2,046 | 仓库内数据 | 不适用 | 保持 |
+| 文件 | 大小 | 来源 | 状态 |
+|---|---|---|---|
+| `ksud` | 4,990,848 | upstream-prebuilt | pinned |
+| `uaf_plant_replay` | 99,048 | upstream-source | upstream-built |
+| `reach_probe` | 45,664 | rebuilt-from-source | rebuilt |
+| `slide_probe` | 43,448 | upstream-source | upstream-built |
+| `pc98260-su` | 25,512 | upstream-source | upstream-built |
+| `lhasa_profile.txt` | 2,046 | in-repo-data | data |
+| `lhasa_99491_profile.json` | 3,440 | device-calibrated | verified |
+| `cve99491_exp` | 800,696 | repo-build | pinned |
+| `kernelsu-android17-6.18.ko` | 375,328 | upstream-prebuilt | pinned |
 
-被 `AssetDeployer.RUNTIME_ASSETS` 预置的是后 6 项；`ksud` 不在预置清单里，
-KernelSU 接管阶段才按需投放。
+被 `AssetDeployer` / `AssetIntegrity` 使用的资产：98260 路径为 `uaf_plant_replay/slide_probe/reach_probe/pc98260-su`；99491 路径为 `cve99491_exp/lhasa_99491_profile.json/kernelsu-android17-6.18.ko`；`ksud` 两条路径共用、按需投放。
 
 ## 核对
 

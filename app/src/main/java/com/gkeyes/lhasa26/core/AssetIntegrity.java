@@ -41,7 +41,7 @@ public final class AssetIntegrity {
      */
     public static final long CVE99491_EXP_BYTES = 800696L;
     public static final String CVE99491_EXP_SHA256 =
-            "b6e67810402eb115490cb3d22c67a00dfcd7caabad731b795867302fce167bd9";
+            "2b8843ce5b1498e2f20f56933c9533808c16194283717e4a61dcf5de7359b921";
 
     /** profile 由 Lead 在 S6/S7 后改 verified=1，size/sha 会变：不做硬编码校验，只用运行时解析。 */
     public static final long PROFILE_BYTES = 0L;
