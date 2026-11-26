@@ -78,7 +78,11 @@ Enforcing
 `finit_module result=0` 但 dmesg 出现 `unknown SID ... called before initial load_policy`，
 `su` 只有 `context=kernel`，所有 App 打不开。
 
-## 5. 设备侧复现（LHASA Harness 脚本）
+## 5. 复盘与经验
+
+见 [`docs/99491-retrospective.md`](99491-retrospective.md)：为什么花了这么久、原因、技术难点、最后的解决路径与可复用经验清单。
+
+## 6. 设备侧复现（LHASA Harness 脚本）
 
 `/sdcard/Download/DSH-Go/99491/`：
 - `exp_direct_root`（sha256 `b6e67810402eb115490cb3d22c67a00dfcd7caabad731b795867302fce167bd9`）
