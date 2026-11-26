@@ -4,7 +4,7 @@
   "release": "6.18.21-android17-5-g805aa6adea19-abogki565292102-4k",
   "arch": "arm64",
   "label": "lhasa 2608BPX34C (Xiaomi 18 Fold), calibrated 2026-11-25",
-  "verified": 0,
+  "verified": 1,
   "page_size": 4096,
   "sym_uhid_worker": "0xffffffc080f79ff4",
   "sym_ihe_default": "0xffffffc080e185a4",

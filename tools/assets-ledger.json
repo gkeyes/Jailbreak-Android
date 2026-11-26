@@ -119,8 +119,8 @@
       "name": "lhasa_99491_profile.json",
       "path": "app/src/main/assets/lhasa_99491_profile.json",
       "size": 3440,
-      "gitBlobSha1": "03adca16e6d09d947aecffded9ba58f2fb407c1f",
-      "sha256": "ecf40bb8d4490804bbf15223dabdacfa793f41039d57ad9e9d61fda2f8caf0f9",
+      "gitBlobSha1": "55d32f1016ec3ac59c8e29919eebfffa3d332df1",
+      "sha256": "964452609484a5b7d2db9ff115333aff9a65485e497ae38539f5ea2d67bf3e88",
       "origin": "device-calibrated",
       "calibration": {
         "device": "lhasa 2608BPX34C (Xiaomi 18 Fold)",
@@ -134,8 +134,8 @@
       "license": "GPL-2.0-only",
       "inApk": true,
       "usedBy": "core/Cve99491Profile（AssetManager 解析 release+verified）；plant/99491/exp 运行时 --profile 读取同一内容（设备侧 /data/local/tmp/cve99491/profile.json）",
-      "status": "calibrated-pending",
-      "action": "2026-11-25 真机标定；verified=0 待 S6/S7 全链验证后改 1，并同步 updatedAt"
+      "status": "verified",
+      "action": "真机打通后标 verified=1（S7 三次冷启动回归待补）；release 构建据此启用 99491"
     },
     {
       "name": "cve99491_exp",
