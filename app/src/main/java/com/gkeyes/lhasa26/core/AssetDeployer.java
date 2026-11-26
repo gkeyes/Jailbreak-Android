@@ -35,7 +35,8 @@ public final class AssetDeployer {
      * 99491（CVE-2026-99491 real_cred / direct 引擎）的运行时资产。
      *
      * <p>最终设备流程（Lead 确认）：`cve99491_exp` + `lhasa_99491_profile.json` 放在
-     * {@link #CVE99491_DIR}（exe 用 `./cve99491_exp`、`--profile ./profile.json`、`--workdir .`），
+     * {@link #CVE99491_DIR}（exe 用 `./cve99491_exp`，`--profile`/`--workdir` 传绝对路径——
+     * exp 的 profile 校验要求 workdir 在 /data/local/tmp/ 下，相对值会在任何内核访问前被拒），
      * `kernelsu-android17-6.18.ko` 和 `ksud` 放在 `/data/local/tmp/`（exp 通过
      * CVE99491_KSU_KO / CVE99491_KSUD_BIN 环境变量引用）。ksud 走按需投放（4.9 MB，远端已校验则跳过）。
      *

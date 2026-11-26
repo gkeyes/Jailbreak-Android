@@ -76,9 +76,10 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
      */
     private static final long CVE99491_RUN_TIMEOUT_MS = 240000L;
     private static final long CVE99491_POLL_MS = 400L;
-    /** 99491 工作目录：exp/profile/运行时标记都在这里（ext 用相对路径 ./…）。 */
+    /** 99491 工作目录：exp/profile/运行时标记都在这里；exp 的 --profile/--workdir 必须传绝对路径。 */
     private static final String CVE99491_DIR = AssetDeployer.CVE99491_DIR;
     private static final String CVE99491_BINARY = CVE99491_DIR + "/" + AssetIntegrity.CVE99491_EXP_ASSET;
+    private static final String CVE99491_PROFILE = CVE99491_DIR + "/" + Cve99491Profile.ASSET_NAME;
     private static final String CVE99491_RUN_LOG = "/data/local/tmp/cve99491_run.log";
     private static final String CVE99491_KSU_KO = "/data/local/tmp/" + AssetIntegrity.KSU_KO_ASSET;
     private final AssetManager assets;
@@ -199,7 +200,8 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
      *
      * <p>内核必须短暂 permissive 才能 finit_module（Enforcing 下 EPERM），所以默认是
      * permissive 路径；{@link #cve99491RunCommand(boolean)} 保留历史 no-permissive 对照开关。
-     * 相对路径依赖 cwd = {@link #CVE99491_DIR}。
+     * cwd 是 {@link #CVE99491_DIR}；`--profile`/`--workdir` 必须传**绝对路径**——exp 的
+     * profile 校验要求 workdir 以 /data/local/tmp/ 开头，相对值（"."）会被在任何内核访问前拒绝。
      *
      * <p>公开成静态方法是为了让 JVM 单测能锁住 env/参数，防止以后改坏。
      */
@@ -220,8 +222,8 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
                 + " " + CVE99491_SKIP_SU_CHECK_ENV
                 + (noPermissive ? " " + CVE99491_NO_PERMISSIVE_ENV : "")
                 + " ./" + AssetIntegrity.CVE99491_EXP_ASSET
-                + " --stage=root --profile ./" + Cve99491Profile.ASSET_NAME
-                + " --workdir .";
+                + " --stage=root --profile " + CVE99491_PROFILE
+                + " --workdir " + CVE99491_DIR;
     }
 
     /** 99491 工作目录（单测/日志用）。 */

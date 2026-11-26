@@ -104,8 +104,13 @@ public class WorkflowEngineLabelsTest {
         assertTrue(legacy, legacy.contains("--stage=root"));
         assertTrue(command, command.contains("--stage=root"));
         assertTrue(command, command.contains("./cve99491_exp"));
-        assertTrue(command, command.contains("--profile ./lhasa_99491_profile.json"));
-        assertTrue(command, command.contains("--workdir ."));
+        assertTrue(command, command.contains(
+                "--profile /data/local/tmp/cve99491/lhasa_99491_profile.json"));
+        assertTrue(command, command.contains("--workdir /data/local/tmp/cve99491"));
+        // T2f：exp 的 profile 路径校验要求 workdir 在 /data/local/tmp/ 下——
+        // 相对值（"." / "./profile.json"）会在任何内核访问前被拒绝（真机日志已确认）。
+        assertFalse(command, command.contains("--workdir ."));
+        assertFalse(command, command.contains("--profile ./"));
         // 旧骨架是 --stage=full 且没有 ko env；这两个组合绝不能再出现
         assertFalse(command, command.contains("--stage=full"));
         assertFalse(command, command.contains("--stage=")
