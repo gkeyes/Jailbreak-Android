@@ -43,7 +43,7 @@ public class AssetIntegrityTest {
     @Test
     public void expContractMatchesLedger() {
         assertEquals(800696L, AssetIntegrity.CVE99491_EXP_BYTES);
-        assertEquals("9f29827ff9a6976e4ebfa44bd562c640e47b6fc12be7abf71d79959481c6ff9a",
+        assertEquals("b56345a244ba85e67972fc9ccc82a638bdc559a0de9a8cd02383b4bb7821c881",
                 AssetIntegrity.CVE99491_EXP_SHA256);
         assertTrue(AssetIntegrity.hasExpectations(AssetIntegrity.CVE99491_EXP_ASSET));
         assertTrue(AssetIntegrity.verify(AssetIntegrity.CVE99491_EXP_ASSET,

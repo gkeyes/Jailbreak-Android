@@ -91,12 +91,17 @@ public class WorkflowEngineLabelsTest {
         assertTrue(command, command.contains(
                 "CVE99491_KSU_KO=/data/local/tmp/kernelsu-android17-6.18.ko"));
         assertTrue(command, command.contains("CVE99491_TIMING=1"));
-        // T2d：no-permissive 路径（SELinux 全程 Enforcing，真机验证中；失败可回退旧路径）
-        assertTrue(command, command.contains("CVE99491_KSU_NO_PERMISSIVE=1"));
-        assertFalse("回退开关：旧路径不应带 no-permissive env",
-                WorkflowEngine.cve99491RunCommand(false)
-                        .contains("CVE99491_KSU_NO_PERMISSIVE=1"));
-        assertTrue(WorkflowEngine.cve99491RunCommand(false).contains("--stage=root"));
+        // T2e：默认 permissive 加载路径（真机已证 Enforcing 下 finit_module 会 EPERM），
+        // 并让 exp 跳过内部 su 检查、走成功路径（失败路径 restore 会写坏 initialized）。
+        assertFalse("默认不再用 no-permissive 路径",
+                command.contains("CVE99491_KSU_NO_PERMISSIVE=1"));
+        assertTrue(command, command.contains("CVE99491_SKIP_SU_CHECK=1"));
+        // 对照开关保留：true 时追加历史 no-permissive env（仅在需要复现旧实验时用）
+        String legacy = WorkflowEngine.cve99491RunCommand(true);
+        assertTrue(legacy, legacy.contains("CVE99491_KSU_NO_PERMISSIVE=1"));
+        assertFalse(legacy, legacy.contains("CVE99491_KSU_NO_PERMISSIVE=0"));
+        assertTrue(legacy, legacy.contains("CVE99491_SKIP_SU_CHECK=1"));
+        assertTrue(legacy, legacy.contains("--stage=root"));
         assertTrue(command, command.contains("--stage=root"));
         assertTrue(command, command.contains("./cve99491_exp"));
         assertTrue(command, command.contains("--profile ./lhasa_99491_profile.json"));

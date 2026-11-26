@@ -58,13 +58,18 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
      */
     private static final long CVE99491_DEPLOY_TIMEOUT_MS = 60000L;
     /**
-     * no-permissive 路径（真机验证中）：exp 不打开 SELinux permissive 窗口，SELinux 全程 Enforcing。
-     *
-     * <p>该路径下 exp 无法提前写 /data/adb/ksud（shell 域被拒），ksud 安装由模块 Live 后的
-     * {@link KsuUserspaceFinisher} 经 su 完成。若真机验证被拒，去掉这个 env 即回到旧路径；
-     * finisher 的两段式命令两种路径都兼容，不需要改分类逻辑。
+     * 历史 no-permissive 实验开关（真机已证伪：Enforcing 下 finit_module 返回 EPERM，
+     * 内核必须短暂 permissive）。保留常量只为 {@link #cve99491RunCommand(boolean)} 的对照开关，
+     * 默认路径不再使用。
      */
     public static final String CVE99491_NO_PERMISSIVE_ENV = "CVE99491_KSU_NO_PERMISSIVE=1";
+    /**
+     * exp 侧跳过内部 su 检查（真机 ROOT12 结论）：失败路径的 restore 会把
+     * selinux_state.initialized 写 0，导致 App 打不开；跳过内部检查让 exp 在模块 Loaded 后
+     * 走成功路径（KSU 自己把 Enforcing 设回，不再做破坏性 restore），su 验收由 App 的
+     * {@link KsuUserspaceFinisher} 完成。
+     */
+    public static final String CVE99491_SKIP_SU_CHECK_ENV = "CVE99491_SKIP_SU_CHECK=1";
     /**
      * 99491 direct 引擎整体上限：cred 泄漏/UAF 写/窗口/60s 模块 Live 轮询都在里面，
      * 用异步 launch + 轮询（不受 CommandExecutor 单命令 120s 上限约束）。
@@ -185,22 +190,26 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
     }
 
     /**
-     * 99491 的最终设备命令（Lead 真机验收通过的形态）。
+     * 99491 的最终设备命令（Lead 真机确定形态）。
      *
-     * <p>`CVE99491_KSU_BACKEND=ko`（KO 直载后端，失败不回退 cli）、`CVE99491_KSUD_BIN`/
-     * `CVE99491_KSU_KO` 指向已校验的资产、`CVE99491_TIMING=1` 打时间戳；默认再带
-     * `CVE99491_KSU_NO_PERMISSIVE=1`（SELinux 全程 Enforcing，不破坏 App 的 SELinux 状态），
-     * `--stage=root` 做 cred+fsuid+caps+KO 载入+su 验收。相对路径依赖 cwd = {@link #CVE99491_DIR}。
+     * <p>`CVE99491_KSU_BACKEND=ko`（KO 直载后端）、`CVE99491_KSUD_BIN`/`CVE99491_KSU_KO`
+     * 指向已校验的资产、`CVE99491_TIMING=1` 打时间戳、`CVE99491_SKIP_SU_CHECK=1` 让 exp 在
+     * 模块 Loaded 后走成功路径（避免失败路径 restore 把 selinux_state.initialized 写 0，
+     * 那是"App 打不开"的真因）；su 验收由 App 的 {@link KsuUserspaceFinisher} 完成。
+     *
+     * <p>内核必须短暂 permissive 才能 finit_module（Enforcing 下 EPERM），所以默认是
+     * permissive 路径；{@link #cve99491RunCommand(boolean)} 保留历史 no-permissive 对照开关。
+     * 相对路径依赖 cwd = {@link #CVE99491_DIR}。
      *
      * <p>公开成静态方法是为了让 JVM 单测能锁住 env/参数，防止以后改坏。
      */
     public static String cve99491RunCommand() {
-        return cve99491RunCommand(true);
+        return cve99491RunCommand(false);
     }
 
     /**
-     * 同上，显式控制 no-permissive 路径（真机若验证被拒，宿主/后续版本传 false 即回退旧路径，
-     * 其余流程与 finisher 两段式命令都不需要改）。
+     * @param noPermissive true = 历史 no-permissive 实验（真机已证伪：Enforcing 下
+     *                     finit_module 返回 EPERM，仅留作对照）；false = 最终 permissive 路径（默认）
      */
     public static String cve99491RunCommand(boolean noPermissive) {
         return "cd " + CVE99491_DIR
@@ -208,6 +217,7 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
                 + " CVE99491_KSUD_BIN=" + KSUD_FILE
                 + " CVE99491_KSU_KO=" + CVE99491_KSU_KO
                 + " CVE99491_TIMING=1"
+                + " " + CVE99491_SKIP_SU_CHECK_ENV
                 + (noPermissive ? " " + CVE99491_NO_PERMISSIVE_ENV : "")
                 + " ./" + AssetIntegrity.CVE99491_EXP_ASSET
                 + " --stage=root --profile ./" + Cve99491Profile.ASSET_NAME
@@ -798,13 +808,13 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
         RootPathDecision.Decision decision = RootPathDecision.decide(output, runResult.timedOut);
         append(channel + " 标记分类=" + outcome + (runResult.timedOut ? "（轮询超时）" : ""));
         append(channel + " 裁决=" + decision + " · " + RootPathDecision.describe(decision));
-        // no-permissive 路径的期望：全程 Enforcing。这里只记录观测值，不改变失败分类
-        // （真机若验证 no-permissive 被拒会回退旧路径，分类逻辑保持双可用）。
+        // permissive 路径的期望：模块 Loaded 后 KSU 自己把 Enforcing 设回（exp 走成功路径、
+        // 不做破坏性 restore）。这里只记录观测值，失败分类不变。
         String enforceAfterExp = enforceNow();
         append(channel + " [SELinux] exp 结束后 getenforce=" + enforceAfterExp
                 + (BootGuard.isEnforcing(enforceAfterExp)
-                ? "（no-permissive 路径：全程 Enforcing）"
-                : "（警告：期望全程 Enforcing，当前非 Enforcing；仅记录，不改变裁决）"));
+                ? "（KSU 已自行恢复 Enforcing；permissive 窗口已关闭）"
+                : "（警告：SELinux 仍非 Enforcing；KSU 未恢复，建议重启；仅记录，不改变裁决）"));
 
         // 模块已 Live：先做一次已加载证据判定（标记优先，/proc/modules 兜底），
         // 只有这一步可能触发 ksud userspace 收尾；exp 失败/写前阶段绝不执行。

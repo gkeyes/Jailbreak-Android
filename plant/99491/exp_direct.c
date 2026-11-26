@@ -7976,7 +7976,7 @@ static int run_direct_root(const struct exp_opts *o, unsigned long long slide) {
                    WIFEXITED(status) ? WEXITSTATUS(status) : -1);
         child = -1;
     }
-    if (port_su_check() != 0)
+    if (!getenv("CVE99491_SKIP_SU_CHECK") && port_su_check() != 0)
         goto fail;
     goto done;
 
@@ -8066,6 +8066,9 @@ static void usage(FILE *out, const char *p)
 }
 
 int main(int argc, char **argv) {
+    /* Device runs redirect stdout to a file; keep it unbuffered so a hang or
+     * kill still leaves the progress markers on disk. */
+    setvbuf(stdout, NULL, _IONBF, 0);
     if (getenv("CVE99491_KO_SELFTEST"))
         return direct_ko_selftest();
     if (getenv("CVE99491_KO_SIM_FINIT")) {

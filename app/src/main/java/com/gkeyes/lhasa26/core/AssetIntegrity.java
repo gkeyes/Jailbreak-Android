@@ -35,10 +35,10 @@ public final class AssetIntegrity {
     public static final String KSU_KO_SHA256 =
             "d848bcbeb3f4daffeea4b2ad2d70aac8f79211ce9f15f200dd87c7b8d68ebe30";
 
-    /** 99491 最终 exp（out12 构建，direct 引擎 + ko 后端）。 */
+    /** 99491 最终 exp（out14 构建：permissive 路径加载 KSU 后走成功路径，不做破坏性 restore）。 */
     public static final long CVE99491_EXP_BYTES = 800696L;
     public static final String CVE99491_EXP_SHA256 =
-            "9f29827ff9a6976e4ebfa44bd562c640e47b6fc12be7abf71d79959481c6ff9a";
+            "b56345a244ba85e67972fc9ccc82a638bdc559a0de9a8cd02383b4bb7821c881";
 
     /** profile 由 Lead 在 S6/S7 后改 verified=1，size/sha 会变：不做硬编码校验，只用运行时解析。 */
     public static final long PROFILE_BYTES = 0L;

@@ -30,7 +30,7 @@ public final class KsuUserspaceFinisher {
 
     /** KSU sucompat 期望的 userspace 入口（设备侧最终位置）。 */
     public static final String KSUD_BIN = "/data/adb/ksud";
-    /** App 已按需投放的 ksud 源文件；no-permissive 路径下 exp 不能提前写 /data/adb/ksud，由这里补装。 */
+    /** App 已按需投放的 ksud 源文件；exp 是否已装好不可假设，这里兜底幂等安装。 */
     public static final String KSUD_SRC = "/data/local/tmp/ksud";
     /** KernelSU 模块 KMI；App 侧必须显式传，不能依赖设备推导。 */
     public static final String KMI = "android17-6.18";
@@ -42,12 +42,9 @@ public final class KsuUserspaceFinisher {
      * chmod 755 /data/adb/ksud 2>/dev/null;
      * /data/adb/ksud late-load --allow-shell --kmi android17-6.18'</pre>
      *
-     * <p>两条背景都要兼容：
-     * <ul>
-     *   <li><b>no-permissive 路径</b>（CVE99491_KSU_NO_PERMISSIVE=1）：exp 不开 SELinux 窗口，
-     *       shell 域写不了 /data/adb，所以模块 Live 后必须用 su 先安装 ksud 再收尾；</li>
-     *   <li><b>旧 permissive 路径</b>：exp 可能已把 ksud 装好，`[ -x ] ||` 保证幂等、不会覆盖。</li>
-     * </ul>
+     * <p>为什么先装 ksud：exp 的 ko 后端在 permissive 窗口内会把 ksud 复制到 /data/adb/ksud，
+     * 但该步骤是否成功不可假设（历史 no-permissive 实验里就写不了），所以这里用
+     * `[ -x ] || cp` 幂等兜底；已存在时跳过，不会覆盖。
      */
     public static final String FINISH_COMMAND =
             "su -c '[ -x " + KSUD_BIN + " ] || cp " + KSUD_SRC + " " + KSUD_BIN
