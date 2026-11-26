@@ -4,6 +4,61 @@
 > 我们绝大部分时间耗在最后这一点上，而它本来可以通过**先读 KernelSU 源码 + 对比 98260 成功路径**
 > 在离线阶段定位，不需要反复上真机。
 
+## 零、最大的问题：我们把 `selinux_state` 写坏了（必须单独写清）
+
+> 这是整个项目里**最严重、也最耗时**的问题，而且**责任在我们自己**：不是内核/Android 的 bug，
+> 也不是"越狱必然导致 App 打不开"，而是**我们的开窗写法破坏了 KSU 初始化所依赖的内核状态**。
+
+### 0.1 具体做了什么、破坏了什么
+
+1. 为了打开 SELinux permissive 窗口，我们用 fixed-word 写原语直接改内核内存里的
+   `struct selinux_state`；
+2. 该原语**一次只能写固定 8 字节词组，不能只写 1 个字节**；
+3. 旧写法把词组打在 `selinux_state-1`：
+   - 目的字节 `enforcing` 确实被写成 0（`getenforce` 变 Permissive，窗口"看起来成功了"）；
+   - **但同一个词组的另外 7 个字节覆盖了 `initialized` 及后面的字段字节**；
+   - 失败路径的"恢复"又把这个区域二次改写，把 `initialized` 写成 0。
+4. KernelSU 在 late-load 模式下加载模块时，会在模块 init 里调用
+   `apply_kernelsu_rules()`：dup/替换 `selinux_state.policy`、重置 AVC、用到结构体内的锁；
+   它要求 `selinux_state` 处于**干净一致**状态（`initialized=true`、`policy` 指针与 mutex 完好）；
+5. 结构体被污染 → 策略重建失败 → 内核报
+   `SELinux: security_sid_to_context_core: called before initial load_policy on unknown SID`，
+   binder 取不到安全上下文 → **zygote 无法为新 App 设置域 → 所有 App 打不开**；
+   `su` 也因为 ksu 域没有正确建立，只能停在 `context=kernel`。
+
+### 0.2 这是谁的问题？
+
+- **是我们的方法问题**：写原语的粒度（8 字节）与目标偏移选择（`-1`）不匹配结构体布局，
+  导致越界覆盖；属于"primitive 太粗 + 目标选错"。
+- **不是底层系统 bug**：同一台机、同一内核、同一 Android，修正写入位置后完全正常
+  （`su=u:r=ksu:s0`、App 正常打开）。
+- **不是"越狱必然破坏系统"**：98260 参考路径同样开 permissive 窗口，但它只改 `enforcing`
+  一个字节，所以不破坏策略初始化。
+
+### 0.3 有没有造成永久损坏？
+
+**没有。** 我们只改了**内存中的内核状态**（`selinux_state` 与临时 LKM）：
+
+- 没有写分区、没有改 boot/系统文件、没有刷机、没有动 `/data/adb` 之外的数据；
+- 重启后内核重新初始化、LKM 消失，系统完全恢复（后续真机验证 App 正常、KSU 状态消失）；
+- 影响范围仅限"被写坏的那次开机"，代价是**必须重启**。
+
+### 0.4 正确做法（最终采用）
+
+- 把**零词组**打到 `selinux_state-7`：8 字节里**只有 `enforcing` 这一个字节落在结构体内**；
+  `initialized`、`policy`、mutex 全部保持原值；前面 7 字节落在结构体外的锁对象上，
+  置 0 等价于 "unlocked"，安全；
+- 加载成功后**不做任何 restore 写**（`CVE99491_SKIP_SU_CHECK=1`），交给 KernelSU 自己恢复 Enforcing；
+- 结果：`finit_module result=0`、模块 Live、`su=u:r=ksu:s0`、其它 App 正常。
+
+### 0.5 这件事的教训（写进 checklist）
+
+1. **改内核结构体前必须先拿到准确布局**（BTF/符号表/源码），并计算"这次写会覆盖哪些字节"；
+2. **能用最小覆盖就不要用大覆盖**：能只改 1 字节就绝不用 8 字节词覆盖半个结构体；
+3. **写完之后用外部状态验证**（`/proc/modules`、`su -c id` 的域、dmesg、能否新起进程），
+   不要因为 `getenforce=0`/`finit=0` 就认为成功；
+4. **对内核状态的写入必须有"恢复策略"**，并明确"这次写给系统留下了什么副作用、是否需要重启"。
+
 ## 一、时间到底花在哪
 
 | 阶段 | 内容 | 评价 |
