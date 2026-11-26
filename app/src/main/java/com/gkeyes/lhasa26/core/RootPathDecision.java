@@ -41,7 +41,7 @@ public final class RootPathDecision {
      * @param tail 99491 二进制的完整输出（可空）
      */
     public static Decision decide(String tail) {
-        return decide(tail, 0);
+        return decide(tail, false);
     }
 
     /**
@@ -49,20 +49,28 @@ public final class RootPathDecision {
      * timeout(124) 视为无法归因 → dirty；非零退出且无写前证据 → dirty（fail-closed）。
      */
     public static Decision decide(String tail, int exitCode) {
+        return decide(tail, exitCode == BootGuard.TIMEOUT_EXIT);
+    }
+
+    /** 调用方按自己的轮询超时裁决（异步 launch 拿不到退出码时使用）。 */
+    public static Decision decide(String tail, boolean timedOut) {
         String output = tail == null ? "" : tail;
         BootGuard.Cve99491Outcome outcome = BootGuard.classifyCve99491(output);
         if (outcome == BootGuard.Cve99491Outcome.SUCCESS) {
             return Decision.SUCCESS;
         }
+        // 中止（panic / holding zombie / 明确 abort）一律按内核已被动过处理：这里没有"干净中止"。
+        if (outcome == BootGuard.Cve99491Outcome.ABORT_BOOT) {
+            return Decision.DIRTY_BOOT;
+        }
         boolean kernelWrite = BootGuard.hasCve99491KernelWrite(output);
-        boolean parked = outcome == BootGuard.Cve99491Outcome.PARKED;
-        boolean aborted = outcome == BootGuard.Cve99491Outcome.ABORT_BOOT
-                || exitCode == BootGuard.TIMEOUT_EXIT;
-        if (parked) {
+        // PARKED 是 direct 引擎"本 boot 已 fire"的显式记录：写后失败 → dirty；写前 → PARKED。
+        // 无论哪种都不允许回退 98260（PARKED 的语义就是本 boot 不该再写内核）。
+        if (BootGuard.hasCve99491Parked(output)) {
             return kernelWrite ? Decision.DIRTY_BOOT : Decision.PARKED;
         }
-        if (aborted) {
-            // 中止（panic / holding zombie / timeout）一律按内核已被动过处理：这里没有"干净中止"。
+        // 超时无法归因：没看到写标记也不能证明"零写"，fail-closed。
+        if (timedOut) {
             return Decision.DIRTY_BOOT;
         }
         if (kernelWrite) {

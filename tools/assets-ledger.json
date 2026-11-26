@@ -136,6 +136,40 @@
       "usedBy": "core/Cve99491Profile（AssetManager 解析 release+verified）；plant/99491/exp 运行时 --profile 读取同一内容（设备侧 /data/local/tmp/cve99491/profile.json）",
       "status": "calibrated-pending",
       "action": "2026-11-25 真机标定；verified=0 待 S6/S7 全链验证后改 1，并同步 updatedAt"
+    },
+    {
+      "name": "cve99491_exp",
+      "path": "app/src/main/assets/cve99491_exp",
+      "size": 800696,
+      "gitBlobSha1": "73c91e6074fe2526d51a83c96b3242a3265390ce",
+      "sha256": "9f29827ff9a6976e4ebfa44bd562c640e47b6fc12be7abf71d79959481c6ff9a",
+      "origin": "repo-build",
+      "sourceDraft": "plant/99491/exp_direct.c（direct 引擎 + ko 后端）",
+      "license": "GPL-3.0",
+      "inApk": true,
+      "usedBy": "core/AssetDeployer → /data/local/tmp/cve99491/cve99491_exp；core/WorkflowEngine 99491 链执行 --stage=root",
+      "status": "pinned",
+      "action": "修改 plant/99491/exp_direct.c 后用 plant/99491/build.sh 重建并更新 sha"
+    },
+    {
+      "name": "kernelsu-android17-6.18.ko",
+      "path": "app/src/main/assets/kernelsu-android17-6.18.ko",
+      "size": 375328,
+      "gitBlobSha1": "e63d9b6ed9ce2cb9c46f362c291f7683d943ddc7",
+      "sha256": "d848bcbeb3f4daffeea4b2ad2d70aac8f79211ce9f15f200dd87c7b8d68ebe30",
+      "origin": "upstream-prebuilt",
+      "upstream": {
+        "repo": "ChaYeWuu/XRING-CVE-2026-99491",
+        "path": "android/app/src/main/assets/kernelsu-violin.ko",
+        "kmi": "android17-6.18",
+        "vermagic": "6.18.32-4k-g47cc22554442-dirty",
+        "note": "本机 6.18.21：GKI vermagic 仅比对 flags，且 exp 把 UND 符号改成 SHN_ABS 后内核跳过符号解析/版本校验；真机已验证 finit_module result=0"
+      },
+      "license": "GPL-2.0",
+      "inApk": true,
+      "usedBy": "99491 ko 后端：exp 按 ksu_symbols.inc 打补丁后 finit_module 加载（App 投放至 /data/local/tmp/）",
+      "status": "pinned",
+      "action": "上游资产；需与 plant/99491/ksu_symbols.inc 同源 build 配套"
     }
   ]
 }

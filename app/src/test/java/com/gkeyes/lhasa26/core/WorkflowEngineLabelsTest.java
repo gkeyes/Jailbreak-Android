@@ -78,4 +78,27 @@ public class WorkflowEngineLabelsTest {
                 WorkflowEngine.deployTimeoutMs(null));
         assertTrue(WorkflowEngine.deployTimeoutMs(RootPath.WACOM_99491) > 0L);
     }
+
+    /** 锁住 Lead 真机验收过的调用形态：cwd/env/--stage=root/相对路径都不能漂。 */
+    @Test
+    public void cve99491RunCommandMatchesTheValidatedDeviceFlow() {
+        String command = WorkflowEngine.cve99491RunCommand();
+        assertEquals("/data/local/tmp/cve99491", WorkflowEngine.cve99491WorkDir());
+        assertTrue(command, command.startsWith("cd /data/local/tmp/cve99491 && "));
+        assertTrue(command, command.contains("CVE99491_KSU_BACKEND=ko"));
+        assertTrue(command, command.contains("CVE99491_KSUD_BIN=/data/local/tmp/ksud"));
+        assertTrue(command, command.contains(
+                "CVE99491_KSU_KO=/data/local/tmp/kernelsu-android17-6.18.ko"));
+        assertTrue(command, command.contains("CVE99491_TIMING=1"));
+        assertTrue(command, command.contains("--stage=root"));
+        assertTrue(command, command.contains("./cve99491_exp"));
+        assertTrue(command, command.contains("--profile ./lhasa_99491_profile.json"));
+        assertTrue(command, command.contains("--workdir ."));
+        // 旧骨架是 --stage=full 且没有 ko env；这两个组合绝不能再出现
+        assertFalse(command, command.contains("--stage=full"));
+        assertFalse(command, command.contains("--stage=")
+                && !command.contains("--stage=root"));
+        assertEquals("/data/local/tmp/kernelsu-android17-6.18.ko",
+                WorkflowEngine.cve99491KsuKoPath());
+    }
 }

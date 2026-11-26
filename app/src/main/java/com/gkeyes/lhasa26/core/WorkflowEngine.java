@@ -6,6 +6,7 @@ import java.io.ByteArrayOutputStream;
 import java.io.InputStream;
 import java.util.HashMap;
 import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
@@ -42,7 +43,7 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
     private static final long DEPLOY_JOIN_MS = 1500L;
     private static final int TEMP_ROOT_PROBE_TIMEOUT_S = 3;
     /** ksud 的权威大小（tools/assets-ledger.json）；不一致就重新投放。 */
-    private static final long KSUD_BYTES = 4990848L;
+    private static final long KSUD_BYTES = AssetIntegrity.KSUD_BYTES;
     private static final String RUN_MARKER = "/data/local/tmp/.lhasa_run";
     private static final String ROOTD_SOCKET = "/data/local/tmp/pc98260-root.sock";
     private static final String SU_CLIENT = "/data/local/tmp/pc98260-su";
@@ -51,15 +52,21 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
     private static final int SLIDE_PROBE_TIMEOUT_S = 12;
     private static final int DIAGNOSE_TIMEOUT_S = 25;
     /**
-     * 99491 链部署超时：cve99491_exp（独立静态 ELF）+ profile 经 Shizuku 管道投放，
-     * 资产比 98260 的探针大，8s 不够；按路径可配置（docs/99491-test-plan.md §4）。
+     * 99491 链部署超时：exp + profile + ko(375 KB) + ksud(4.9 MB，远端已校验时跳过) 经 Shizuku
+     * 管道投放；按路径可配置（docs/99491-test-plan.md §4）。
      */
-    private static final long CVE99491_DEPLOY_TIMEOUT_MS = 30000L;
-    /** 99491 分阶段二进制整体超时（clean boot 参考 1.4s，冷启动/慢 IO 留足余量）。 */
-    private static final int CVE99491_TIMEOUT_S = 120;
-    private static final String CVE99491_BINARY = "/data/local/tmp/cve99491_exp";
-    private static final String CVE99491_PROFILE = "/data/local/tmp/" + Cve99491Profile.ASSET_NAME;
+    private static final long CVE99491_DEPLOY_TIMEOUT_MS = 60000L;
+    /**
+     * 99491 direct 引擎整体上限：cred 泄漏/UAF 写/窗口/60s 模块 Live 轮询都在里面，
+     * 用异步 launch + 轮询（不受 CommandExecutor 单命令 120s 上限约束）。
+     */
+    private static final long CVE99491_RUN_TIMEOUT_MS = 240000L;
+    private static final long CVE99491_POLL_MS = 400L;
+    /** 99491 工作目录：exp/profile/运行时标记都在这里（ext 用相对路径 ./…）。 */
+    private static final String CVE99491_DIR = AssetDeployer.CVE99491_DIR;
+    private static final String CVE99491_BINARY = CVE99491_DIR + "/" + AssetIntegrity.CVE99491_EXP_ASSET;
     private static final String CVE99491_RUN_LOG = "/data/local/tmp/cve99491_run.log";
+    private static final String CVE99491_KSU_KO = "/data/local/tmp/" + AssetIntegrity.KSU_KO_ASSET;
     private final AssetManager assets;
     private final CommandExecutor executor;
     private final AssetDeployer deployer;
@@ -166,6 +173,36 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
     /** 部署超时按路径可配置：99491 的资产更大，放宽到 {@link #CVE99491_DEPLOY_TIMEOUT_MS}。 */
     public static long deployTimeoutMs(RootPath path) {
         return path == RootPath.WACOM_99491 ? CVE99491_DEPLOY_TIMEOUT_MS : DEPLOY_TIMEOUT_MS;
+    }
+
+    /**
+     * 99491 的最终设备命令（Lead 真机验收通过的形态）。
+     *
+     * <p>`CVE99491_KSU_BACKEND=ko`（KO 直载后端，失败不回退 cli）、`CVE99491_KSUD_BIN`/
+     * `CVE99491_KSU_KO` 指向已校验的资产、`CVE99491_TIMING=1` 打时间戳；`--stage=root` 做
+     * cred+fsuid+caps+permissive+KO 载入+su 验收。相对路径依赖 cwd = {@link #CVE99491_DIR}。
+     *
+     * <p>公开成静态方法是为了让 JVM 单测能锁住 env/参数，防止以后改坏。
+     */
+    public static String cve99491RunCommand() {
+        return "cd " + CVE99491_DIR
+                + " && env CVE99491_KSU_BACKEND=ko"
+                + " CVE99491_KSUD_BIN=" + KSUD_FILE
+                + " CVE99491_KSU_KO=" + CVE99491_KSU_KO
+                + " CVE99491_TIMING=1"
+                + " ./" + AssetIntegrity.CVE99491_EXP_ASSET
+                + " --stage=root --profile ./" + Cve99491Profile.ASSET_NAME
+                + " --workdir .";
+    }
+
+    /** 99491 工作目录（单测/日志用）。 */
+    public static String cve99491WorkDir() {
+        return CVE99491_DIR;
+    }
+
+    /** 99491 期望的 KO 路径（单测/日志用）。 */
+    public static String cve99491KsuKoPath() {
+        return CVE99491_KSU_KO;
     }
 
     public boolean startRoot() {
@@ -613,11 +650,12 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
         String channel = RootPath.WACOM_99491.channel();
         activePath = RootPath.WACOM_99491;
         step(0);
-        status(channel + " 校验 profile");
+        status(channel + " 校验 profile / 干净开机预检");
         Map<String, String> preflight = fetchPreflightSnapshot();
         String kernel = preflight.getOrDefault("UNAME", "");
         String boot = preflight.getOrDefault("BOOT", "");
         String recorded = preflight.getOrDefault("FAILED", "").trim();
+        String modules = preflight.getOrDefault("MODULES", "");
         enforceBeforeRun = preflight.getOrDefault("ENFORCE", "");
         String identity = oneLine(preflight.getOrDefault("ID", ""));
         rootBeforeRun = preflight.getOrDefault("SU", "").contains("uid=0") || identity.contains("uid=0");
@@ -626,7 +664,20 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
         if (!BootGuard.isSupportedKernel(kernel)) {
             append(channel + " " + BootGuard.kernelWarning(kernel));
         }
+        String hint = BootGuard.leftoverStageHint(preflight.getOrDefault("STAGE", ""));
+        if (!hint.isEmpty()) {
+            append(channel + " [上次] " + hint);
+        }
 
+        // 1) 干净开机预检（Lead 最终流程硬要求）：非 Enforcing 或 /proc/modules 已有 kernelsu → 拒绝重启。
+        //    /sys/module/kernelsu 作为第二来源（部分 ROM 上 shell 读不到 /proc/modules）。
+        String ksuModuleDir = preflight.getOrDefault("KSUDIR", "").trim();
+        String refusal = BootGuard.cleanBootRefusal(enforceBeforeRun, modules, !ksuModuleDir.isEmpty());
+        if (!refusal.isEmpty()) {
+            append(channel + " [预检] " + refusal);
+            throw new IllegalStateException(channel + " " + refusal);
+        }
+        // 2) 已由 KernelSU 接管（su 可用）：无需执行；clean boot 检查已覆盖"模块 Live"的常态。
         if (rootBeforeRun) {
             clearRunMarker();
             run(BootGuard.clearStageCommand(), true);
@@ -638,7 +689,7 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
                     "99491 无需执行：已由 KernelSU 接管 · SELinux " + selinuxAfterRoot);
             return;
         }
-
+        // 3) 两条链共享的 dirty 标记（任一条写后失败都不许在本 boot 再写）。
         String dirty = BootGuard.dirtyReason(recorded, boot);
         if (!dirty.isEmpty()) {
             throw new IllegalStateException(channel + " " + dirty + " · 本 boot 禁止再写内核，请重启设备后再试");
@@ -646,12 +697,7 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
         if (payloadProcessCount() > 0) {
             throw new IllegalStateException(channel + " 上次运行的进程仍在运行，请重启设备后重试。");
         }
-        String hint = BootGuard.leftoverStageHint(preflight.getOrDefault("STAGE", ""));
-        if (!hint.isEmpty()) {
-            append(channel + " [上次] " + hint);
-        }
-
-        // profile 可用性：release 精确匹配 + verified。失败即 fail-closed，不运行任何二进制。
+        // 4) profile 可用性：release 精确匹配 + verified。失败即 fail-closed，不运行任何二进制。
         Cve99491Profile.Status profileStatus = Cve99491Profile.check(
                 kernel, readAsset(Cve99491Profile.ASSET_NAME), unverifiedProfileAllowed);
         cve99491Status = profileStatus;
@@ -663,10 +709,20 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
         append(channel + " [p] profile_ok release=" + profileStatus.release
                 + " sha256=" + profileStatus.sha256 + " · " + profileStatus.reason);
 
+        // 5) APK 资产存在性预检：缺件在开远端进程之前就报出来（零写 → 允许回退 98260）。
+        List<String> missing = AssetDeployer.missingAssets(
+                RootPath.WACOM_99491, listAssetNames());
+        if (!missing.isEmpty()) {
+            append(channel + " [预检] APK 缺少 99491 必需资产：" + missing);
+            fallbackTo98260(channel + " 资产缺失（" + missing + "）");
+            return;
+        }
+
+        // 6) 部署：exp/profile → /data/local/tmp/cve99491/，ko/ksud → /data/local/tmp/（带 size/sha256 校验）。
         writeRunMarker(boot);
         writeStageQuietly("99491-deploy");
         step(1);
-        status(channel + " 部署资产");
+        status(channel + " 部署资产（exp/profile/ko/ksud）");
         DeployGate deployed = deployAssets(RootPath.WACOM_99491,
                 deployTimeoutMs(RootPath.WACOM_99491));
         if (deployed.outcome() != DeployGate.Result.READY) {
@@ -686,49 +742,110 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
             return;
         }
 
-        // D3：模块 late-load 由 99491 二进制自身完成（--stage=full 内部调用 ksud late-load）。
-        // 这里先按需补投 ksud，保证 /data/local/tmp/ksud 存在。若 plant 侧改成 App 外部 late-load，
-        // 再把这一步拆成独立阶段（TODO 已同步给 Lead）。
-        try {
-            stageKsudIfNeeded();
-        } catch (Exception error) {
-            append(channel + " [部署] ksud 投放失败（模块 late-load 可能不可用）：" + friendly(error));
-        }
-
+        // 7) 运行 direct 引擎：--stage=root 一次做完 cred/fsuid/caps/SELinux 窗口/KO 载入/su 验收。
         step(2);
-        status(channel + " 预检");
+        status(channel + " 提权执行中（--stage=root，KO 后端），请勿中断");
         writeStageQuietly("99491-run");
-        String arguments = "--stage=full --profile " + CVE99491_PROFILE + " --workdir /data/local/tmp";
-        append(channel + " 运行 " + CVE99491_BINARY + " " + arguments);
-        CommandResult binary = run(BootGuard.withTimeout(CVE99491_TIMEOUT_S,
-                CVE99491_BINARY + " " + arguments + " > " + CVE99491_RUN_LOG + " 2>&1"), false);
-        if (binary.exitCode == BootGuard.TIMEOUT_EXIT) {
-            append(channel + " 二进制超过 " + CVE99491_TIMEOUT_S + " 秒被 timeout 终止");
-        }
-        String output = run("cat " + CVE99491_RUN_LOG + " 2>/dev/null", true).output;
-        if (output == null || output.trim().isEmpty()) {
-            output = binary.output == null ? "" : binary.output;
-        }
-        appendCve99491Output(output);
+        append(channel + " 运行（cwd=" + CVE99491_DIR + "）：" + cve99491RunCommand());
+        CveRunResult runResult = runCve99491Binary(channel);
+        String output = runResult.output;
         stepForCve99491Output(output);
         BootGuard.Cve99491Outcome outcome = BootGuard.classifyCve99491(output);
-        append(channel + " 标记分类=" + outcome);
+        append(channel + " 标记分类=" + outcome + (runResult.timedOut ? "（轮询超时）" : ""));
         if (outcome == BootGuard.Cve99491Outcome.SUCCESS) {
-            boolean recheck = verifyCve99491Su();
-            finishCve99491Success(channel, recheck);
+            boolean accepted = verifyCve99491Acceptance();
+            boolean live = kernelSuModuleLiveNow();
+            finishCve99491Success(channel, accepted, live);
             return;
         }
-        RootPathDecision.Decision decision = RootPathDecision.decide(output, binary.exitCode);
+        RootPathDecision.Decision decision = RootPathDecision.decide(output, runResult.timedOut);
         append(channel + " 裁决=" + decision + " · " + RootPathDecision.describe(decision));
         if (decision == RootPathDecision.Decision.DIRTY_BOOT
-                && BootGuard.hasCve99491ModuleLive(output) && verifyCve99491Su()) {
-            // 模块已 live 但二进制没打出最终 su_check 行：外部 su 复核通过就按成功处理，
+                && BootGuard.hasCve99491ModuleLive(output) && verifyCve99491Acceptance()) {
+            // 模块已 live 但二进制没打出最终 su_check 行：外部 su 验收通过就按成功处理，
             // 不把一个已接管的内核误标成 dirty（那会逼用户白重启一次）。
-            finishCve99491Success(channel, true);
+            finishCve99491Success(channel, true, true);
             return;
         }
         settleCve99491Failure(channel, decision, boot);
     }
+
+    /** 99491 一次运行的输出与"是否因轮询超时被终止"。 */
+    private static final class CveRunResult {
+        final String output;
+        final boolean timedOut;
+
+        CveRunResult(String output, boolean timedOut) {
+            this.output = output == null ? "" : output;
+            this.timedOut = timedOut;
+        }
+    }
+
+    /**
+     * 异步启动 99491 direct 引擎并轮询日志。
+     *
+     * <p>为什么不用单条 `run()`：CommandExecutor 对单条远端命令有 120s 上限，而 --stage=root
+     * 含 cred 泄漏/多次 UAF 写/60s 模块 Live 轮询，必须在 120s 内完成并不现实；launch+poll
+     * 同时也能把实时 tail 喂给 UI（98260 的 payload 也是这个模式）。
+     */
+    private CveRunResult runCve99491Binary(String channel) throws Exception {
+        payloadLines.clear();
+        payloadStartAt = System.currentTimeMillis();
+        run("rm -f " + CVE99491_RUN_LOG + "; "
+                + BootGuard.launchCommand(cve99491RunCommand(), "", CVE99491_RUN_LOG), true);
+        Thread.sleep(CVE99491_POLL_MS);
+        long deadline = System.currentTimeMillis() + CVE99491_RUN_TIMEOUT_MS;
+        boolean exited = false;
+        while (System.currentTimeMillis() < deadline) {
+            String snap = run("echo \"__ALIVE__=$(" + BootGuard.aliveCommand() + ")\"; "
+                    + "echo \"__TAIL__\"; tail -n 40 " + CVE99491_RUN_LOG + " 2>/dev/null", true).output;
+            int tailIdx = snap.indexOf("__TAIL__\n");
+            String header = tailIdx >= 0 ? snap.substring(0, tailIdx) : snap;
+            String tail = tailIdx >= 0 ? snap.substring(tailIdx + 9) : "";
+            boolean alive = !"0".equals(extractKv(header, "__ALIVE__="));
+            if (!tail.trim().isEmpty()) {
+                callbacks.onTail(tail);
+                appendCve99491Output(tail);
+                stepForCve99491Output(tail);
+            }
+            if (!alive) {
+                exited = true;
+                break;
+            }
+            Thread.sleep(CVE99491_POLL_MS);
+        }
+        boolean timedOut = !exited;
+        if (timedOut) {
+            append(channel + " [超时] direct 引擎超过 " + (CVE99491_RUN_TIMEOUT_MS / 1000L)
+                    + " 秒仍未退出，终止并进入失败裁决");
+            stopPayload();
+        }
+        String output = run("cat " + CVE99491_RUN_LOG + " 2>/dev/null", true).output;
+        if (output == null) {
+            output = "";
+        }
+        appendCve99491Output(output);
+        return new CveRunResult(output, timedOut);
+    }
+
+    /** APK 内 assets 顶层文件名集合（资产存在性预检用）。 */
+    private Set<String> listAssetNames() {
+        Set<String> names = new LinkedHashSet<>();
+        try {
+            String[] listed = assets.list("");
+            if (listed != null) {
+                for (String name : listed) {
+                    if (name != null && !name.isEmpty()) {
+                        names.add(name);
+                    }
+                }
+            }
+        } catch (Throwable ignored) {
+            // 列不出来按"缺失"处理会在下面变成明确的 fallback 日志；这里先给空集。
+        }
+        return names;
+    }
+
 
     /** 99491 部署门：超时按路径可配置，语义沿用 DeployGate（READY 必须显式完成）。 */
     private DeployGate deployAssets(RootPath path, long timeoutMs) throws InterruptedException {
@@ -756,46 +873,62 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
         return gate;
     }
 
-    /** 外部复核 `su -c id`；二进制标记是主证据，这里只做二次确认并写日志。 */
-    private boolean verifyCve99491Su() {
+    /**
+     * App 侧 su 验收：`su -c id` 必须是 uid=0 且 ksu 域（`u:r=ksu:s0`）。
+     *
+     * <p>二进制自己的 `[f] su_check=` 是主证据；这里做二次确认，防止"模块 Live 但 su 没生效"。
+     * 只跑一条命令、不带额外引号层（Shizuku sh → su 的嵌套引号容易坏）。
+     */
+    private boolean verifyCve99491Acceptance() {
         try {
-            // 经 Shizuku 的 sh 再套一层 su 引号容易坏，所以拆成三条独立命令：
-            // 每条只有一个参数层级，失败时也能定位是哪一项没通过。
-            CommandResult id = run("/system/bin/su -c id", false);
-            CommandResult enforce = run("/system/bin/su -c getenforce", false);
-            CommandResult context = run("/system/bin/su -c 'cat /proc/self/attr/current'", false);
-            String joined = oneLine(id.output) + " · " + oneLine(enforce.output)
-                    + " · " + oneLine(context.output);
-            boolean uid = isRoot(id.output);
-            boolean ksuDomain = containsKsuContext(context.output) || containsKsuContext(id.output);
-            append("[99491] [f] su 复核 uid=" + uid + " ksu=" + ksuDomain + " → " + joined);
-            return uid && ksuDomain;
+            CommandResult id = run("if [ -x /system/bin/su ]; then /system/bin/su -c id; "
+                    + "elif [ -x /data/adb/ksu/bin/su ]; then /data/adb/ksu/bin/su -c id; "
+                    + "else echo no-su; fi", false);
+            String output = id.output == null ? "" : id.output;
+            boolean ok = BootGuard.isKernelSuIdentityOk(output);
+            append("[99491] [f] su 验收 uid=0&ksu=" + ok + " → " + oneLine(output));
+            return ok;
         } catch (Throwable error) {
-            append("[99491] [f] su 复核失败：" + friendly(error));
+            append("[99491] [f] su 验收失败：" + friendly(error));
             return false;
         }
     }
 
-    private static boolean containsKsuContext(String output) {
-        return output != null
-                && (output.contains("u:r=ksu:s0") || output.contains("u:r:ksu:s0"));
+    /** App 侧复核模块是否已在 /proc/modules 里 Live（成功路径用来确认"不用再 late-load"）。 */
+    private boolean kernelSuModuleLiveNow() {
+        try {
+            String modules = run("grep -m1 '^kernelsu ' /proc/modules 2>/dev/null", true).output;
+            boolean live = BootGuard.isKernelSuLive(modules);
+            append("[99491] [f] /proc/modules kernelsu Live=" + live
+                    + (live ? "（模块已加载，跳过 App 侧 late-load）" : ""));
+            return live;
+        } catch (Throwable error) {
+            append("[99491] [f] /proc/modules 复核失败：" + friendly(error));
+            return false;
+        }
     }
 
-    private void finishCve99491Success(String channel, boolean recheck) throws Exception {
+    private void finishCve99491Success(String channel, boolean accepted, boolean moduleLive)
+            throws Exception {
         run(BootGuard.clearFailureCommand(), true);
         clearRunMarker();
         run(BootGuard.clearStageCommand(), true);
         state = State.COMPLETE;
         selinuxAfterRoot = enforceNow();
-        append(channel + " [f] module_live / [f] su_check 命中：KernelSU 模块已接管");
-        append(channel + " 临时提权链（real_cred）成功，本次未使用 98260");
+        append(channel + " [f] su_check / MODULE_LOADED 命中：KernelSU 模块已接管");
+        append(channel + " 模块已 Live："
+                + (moduleLive
+                ? "App 复核 /proc/modules 确认，跳过 App 侧 late-load（不重复加载）"
+                : "二进制报告已加载（App 复核 /proc/modules 未命中，未重复 late-load）"));
+        append(channel + " 临时提权链（direct 引擎 + ko 后端）成功，本次未使用 98260");
         append(channel + " SELinux " + selinuxAfterRoot);
         append(String.format(Locale.US, "[耗时] 99491 链从点击到接管 %.1fs · path=%s",
                 (System.currentTimeMillis() - startedAt) / 1000.0, RootPath.WACOM_99491.key()));
         callbacks.onStatus("99491 已完成 · KernelSU 已接管 · SELinux " + selinuxAfterRoot);
-        callbacks.onState(State.COMPLETE, recheck
-                ? "99491 全部完成 · su 复核通过 · SELinux " + selinuxAfterRoot
-                : "99491 二进制报告已接管 · su 复核未通过（Shizuku 可能断开）· SELinux " + selinuxAfterRoot);
+        callbacks.onState(State.COMPLETE, accepted
+                ? "99491 全部完成 · su 验收通过（uid=0 · u:r=ksu:s0）· SELinux " + selinuxAfterRoot
+                : "99491 二进制报告已接管 · App 侧 su 验收未通过（Shizuku 可能断开）· SELinux "
+                        + selinuxAfterRoot);
     }
 
     /** 按裁决落地：回退 98260 / PARKED / dirty boot。 */
@@ -823,7 +956,7 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
             case SUCCESS:
             default:
                 // 二进制报告成功但外部复核失败：按已接管处理，避免把成功误报成 dirty。
-                finishCve99491Success(channel, false);
+                finishCve99491Success(channel, false, kernelSuModuleLiveNow());
         }
     }
 
@@ -878,7 +1011,7 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
         }
     }
 
-    /** 按二进制内部标记推进步骤，让 UI 进度条与日志对齐。 */
+    /** 按二进制内部标记推进步骤，让 UI 进度条与日志对齐（direct 引擎阶段）。 */
     private void stepForCve99491Output(String text) {
         if (text == null || text.isEmpty()) {
             return;
@@ -886,16 +1019,18 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
         int target = -1;
         for (String raw : text.split("\\n")) {
             String line = raw.trim();
-            if (line.startsWith("[p] profile_ok")) {
+            if (line.startsWith("[p] profile_ok") || line.startsWith("[p] engine=")) {
                 target = Math.max(target, 2);
             } else if (line.startsWith("[p] anchor")) {
                 target = Math.max(target, 3);
-            } else if (line.startsWith("[+] setcon")) {
-                target = Math.max(target, 5);
-            } else if (line.startsWith("[+] ")) {
+            } else if (line.startsWith("[+] cred") || line.startsWith("[+] fsuid")
+                    || line.startsWith("[+] caps")) {
                 target = Math.max(target, 4);
-            } else if (line.startsWith("MODULE_LOADED") || line.startsWith("[f] module_live")
-                    || line.startsWith("[f] su_check")) {
+            } else if (line.startsWith("[+] setcon") || line.contains("permissive window")) {
+                target = Math.max(target, 5);
+            } else if (line.startsWith("[ko]") || line.startsWith("[step] direct root")
+                    || line.startsWith("MODULE_LOADED") || line.startsWith("[f] module_live")
+                    || line.startsWith("[f] su_check") || line.contains("su_check_begin")) {
                 target = Math.max(target, 6);
             }
         }
@@ -1264,6 +1399,8 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
             String targets = EXPLOIT_BINARIES
                     + (keepRootClient ? "" : " pc98260-su pc98260-root.sock");
             run("cd /data/local/tmp 2>/dev/null; rm -f " + targets + "; true", true);
+            // 99491 的 exp 在专用工作目录里，运行日志在外层；profile/ko/ksud 保留（下次按需校验复用）。
+            run("rm -f " + CVE99491_BINARY + " " + CVE99491_RUN_LOG + " 2>/dev/null; true", true);
             String reason;
             if (keepRootClient) {
                 reason = "（保留 pc98260-su、rootd socket 与 ksud，临时 ROOT 仍在用）";
@@ -1389,6 +1526,8 @@ public final class WorkflowEngine implements AssetDeployer.WorkflowLog {
                 + "echo \"BOOT=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)\"; "
                 + "echo \"ID=$(id 2>/dev/null)\"; "
                 + "echo \"ENFORCE=$(getenforce 2>/dev/null)\"; "
+                + "echo \"MODULES=$(grep -m1 '^kernelsu ' /proc/modules 2>/dev/null)\"; "
+                + "echo \"KSUDIR=$(ls -d /sys/module/kernelsu 2>/dev/null)\"; "
                 + "echo \"PATCH=$(getprop ro.build.version.security_patch 2>/dev/null)\"; "
                 + "if [ -x /system/bin/su ]; then echo \"SU=$(/system/bin/su -c id 2>/dev/null)\"; else echo \"SU=\"; fi; "
                 + "echo \"SOCK=$(ls -l " + ROOTD_SOCKET + " 2>/dev/null)\"; "

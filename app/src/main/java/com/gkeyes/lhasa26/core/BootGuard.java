@@ -70,9 +70,14 @@ public final class BootGuard {
             "[+] swap",
             "[+] cred",
             "[+] setcon",
+            "[+] fsuid",
+            "[+] caps bit16",
             "[f] module_live",
             "[f] su_check",
-            "MODULE_LOADED"
+            "MODULE_LOADED",
+            "[ko]",
+            "[step] direct root",
+            "[!] permissive window"
     };
 
     /** 99491 写前失败标记：安全重试/回退。 */
@@ -104,6 +109,15 @@ public final class BootGuard {
     private static final String CVE99491_KSU_CONTEXT_ALT = "u:r:ksu:s0";
     private static final String CVE99491_PARKED = "PARKED";
     private static final String CVE99491_MODULE_LOADED = "MODULE_LOADED";
+    /**
+     * direct 引擎在 --stage=root 开头就会打印
+     * `[!] direct engine: PARKED marker set for this boot; reboot before the next fire run`
+     * —— 这是"本 boot 已 fire"的信息行，不应当成失败 tail 里的 PARKED 令牌。
+     */
+    private static final String CVE99491_PARKED_INFO = "PARKED marker set";
+    /** 99491 要求从干净开机开始：Enforcing 且 /proc/modules 里没有 kernelsu。 */
+    public static final String KSU_MODULE_NAME = "kernelsu";
+    private static final String KSU_LIVE_TOKEN = "Live";
 
     /**
      * Written by the launch wrapper as `&lt;pgid&gt;:&lt;boot_id&gt;`.
@@ -183,8 +197,11 @@ public final class BootGuard {
     }
 
     /**
-     * 99491 标记分类。优先级：中止 &gt; PARKED &gt; 成功 &gt; 可重试 &gt; 未命中。
-     * 中止必须赢过同一条 tail 里的成功标记（先 panic 后补打的输出不能算成功）。
+     * 99491 标记分类。优先级：中止 &gt; 成功 &gt; PARKED &gt; 可重试 &gt; 未命中。
+     *
+     * <p>中止必须赢过同一条 tail 里的成功标记（先 panic 后补打的输出不能算成功）；
+     * 成功必须赢过 PARKED 信息行——成功 tail 里也有
+     * `PARKED marker set`（本 boot 已 fire 的提示），那是"完事记得重启"，不是失败令牌。
      */
     public static Cve99491Outcome classifyCve99491(String tail) {
         if (tail == null || tail.isEmpty()) {
@@ -193,11 +210,11 @@ public final class BootGuard {
         if (containsAny(tail, CVE99491_ABORT_MARKERS)) {
             return Cve99491Outcome.ABORT_BOOT;
         }
-        if (tail.contains(CVE99491_PARKED)) {
-            return Cve99491Outcome.PARKED;
-        }
         if (isCve99491SuCheckOk(tail)) {
             return Cve99491Outcome.SUCCESS;
+        }
+        if (hasCve99491Parked(tail)) {
+            return Cve99491Outcome.PARKED;
         }
         if (containsAny(tail, CVE99491_RETRY_MARKERS)) {
             return Cve99491Outcome.RETRY_SAFE;
@@ -205,16 +222,72 @@ public final class BootGuard {
         return Cve99491Outcome.NONE;
     }
 
-    /** `[f] su_check=uid=0 … u:r=ksu:s0` 必须同一行同时出现 uid=0 与 ksu 域。 */
+    /**
+     * 99491 的 su 验收：两种形态都接受。
+     *
+     * <ul>
+     *   <li>单行契约：`[f] su_check=uid=0 … u:r=ksu:s0`（旧/当前 exp）；</li>
+     *   <li>块契约：`su_check_begin` 与 `su_check_end` 之间出现 uid=0 且 ksu 域（out12 之后的版本）。</li>
+     * </ul>
+     *
+     * <p>`[f] su_check=FAILED` 不算成功（没有 uid=0/ksu 域）。
+     */
     public static boolean isCve99491SuCheckOk(String tail) {
         if (tail == null) {
             return false;
         }
+        boolean inBlock = false;
+        StringBuilder block = new StringBuilder();
         for (String raw : tail.split("\\n")) {
             String line = raw.trim();
-            if (line.startsWith(CVE99491_SU_CHECK_PREFIX)
-                    && line.contains("uid=0")
-                    && (line.contains(CVE99491_KSU_CONTEXT) || line.contains(CVE99491_KSU_CONTEXT_ALT))) {
+            if (line.contains("su_check_begin")) {
+                inBlock = true;
+                block.setLength(0);
+                continue;
+            }
+            if (line.contains("su_check_end")) {
+                inBlock = false;
+                if (containsKsuIdentity(block.toString())) {
+                    return true;
+                }
+                continue;
+            }
+            if (inBlock) {
+                block.append(line).append(' ');
+            }
+            if (line.startsWith(CVE99491_SU_CHECK_PREFIX) && containsKsuIdentity(line)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** `uid=0` + ksu 域（两种 SELinux 写法都接受）。 */
+    public static boolean containsKsuIdentity(String output) {
+        if (output == null || output.isEmpty()) {
+            return false;
+        }
+        return output.contains("uid=0")
+                && (output.contains(CVE99491_KSU_CONTEXT) || output.contains(CVE99491_KSU_CONTEXT_ALT));
+    }
+
+    /**
+     * 是否出现真正的 PARKED 令牌。
+     *
+     * <p>direct 引擎失败时打印裸行 `PARKED`；成功/启动时打印
+     * `[!] direct engine: PARKED marker set …` —— 后者是"本 boot 已 fire，记得重启"的信息，
+     * 不算失败令牌（否则成功会被误判成失败）。
+     */
+    public static boolean hasCve99491Parked(String tail) {
+        if (tail == null || tail.isEmpty()) {
+            return false;
+        }
+        for (String raw : tail.split("\\n")) {
+            String line = raw.trim();
+            if (line.equals(CVE99491_PARKED) || line.startsWith(CVE99491_PARKED + " ")) {
+                return true;
+            }
+            if (line.contains(CVE99491_PARKED_INFO)) {
                 return true;
             }
         }
@@ -237,6 +310,87 @@ public final class BootGuard {
     /** 是否出现 99491 专属中止标记（panic / holding zombie / abort）。 */
     public static boolean hasCve99491Abort(String tail) {
         return containsAny(tail, CVE99491_ABORT_MARKERS);
+    }
+
+    /** getenforce 输出是否 Enforcing。 */
+    public static boolean isEnforcing(String getenforce) {
+        return getenforce != null && "Enforcing".equalsIgnoreCase(getenforce.trim());
+    }
+
+    /** /proc/modules 里是否已经出现 kernelsu（不管状态）。 */
+    public static boolean hasKernelSuModule(String procModules) {
+        if (procModules == null || procModules.trim().isEmpty()) {
+            return false;
+        }
+        for (String raw : procModules.split("\\n")) {
+            String line = raw.trim();
+            if (line.isEmpty()) {
+                continue;
+            }
+            String[] parts = line.split("\\s+");
+            if (parts.length > 0 && KSU_MODULE_NAME.equals(parts[0])) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** /proc/modules 里 kernelsu 是否 Live（模块加载完成、sucompat 可用）。 */
+    public static boolean isKernelSuLive(String procModules) {
+        if (procModules == null || procModules.trim().isEmpty()) {
+            return false;
+        }
+        for (String raw : procModules.split("\\n")) {
+            String line = raw.trim();
+            if (line.isEmpty()) {
+                continue;
+            }
+            String[] parts = line.split("\\s+");
+            if (parts.length > 0 && KSU_MODULE_NAME.equals(parts[0])
+                    && line.contains(KSU_LIVE_TOKEN)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * 99491 的干净开机预检（docs/99491-test-plan.md §5.3 + Lead 最终流程）：
+     * 必须 Enforcing，且 /proc/modules 里没有 kernelsu。
+     *
+     * @return 空串 = 通过；否则是给用户看的具体拒绝原因（含"请重启"）
+     */
+    public static String cleanBootRefusal(String getenforce, String procModules) {
+        return cleanBootRefusal(getenforce, procModules, false);
+    }
+
+    /**
+     * @param sysModulePresent `/sys/module/kernelsu` 是否存在（/proc/modules 在部分 ROM 上
+     *                         对 shell 不可读，用 sysfs 做第二来源）
+     */
+    public static String cleanBootRefusal(String getenforce, String procModules, boolean sysModulePresent) {
+        StringBuilder reason = new StringBuilder();
+        if (!isEnforcing(getenforce)) {
+            String value = getenforce == null || getenforce.trim().isEmpty()
+                    ? "未知" : getenforce.trim();
+            reason.append("当前 SELinux=").append(value).append("（99491 要求 Enforcing）");
+        }
+        if (hasKernelSuModule(procModules) || sysModulePresent) {
+            if (reason.length() > 0) {
+                reason.append("；");
+            }
+            reason.append("/proc/modules 里已有 kernelsu（本次开机已被写过）");
+        }
+        if (reason.length() == 0) {
+            return "";
+        }
+        return reason.append("。99491 必须从干净开机开始，请重启设备后再试；重启前不要重复点击")
+                .toString();
+    }
+
+    /** `su -c id` 输出验收：uid=0 且 ksu 域（与 99491 的 su_check 契约一致）。 */
+    public static boolean isKernelSuIdentityOk(String suOutput) {
+        return containsKsuIdentity(suOutput);
     }
 
     /**

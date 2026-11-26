@@ -154,3 +154,25 @@ CRED_ORACLE_OK
 - egid 问题已修（补 cred+0x18 零词），ids 全 0；
 - ksud CLI 已 exec（无错误输出）；模块未 Live。已加诊断：child 打印 exec 目标/errno，
   父进程打印 child waitpid 状态，模块轮询 30s→60s；产物 sha 5c3aa97d。
+
+## 2026-11-26 07:43 真机重大进展：KernelSU 模块由 99491 第二条链成功加载
+干净开机（boot 0098013a-b18d-4d51-bcb1-82f189dd44c3）真机结果：
+```
+[ko] ksud installed src=/data/local/tmp/ksud dst=/data/adb/ksud
+[ko] image=/data/local/tmp/kernelsu-android17-6.18.ko size=375328
+[ko] patched=225 missing=0 slide=0x2dc9000000
+[ko] finit_module result=0 errno=0 (ok)
+[+] ko backend loaded (rc=0)
+MODULE_LOADED
+[f] module_live=1 enforce=1
+```
+dmesg 确认 KernelSU 初始化：hook_manager tracepoint 注册、su_compat/kernel_umount feature 注册、
+crown 管理器、`Permissive SELinux, enforcing`（KSU 自行恢复 Enforcing）。
+仅 su 验收失败：finit_module 未传模块参数 `allow_shell=1`（ksud --allow-shell 会传），
+KSU 因此不向 shell(uid2000) 发 su。已补参数（env CVE99491_KSU_PARAMS 可覆盖，flags 仍为 0）。
+离线模拟（宿主机构建 exp，CVE99491_KO_SELFTEST / CVE99491_KO_SIM_FINIT）结果：
+patch 225/0、UND 225→0、非 symtab 段字节不变、225 个 st_value 全部 = 符号表+slide；
+finit 参数路径正常（宿主 ENOSYS 为 proot seccomp 拦截）。
+KO 来源：ChaYeWuu/XRING-CVE-2026-99491 `kernelsu-violin.ko`（KMI android17-6.18，
+vermagic 6.18.32，本机 6.18.21；GKI vermagic 只比对 flags，且 SHN_ABS 使内核跳过
+符号解析/版本校验 —— 实测可加载）。
