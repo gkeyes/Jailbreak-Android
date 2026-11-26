@@ -25,3 +25,14 @@ DSH 文件沙箱在重启后导致少数旧 inode 不可读（`plant/99491/exp.c
 - `plant/99491/exp_direct.c` = exp.c 全量恢复 + 触发落点修正（sel-1），编译/self-test 通过
 - `plant/99491/README_recovered.md` = README.md 全量恢复（16 次编辑重放）
 - 交付时在干净 worktree 中把二者归位为 `exp.c` / `README.md`。
+
+## 修复信息（CVE-2026-99491）
+
+- 上游修复 commit：`ef32877368a7` / `1178927ffa54`（`drivers/hid/wacom_wac.c`，sibling
+  `shared->touch_input` 在移除时的同步/清空修复；`wacom_remove_shared_data` 增加 synchronize_rcu）。
+- 首个包含该修复的 **6.12.y 稳定版：6.12.117**（6.12.58 仍是 pre-fix）。
+- Android 上游安全补丁日期：**2026-10-06**（对应 SPL 对照；App 以 `SPL < 2026-10-06` 判定"未修补窗口"）。
+- 6.18.y 同代内核按 stable 流程回补：本机 **6.18.21（build 2026-09-23）未包含**；
+  首个包含它的 6.18.x 版本在 2026-10-06 之后发布。
+- 本机实测佐证：SPL 2026-10-01 → 未修补；`tools/devtests/99491/patch_check.py` 静态检查
+  `wacom_remove_shared_data` 无 synchronize_rcu，与真机 UAF 可达一致。
