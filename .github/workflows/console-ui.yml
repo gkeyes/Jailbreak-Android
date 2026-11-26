@@ -1,0 +1,32 @@
+name: Console UI
+
+on:
+  push:
+    branches: [next-99491-realcred]
+    paths:
+      - 'design/miuix-console/**'
+      - '.github/workflows/console-ui.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  assemble-ui:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: design/miuix-console
+          persist-credentials: false
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Assemble UI library
+        working-directory: design/miuix-console
+        run: ./gradlew --no-daemon :ui:assembleDebug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: console-ui-debug
+          path: design/miuix-console/ui/build/outputs/aar/ui-debug.aar
+          if-no-files-found: error

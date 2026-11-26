@@ -4,6 +4,7 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -13,7 +14,11 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.scale
@@ -25,11 +30,13 @@ import androidx.compose.ui.semantics.heading
 import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import top.yukonga.miuix.kmp.basic.BasicComponent
+import top.yukonga.miuix.kmp.basic.BasicComponentDefaults
 import top.yukonga.miuix.kmp.basic.ButtonDefaults
 import top.yukonga.miuix.kmp.basic.Card
 import top.yukonga.miuix.kmp.basic.Icon
@@ -97,7 +104,7 @@ internal fun FoldPages(
 @Composable
 private fun SessionPanel(state: FoldUiState, onEvent: (FoldEvent) -> Unit) {
     GroupCard("会话状态") {
-        BasicComponent(
+        ExpandableSummaryRow(
             title = "临时 ROOT",
             summary = listOf(state.privilege, state.status).filter { it.isNotBlank() }.joinToString(" · "),
             modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite },
@@ -117,6 +124,7 @@ private fun SessionPanel(state: FoldUiState, onEvent: (FoldEvent) -> Unit) {
         }
         TextButton(
             text = state.actionLabel,
+            textStyle = MiuixTheme.textStyles.button.copy(textAlign = TextAlign.Center),
             enabled = state.primaryEnabled, onClick = { onEvent(FoldEvent.PRIMARY) },
             colors = ButtonDefaults.textButtonColorsPrimary(),
             modifier = Modifier.fillMaxWidth().padding(start = 16.dp, end = 16.dp, bottom = 16.dp),
@@ -155,15 +163,10 @@ private fun ActionSummary(title: String, summary: String, action: String, enable
 private fun SystemPanel(state: FoldUiState, onEvent: (FoldEvent) -> Unit) {
     GroupCard("系统信息") {
         Spacer(Modifier.height(6.dp))
-        BoxWithConstraints(Modifier.fillMaxWidth()) {
-            val stack = maxWidth < 300.dp || LocalDensity.current.fontScale >= 1.3f
-            Column {
-                DeviceValue("设备代号", state.device, stack)
-                DeviceValue("系统版本", state.build, stack)
-                DeviceValue("内核版本", state.kernel, stack)
-                DeviceValue("适配状态", state.compatibility, stack)
-            }
-        }
+        DeviceValue("设备代号", state.device)
+        DeviceValue("系统版本", state.build)
+        DeviceValue("内核版本", state.kernel)
+        DeviceValue("适配状态", state.compatibility)
         Spacer(Modifier.height(4.dp))
         TextButton(
             text = "接口诊断", onClick = { onEvent(FoldEvent.DIAGNOSE) }, enabled = state.diagnosticEnabled,
@@ -187,7 +190,7 @@ private fun RootPathPanel(state: FoldUiState, onEvent: (FoldEvent) -> Unit) {
         BasicComponent(
             title = "98260 · 定时器 UAF",
             summary = if (timerSelected) "当前路径 · 已验证 · 默认" else "稳定回退路径",
-            insideMargin = PaddingValues(vertical = 8.dp),
+            insideMargin = PaddingValues(horizontal = 16.dp, vertical = 8.dp),
             endActions = {
                 Switch(checked = timerSelected, onCheckedChange = {
                     if (it && !state.running) onEvent(FoldEvent.PATH_SELECT)
@@ -199,7 +202,7 @@ private fun RootPathPanel(state: FoldUiState, onEvent: (FoldEvent) -> Unit) {
             BasicComponent(
                 title = "99491 · WACOM real_cred",
                 summary = if (cveSelected) "当前路径 · 实验（opt-in）" else "实验（opt-in）· profile 已校验",
-                insideMargin = PaddingValues(vertical = 8.dp),
+                insideMargin = PaddingValues(horizontal = 16.dp, vertical = 8.dp),
                 endActions = {
                     Switch(checked = cveSelected, onCheckedChange = {
                         if (it && !state.running) onEvent(FoldEvent.PATH_SELECT)
@@ -207,28 +210,52 @@ private fun RootPathPanel(state: FoldUiState, onEvent: (FoldEvent) -> Unit) {
                 },
             )
         } else {
-            BasicComponent(
+            ExpandableSummaryRow(
                 title = "99491 · WACOM real_cred",
                 summary = "未适配 · " + state.rootPathNote.ifBlank { "profile 校验中" },
-                insideMargin = PaddingValues(vertical = 8.dp),
+                insideMargin = PaddingValues(horizontal = 16.dp, vertical = 8.dp),
             )
         }
     }
 }
 
 @Composable
-private fun DeviceValue(label: String, value: String, stack: Boolean) {
-    val row = Modifier.fillMaxWidth().heightIn(min = 36.dp).padding(horizontal = 16.dp, vertical = 3.dp)
-    if (stack) {
-        Column(row, verticalArrangement = Arrangement.spacedBy(4.dp)) {
-            Text(label, style = MiuixTheme.textStyles.body2, color = MiuixTheme.colorScheme.onSurfaceVariantSummary)
-            Text(value)
+private fun ExpandableSummaryRow(
+    title: String,
+    summary: String,
+    modifier: Modifier = Modifier,
+    insideMargin: PaddingValues = BasicComponentDefaults.InsideMargin,
+) {
+    val previewLines = 3
+    var expanded by rememberSaveable(summary) { mutableStateOf(false) }
+    var canExpand by remember(summary) { mutableStateOf(false) }
+    BasicComponent(modifier = modifier, insideMargin = insideMargin) {
+        Text(title, style = MiuixTheme.textStyles.headline1, fontWeight = FontWeight.Medium)
+        Text(
+            summary,
+            style = MiuixTheme.textStyles.body2,
+            color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+            maxLines = if (expanded) Int.MAX_VALUE else previewLines,
+            overflow = TextOverflow.Ellipsis,
+            onTextLayout = { canExpand = it.hasVisualOverflow || it.lineCount > previewLines },
+        )
+        if (canExpand) {
+            TextButton(text = if (expanded) "收起" else "展开全文", onClick = { expanded = !expanded })
         }
-    } else {
-        Row(row, horizontalArrangement = Arrangement.spacedBy(16.dp), verticalAlignment = Alignment.CenterVertically) {
-            Text(label)
-            Text(value, modifier = Modifier.weight(1f), textAlign = TextAlign.End)
-        }
+    }
+}
+
+@Composable
+private fun DeviceValue(label: String, value: String) {
+    FlowRow(
+        modifier = Modifier.fillMaxWidth().heightIn(min = 36.dp).padding(horizontal = 16.dp, vertical = 3.dp),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalArrangement = Arrangement.spacedBy(4.dp, Alignment.CenterVertically),
+        itemVerticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(label, modifier = Modifier.padding(end = 16.dp),
+            style = MiuixTheme.textStyles.body2, color = MiuixTheme.colorScheme.onSurfaceVariantSummary)
+        Text(value)
     }
 }
 
